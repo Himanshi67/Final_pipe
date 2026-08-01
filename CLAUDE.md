@@ -37,6 +37,11 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   `NOT FOUND` · `ERROR: …`
 - `.cache\` (gitignored) holds gzipped pages and search results, TTL 14 days.
   Only successes are cached; a cache error is always a miss, never a failure.
+- Politeness delays are owed to the remote host, so `polite_sleep()` skips them
+  on a cache hit and always fires on a live request. A warm-cache replay is
+  therefore ~23x faster (5 SKUs: 99s → 4.3s) with byte-identical output.
+  Never make a delay unconditional-skip: `tests\test_polite_sleep.py` pins both
+  directions, and a block costs far more than the minutes saved.
 
 ## Repo layout
     *.py                  the 7 pipeline scripts — MUST stay at root (see below)

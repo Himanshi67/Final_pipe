@@ -71,6 +71,14 @@ MAX_ATTRIBUTES = 15   # each one costs 4 CSV columns, so the sheet stays usable
 # own thumbnails from it. 95 costs roughly 40% more bytes and stops the loss
 # compounding through that second encode.
 WEBP_QUALITY = 95
+# Encoder EFFORT, not quality - it only changes how hard the encoder searches
+# for a smaller file at the WEBP_QUALITY above. Measured over 60 real catalogue
+# images at q=95: method=6 took 586 ms each and beat method=4 by 0.27% of
+# bytes. That is ~20 minutes of extra CPU across a 6,400-image catalogue to
+# save a quarter of a percent, so this sits at 4 (also PIL's own default).
+# Dropping to 2 is 4.9x faster again but costs +2.7% bytes - a real tradeoff,
+# not a free one.
+WEBP_METHOD = 4
 # Long edge to keep. WooCommerce generates its own thumbnails, so the master
 # only has to be big enough for the zoom/lightbox; past this it is bandwidth.
 MAX_IMAGE_EDGE = 2400
@@ -1133,7 +1141,8 @@ def download_urls_for_sku(sku, urls):
                                   max(1, round(image.size[1] * ratio))),
                                  Image.LANCZOS)
         target = os.path.join(root, f'{sku}_{index}.webp')
-        image.save(target, format='WEBP', quality=WEBP_QUALITY, method=6)
+        image.save(target, format='WEBP', quality=WEBP_QUALITY,
+                   method=WEBP_METHOD)
         return index
 
     if not urls:

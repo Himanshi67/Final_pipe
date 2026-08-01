@@ -203,6 +203,32 @@ CACHE_STATS = {"page_hit": 0, "page_miss": 0, "page_write": 0,
 RUN_STATS = {"serper_calls": 0, "ddg_calls": 0, "pages_fetched": 0,
              "blocked_domains": {}}
 
+# Live round-trips made so far - cache hits excluded. fetch() and web_search()
+# bump it just before they go to the network; polite_sleep() reads it to tell a
+# real request apart from a cache hit.
+NET_CALLS = 0
+SLEEP_SAVED = 0.0         # seconds of politeness skipped, for the batch report
+
+
+def polite_sleep(lo, hi, since=None):
+    """Wait between requests so a retailer sees a human-paced crawl.
+
+    The delay is owed to the REMOTE HOST, so a cache hit does not owe it: no
+    server was touched and there is nothing to be polite to. Passing `since`
+    (a NET_CALLS snapshot from just before the call) makes the sleep fire only
+    when the wrapped call actually went out.
+
+    This is what makes the documented free replay actually free. Re-running a
+    finished batch through improved parsers does no network I/O, but every
+    delay used to fire anyway, so a warm-cache replay of ~190 pages spent
+    ~14 minutes asleep to do ~30 seconds of parsing."""
+    global SLEEP_SAVED
+    naptime = random.uniform(lo, hi)
+    if since is not None and NET_CALLS == since:
+        SLEEP_SAVED += naptime
+        return
+    time.sleep(naptime)
+
 
 def _cache_file(kind, key):
     h = hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()
@@ -931,12 +957,14 @@ def web_search(query):
     spends no Serper credits at all. An EMPTY serper answer is cached (Google
     genuinely found nothing); an empty DuckDuckGo answer is not, because that
     is nearly always the library failing rather than a real absence."""
+    global NET_CALLS
     hit = cache_get("search", query)
     if hit is not None:
         CACHE_STATS["search_hit"] += 1
         log("      (cached search)")
         return hit
     CACHE_STATS["search_miss"] += 1
+    NET_CALLS += 1
 
     res = serper_search(query)
     if res is not None:      # serper answered (even if empty) - trust Google
@@ -1276,12 +1304,14 @@ def nav_headers(url, dom):
 def fetch(url):
     """Cached front door to fetch_live. A cache hit does no network I/O, which
     is what makes re-running a finished batch through improved parsers free."""
+    global NET_CALLS
     hit = cache_get("page", url)
     if hit:
         CACHE_STATS["page_hit"] += 1
         log(f"      (cached page, {len(hit) // 1024} KB)")
         return hit, ""
     CACHE_STATS["page_miss"] += 1
+    NET_CALLS += 1
     html, reason = fetch_live(url)
     if html:
         RUN_STATS["pages_fetched"] += 1
@@ -2431,8 +2461,9 @@ def hunt_donors(candidates, tried, sku, model, brand, min_price, max_price,
         seen_dom.add(dom)
         used += 1
         log(f"    completing: {u[:90]}")
+        _net_before = NET_CALLS
         html, why = fetch(u)
-        time.sleep(random.uniform(1.5, 3.0))
+        polite_sleep(1.5, 3.0, since=_net_before)
         if not html:
             if is_block_reason(why):
                 trip_domain(dom, why)
@@ -2466,6 +2497,7 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
     seen, candidates = set(), []
     for q, dom in queries:
         log(f"    searching: {q}")
+        _net_before = NET_CALLS
         for r in web_search(q):
             u = r.get("href", "")
             if not u or is_blocked(u):
@@ -2485,7 +2517,7 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
                 log(f"      skipped off-category result: {str(r.get('title'))[:70]}")
                 continue
             candidates.append(u)
-        time.sleep(random.uniform(0.6, 1.4))
+        polite_sleep(0.6, 1.4, since=_net_before)
 
     # Round-robin: take the best URL from EACH domain before any domain's
     # second. Straight domain_rank order let amazon occupy every fetch slot,
@@ -2522,8 +2554,9 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
         fetched += 1
         tried.add(u)
         log(f"    checking:  {u[:95]}")
+        _net_before = NET_CALLS
         html, why = fetch(u)
-        time.sleep(random.uniform(1.5, 3.0))
+        polite_sleep(1.5, 3.0, since=_net_before)
         if not html:
             fail_reasons.append((dom, why))
             if is_block_reason(why):
@@ -3133,6 +3166,7 @@ def main():
 
         done += 1
         log(f"\n[{done}] Row {r}: {sku}")
+        _net_before_sku = NET_CALLS
         try:
             rec = lookup_sku(str(sku).strip(), args.min_price, args.max_price,
                              args.min_images)
@@ -3170,7 +3204,7 @@ def main():
         if stopped:
             break
         try:
-            time.sleep(random.uniform(args.delay[0], args.delay[1]))
+            polite_sleep(args.delay[0], args.delay[1], since=_net_before_sku)
         except KeyboardInterrupt:
             log("\nStopped by user - progress saved.")
             break
@@ -3183,6 +3217,9 @@ def main():
         log(f"Cache: {CACHE_STATS['search_hit']} search(es) and "
             f"{CACHE_STATS['page_hit']} page(s) replayed from disk "
             f"(~{CACHE_STATS['search_hit']} serper credit(s) not spent).")
+    if SLEEP_SAVED >= 1:
+        log(f"Politeness delays skipped: {SLEEP_SAVED / 60:.1f} min "
+            f"(no host was contacted for those steps).")
     if RUN_STATS["serper_calls"]:
         log(f"serper.dev calls this run: {RUN_STATS['serper_calls']} "
             f"(~1 credit each).")
