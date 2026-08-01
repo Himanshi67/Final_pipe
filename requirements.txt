@@ -1,0 +1,23 @@
+# Dependencies for the FULL active pipeline
+# (sku_enricher.py + app.py + validate_csv.py)
+#
+# Install once:  python -m pip install -r requirements.txt
+
+# -- sku_enricher.py --
+curl_cffi>=0.7        # browser-fingerprint HTTP client (beats bot checks)
+ddgs                  # DuckDuckGo search (fallback when no SERPER_API_KEY)
+beautifulsoup4
+lxml
+openpyxl
+
+# optional: only needed for --js-fallback (blocked or JS-rendered pages).
+# after installing, run once:
+#   .venv\Scripts\python.exe -m playwright install chromium
+# (skippable if Google Chrome is already installed - it is used automatically)
+playwright
+
+# -- app.py (Streamlit formatter) --
+streamlit
+pandas
+requests
+Pillow

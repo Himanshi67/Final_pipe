@@ -1,0 +1,716 @@
+"""QA report for WooCommerce import files.
+
+Usage:
+    python validate_csv.py [csv_path]
+
+If no path is given, tries wordpress_ready_clean_repaired.csv first, then
+wordpress_ready.csv. Prints a summary and writes validation_issues.csv.
+
+Checks per row:
+  - missing sku / title / category / description (or placeholder text)
+  - fewer than MIN_IMAGES images (the pipeline standard is 3+)
+  - image URLs whose .webp file is NOT present locally in
+    product_images_for_upload (phantom links = broken images after import)
+  - image files that are too small or the wrong shape to be product photos
+  - duplicate SKUs (would collide in WooCommerce)
+  - price problems: both prices missing, regular price <= sale price, or a
+    price outside the plausible band for the category
+  - attributes the product's own sub-category requires but nothing filled
+  - titles that say "front load" while the category/description says Top Load
+
+Cross-row (the wrong-match signatures no per-row check can see):
+  - two SKUs sharing a source URL, a first image, a whole gallery, any single
+    image, or a title
+
+Importable: build_csv.py calls validate_export() straight after writing the
+CSV, so the QA gate is part of generating the file rather than a step someone
+has to remember.
+"""
+
+import os
+import re
+import sys
+from collections import Counter
+
+import pandas as pd
+
+# A comma-joined URL list cannot be split on commas alone: Amazon's rendition
+# modifiers legitimately contain them (`._AC_UL165_SR165,165_.jpg`), and a plain
+# split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
+# images on one product. Split only where a comma is followed by a URL start.
+_URL_SPLIT_RE = re.compile(r',(?=\s*(?:https?://|//))')
+
+
+def split_image_list(raw):
+    """Split a stored image list without breaking URLs that contain commas."""
+    text = str(raw or '').strip()
+    if not text:
+        return []
+    parts = _URL_SPLIT_RE.split(text)
+    if len(parts) == 1 and ',' in text and '://' not in text:
+        parts = text.split(',')          # not a URL list - old behaviour
+    return [p.strip() for p in parts if p.strip()]
+
+
+MIN_IMAGES = 3
+IMAGE_ROOT = 'product_images_for_upload'
+PLACEHOLDER = '<p>Premium product available at Shree Jee Electronics. Detailed specifications currently updating.</p>'
+
+# A product photo below this on its long edge is a thumbnail: it will look soft
+# on a product page and terrible in a lightbox.
+MIN_IMAGE_PX = 400
+# Below this it is usable but not good. WooCommerce re-encodes its own sizes
+# from whatever master it is given, so a soft master compounds. app.py now
+# fetches each CDN's largest rendition, which puts real product shots well
+# above this - a row that trips it usually means the source only had a
+# thumbnail, and the listing is worth a second look.
+GOOD_IMAGE_PX = 1000
+# Beyond this the file is a banner, a size chart or a sliver of one - not a
+# photo of the appliance. 1:3 either way is already generous for a product shot.
+MAX_IMAGE_ASPECT = 3.0
+
+# A selling price below this for the category means an accessory (a remote, a
+# stand, a cover) was matched instead of the appliance. Keyed on a substring of
+# the category string, checked longest-first.
+CATEGORY_PRICE_FLOOR = {
+    'air conditioner': 12000,
+    'refrigerator': 6000,
+    'washing machine': 6000,
+    'microwave': 3000,
+    'water heater': 1500,
+    'led': 5000,
+    'television': 5000,
+}
+
+# The other end of the same test. A number far above the category's ceiling is
+# almost never a real price - it is a bundle, a dealer pack, or an MRP read out
+# of the wrong element. Deliberately loose: these are "look at this", not "this
+# is wrong", and the premium-panel exemption in implausible_tv_price() applies
+# to TVs on top of this.
+CATEGORY_PRICE_CEILING = {
+    'air conditioner': 250000,
+    'refrigerator': 400000,
+    'washing machine': 250000,
+    'microwave': 100000,
+    'water heater': 60000,
+    'electric iron': 25000,
+    'electric kettle': 25000,
+    'induction cooktop': 40000,
+    'led': 1000000,
+    'television': 1000000,
+}
+
+# Wording that app.py used to emit when it could not read a spec. Nothing should
+# produce these any more (KI-14); if one appears, a stale CSV is being validated
+# or the placeholder behaviour has come back.
+DEAD_PLACEHOLDERS = (
+    'Standard Capacity', 'Standard Power Rating', 'Standard Washing Capacity',
+    'Standard Tank Volume', 'Standard Cavity Volume', 'Standard Liquid Volume',
+    'Appliance Utility Core', 'WM Function Type', 'WM Washing Capacity',
+)
+
+
+def mostly_non_latin(text):
+    """A title from a site's Arabic/Chinese locale. Seen live: haier.com served
+    the Arabic page for H43S80GFX."""
+    letters = [c for c in str(text) if c.isalpha()]
+    if len(letters) < 6:
+        return False
+    return sum(1 for c in letters if 'a' <= c.lower() <= 'z') / len(letters) < 0.6
+
+
+def implausible_tv_price(title, sale):
+    """A price ceiling driven by the panel spec rather than the screen size.
+
+    Size alone is a bad ceiling - a 55" OLED legitimately costs six figures. But
+    panel class is not negotiable: HD Ready (720p) is entry-level hardware, so a
+    HD Ready set priced like a 4K one means the wrong listing, a bundle, or an
+    MRP read as the price. Caught live: a 32" HD Ready TV at Rs 34,590, roughly
+    double its real price, which every other check passed.
+    """
+    if sale is None or sale <= 0:
+        return ''
+    t = str(title).lower()
+    if re.search(r'\b(8k|4k|uhd|ultra\s*hd|qled|oled|qned|nano\s*cell)\b', t):
+        return ''                       # premium panels have no sane ceiling
+    if re.search(r'hd\s*ready|\b720p?\b', t):
+        return ('hd_ready_priced_like_premium' if sale > 25000 else '')
+    if re.search(r'full\s*hd|\b1080p?\b|\bfhd\b', t):
+        return ('full_hd_priced_like_premium' if sale > 45000 else '')
+    return ''
+
+
+def summary_key(reason):
+    """The reason with its per-row detail stripped, so the summary counts
+    kinds of problem rather than instances. Everything after '(' is detail,
+    and so is the SKU list a cross-row reason names - without this,
+    'identical_gallery_files_as AP-X' and '...as AP-Y' count as two problems
+    when they are one."""
+    head = str(reason).split(' (')[0]
+    match = re.match(r'^(\w+(?:_as|_with))\b', head)
+    return match.group(1) if match else head
+
+
+def price_floor_for(categories):
+    cats = str(categories).lower()
+    for key in sorted(CATEGORY_PRICE_FLOOR, key=len, reverse=True):
+        if key in cats:
+            return key, CATEGORY_PRICE_FLOOR[key]
+    return None, None
+
+
+def price_ceiling_for(categories):
+    cats = str(categories).lower()
+    for key in sorted(CATEGORY_PRICE_CEILING, key=len, reverse=True):
+        if key in cats:
+            return key, CATEGORY_PRICE_CEILING[key]
+    return None, None
+
+
+def image_dimension_problems(filenames, root=IMAGE_ROOT):
+    """Sizes and shapes that disqualify a file as a product photo.
+
+    Reads the header only (Pillow is lazy about pixel data), so this stays
+    cheap across a few hundred images. Silent when Pillow is absent - the QA
+    gate must keep running on a machine that only has pandas."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    problems = []
+    for name in filenames:
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            continue                     # the existence check already reports it
+        try:
+            with Image.open(path) as img:
+                width, height = img.size
+        except Exception:
+            problems.append(f'{name} is not a readable image')
+            continue
+        # 1.91:1 is the OpenGraph share ratio: a social banner, not a product
+        # photo. Only reported for the FIRST image, because that is the
+        # storefront thumbnail and the only position where it does harm.
+        if (name == filenames[0] and height
+                and 1.85 <= width / height <= 2.05):
+            problems.append(f'{name} is {width}x{height} - a share banner is '
+                            f'the thumbnail')
+        if max(width, height) < MIN_IMAGE_PX:
+            problems.append(f'{name} is {width}x{height} (thumbnail)')
+        elif max(width, height) < GOOD_IMAGE_PX:
+            # not unusable, but it will look soft in the zoom/lightbox and
+            # worse again after WooCommerce re-encodes its own sizes from it
+            problems.append(f'{name} is only {width}x{height} (low resolution)')
+        elif min(width, height) and max(width, height) / min(width, height) > MAX_IMAGE_ASPECT:
+            problems.append(f'{name} is {width}x{height} (banner shape)')
+    return problems
+
+
+def duplicate_image_content(records, root=IMAGE_ROOT):
+    """Two SKUs whose DOWNLOADED FILES are byte-identical.
+
+    On this file the URL-based cross-row checks are structurally unable to
+    fire: app.py rewrites every image to '<media base>/<sku>_<n>.webp', so the
+    URLs are derived from the SKU and can never collide however wrong the match
+    was. Comparing the bytes on disk is the only way to see it here - and it is
+    the check that matters, because two SKUs sharing a gallery means one of
+    them resolved to the other's listing.
+
+    Caught live on the LED batch: UA32H4500FUXXL and UA32H4510FUXXL shipped
+    the same eight photos.
+
+    Keyed on (size, hash of the first 64 KB) rather than a full digest: same
+    verdict, a fraction of the I/O on a batch of several hundred images.
+    """
+    import hashlib
+
+    digests = {}
+
+    def key_for(name):
+        if name in digests:
+            return digests[name]
+        path = os.path.join(root, name)
+        try:
+            size = os.path.getsize(path)
+            with open(path, 'rb') as fh:
+                head = hashlib.md5(fh.read(65536)).hexdigest()
+            digests[name] = (size, head)
+        except Exception:
+            digests[name] = None
+        return digests[name]
+
+    for rec in records:
+        rec['_content'] = frozenset(
+            k for k in (key_for(os.path.basename(u)) for u in rec['images'])
+            if k is not None)
+
+    by_set, by_single = {}, {}
+    for rec in records:
+        if not rec['_content']:
+            continue
+        by_set.setdefault(rec['_content'], []).append(rec)
+        for k in rec['_content']:
+            by_single.setdefault(k, []).append(rec)
+
+    flagged = set()
+    for group in by_set.values():
+        if len(group) < 2:
+            continue
+        for rec in group:
+            others = sorted(g['sku'] for g in group if g is not rec)[:3]
+            rec['reasons'].append('identical_gallery_files_as ' + ', '.join(others))
+            flagged.add(id(rec))
+
+    partners = {}
+    for group in by_single.values():
+        if len(group) < 2:
+            continue
+        for rec in group:
+            if id(rec) in flagged:
+                continue
+            for other in group:
+                if other is not rec:
+                    partners.setdefault(id(rec), set()).add(other['sku'])
+    for rec in records:
+        names = partners.get(id(rec))
+        if names:
+            rec['reasons'].append('shares_image_files_with '
+                                  + ', '.join(sorted(names)[:3]))
+    for rec in records:
+        rec.pop('_content', None)
+
+
+def shared_image_pairs(records):
+    """SKUs sharing ANY single image, beyond the first-image and whole-gallery
+    checks that already run. This is the case where two SKUs resolved to
+    different listings of the same wrong product, so their galleries overlap
+    without matching.
+
+    Only reported when the blunter checks did not already flag the row, so one
+    wrong match produces one line rather than four."""
+    by_image = {}
+    for rec in records:
+        for url in rec['images']:
+            by_image.setdefault(url, []).append(rec)
+    partners = {}
+    for group in by_image.values():
+        if len(group) < 2:
+            continue
+        for rec in group:
+            for other in group:
+                if other is not rec:
+                    partners.setdefault(id(rec), set()).add(other['sku'])
+    for rec in records:
+        names = partners.get(id(rec))
+        if not names:
+            continue
+        if any(r.startswith(('same_first_image_as', 'identical_gallery_as'))
+               for r in rec['reasons']):
+            continue
+        rec['reasons'].append('shares_an_image_with '
+                              + ', '.join(sorted(names)[:3]))
+
+
+def load_valid_categories():
+    """Exact category strings allowed by category_map.xlsx (if present)."""
+    candidates = ('category_map.xlsx', 'category_map.csv',
+                  'reorganise the catgory and sub category.xlsx')
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.getcwd(), here):
+        for name in candidates:
+            path = os.path.join(base, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                df = (pd.read_csv(path, dtype=str) if path.lower().endswith('.csv')
+                      else pd.read_excel(path, dtype=str)).fillna('')
+            except Exception:
+                return set()
+            valid = set()
+            for _, row in df.iterrows():
+                vals = [str(v) for v in row.tolist()]
+                parent = vals[0].strip()
+                if not parent or parent.lower() == 'parent category':
+                    continue
+                valid.add(parent)
+                parts = [s.strip() for s in (vals[1] if len(vals) > 1 else '').split(',') if s.strip()]
+                i = 0
+                while i < len(parts):
+                    if (parts[i] == 'Juicers' and i + 1 < len(parts)
+                            and parts[i + 1] == 'Mixers & Grinders'):
+                        valid.add(f'{parent} > Juicers, Mixers & Grinders')
+                        i += 2
+                        continue
+                    valid.add(f'{parent} > {parts[i]}')
+                    i += 1
+            return valid
+    return set()
+
+
+def cross_row_duplicates(records):
+    """Two SKUs that resolved to the SAME listing - the classic wrong-match
+    signature, invisible to any per-row check. Appends reasons in place."""
+    for label, key_of in (
+        ('same_source_url_as', lambda r: r.get('url', '')),
+        ('same_first_image_as', lambda r: r['images'][0] if r['images'] else ''),
+        ('identical_gallery_as',
+         lambda r: ','.join(sorted(r['images'])) if len(r['images']) > 1 else ''),
+        ('same_title_as', lambda r: r['title'].strip().lower()),
+    ):
+        groups = {}
+        for rec in records:
+            key = key_of(rec)
+            if key:
+                groups.setdefault(key, []).append(rec)
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            for rec in group:
+                others = [g['sku'] for g in group if g is not rec][:3]
+                rec['reasons'].append(f'{label} {", ".join(others)}')
+    shared_image_pairs(records)
+
+
+def validate_filled(df, path):
+    """QA for the enricher's own output, BEFORE the human review step.
+
+    Nothing checked this file before, which is where wrong matches are cheapest
+    to catch - one spreadsheet cell, versus a wrong product on the storefront.
+    """
+    print(f'Input: {path}   (enricher output - stage 1 checks)')
+    print(f'Rows: {len(df)}')
+
+    def col(*names):
+        for n in names:
+            for c in df.columns:
+                if str(c).strip().lower() == n:
+                    return c
+        return None
+
+    c_sku = col('sku', 'item details')
+    c_title, c_status = col('title'), col('status')
+    c_url, c_img = col('url_link'), col('image_url')
+    c_reg, c_sale = col('regular price'), col('sale price')
+
+    records, statuses = [], Counter()
+    for idx, row in df.iterrows():
+        reasons = []
+        sku = str(row.get(c_sku, '')).strip()
+        title = str(row.get(c_title, '')).strip()
+        status = str(row.get(c_status, '')).strip()
+        url = str(row.get(c_url, '')).strip()
+        images = split_image_list(row.get(c_img, ''))
+        statuses[status.split(' - ')[0] or '(blank)'] += 1
+
+        verified = status.upper().startswith('FOUND')
+        if verified:
+            sale = to_number(row.get(c_sale, ''))
+            reg = to_number(row.get(c_reg, ''))
+            if sale is None:
+                reasons.append('verified_but_no_price')
+            if len(images) < MIN_IMAGES:
+                reasons.append(f'verified_but_images<{MIN_IMAGES} (has {len(images)})')
+            if reg is not None and sale is not None and sale > 0:
+                if reg <= sale:
+                    reasons.append(f'mrp<=price ({reg:g} <= {sale:g})')
+                elif reg > sale * 4:
+                    reasons.append(f'mrp_implausible ({reg:g} is {reg / sale:.1f}x)')
+            over = implausible_tv_price(title, sale)
+            if over:
+                reasons.append(f'{over} ({sale:g})')
+            if title and mostly_non_latin(title):
+                reasons.append('title_not_in_english (wrong locale page)')
+            brand = re.split(r'[-\s]', sku)[0].lower()
+            if len(brand) > 3 and title and brand not in title.lower():
+                reasons.append(f'brand_missing_from_title (sku says {brand})')
+            if 'unlisted store' in status:
+                reasons.append('source_is_an_unlisted_store')
+        records.append({'idx': idx, 'sku': sku, 'title': title, 'url': url,
+                        'images': images, 'reasons': reasons})
+
+    cross_row_duplicates(records)
+
+    print('\nStatus breakdown:')
+    for status, n in statuses.most_common():
+        print(f'  {n:4}  {status}')
+
+    issues = [r for r in records if r['reasons']]
+    counts = Counter()
+    for rec in issues:
+        for reason in rec['reasons']:
+            counts[summary_key(reason)] += 1
+
+    print('\nIssue summary:')
+    if not counts:
+        print('  none - every verified row is complete and unique')
+    for reason, n in counts.most_common():
+        print(f'  - {reason}: {n}')
+
+    print(f'\nRows with issues: {len(issues)} / {len(df)}')
+    for rec in issues[:30]:
+        print(f"  row {rec['idx'] + 2}: sku={rec['sku']} | {'; '.join(rec['reasons'])}")
+    if len(issues) > 30:
+        print(f'  ... and {len(issues) - 30} more (see validation_issues.csv)')
+
+    if issues:
+        pd.DataFrame([{'row': r['idx'] + 2, 'sku': r['sku'],
+                       'title': r['title'][:120],
+                       'reasons': '; '.join(r['reasons']),
+                       'url': r['url']} for r in issues]
+                     ).to_csv('validation_issues.csv', index=False)
+        print('\nSaved details to validation_issues.csv')
+    print('\nFix what matters, then run app.py / build_csv.py on this file.')
+    return issues
+
+
+def pick_input_path():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    for candidate in ('wordpress_ready_clean_repaired.csv', 'wordpress_ready.csv'):
+        if os.path.exists(candidate):
+            return candidate
+    return 'wordpress_ready_clean_repaired.csv'
+
+
+def find_col(df, *candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def to_number(value):
+    try:
+        text = str(value).replace(',', '').replace('₹', '').strip()
+        return float(text) if text else None
+    except Exception:
+        return None
+
+
+def validate_export(df, csv_path, check_images=True, write_issues=True):
+    """QA for the generated WooCommerce CSV. Returns the list of issue dicts.
+
+    Importable so build_csv.py can run it the moment the file is written -
+    "run it automatically after generation rather than as a separate step".
+    """
+    print(f'Input: {csv_path}')
+    print(f'Rows: {len(df)}')
+
+    sku_col = find_col(df, 'sku', 'SKU', 'Sku')
+    title_col = find_col(df, 'title', 'Title', 'name')
+    images_col = find_col(df, 'Images', 'images', 'image_url')
+    desc_col = find_col(df, 'description', 'Description')
+    categories_col = find_col(df, 'categories', 'Categories', 'category')
+    reg_col = find_col(df, 'regular price', 'regular_price')
+    sale_col = find_col(df, 'sale price', 'sale_price')
+    gaps_col = find_col(df, '_spec_gaps')
+
+    local_images_available = os.path.isdir(IMAGE_ROOT)
+    if not local_images_available:
+        print(f"Note: '{IMAGE_ROOT}' folder not found here - skipping the "
+              f'local image-file existence check.')
+
+    valid_categories = load_valid_categories()
+    if valid_categories:
+        print(f'Category map loaded: {len(valid_categories)} allowed category strings.')
+    else:
+        print('Note: category_map.xlsx not found - skipping the category check.')
+
+    issues = []
+    seen_skus = {}
+    records = []                    # kept for the cross-row pass after the loop
+
+    for idx, row in df.iterrows():
+        reasons = []
+        sku = str(row.get(sku_col, '')).strip() if sku_col else ''
+        title = str(row.get(title_col, '')).strip() if title_col else ''
+
+        if not sku:
+            reasons.append('missing_sku')
+        if not title:
+            reasons.append('missing_title')
+
+        if sku:
+            if sku in seen_skus:
+                reasons.append(f'duplicate_sku (first at row {seen_skus[sku] + 2})')
+            else:
+                seen_skus[sku] = idx
+            if re.search(r'[\\/:*?"<>|]', sku):
+                reasons.append('sku_has_unsafe_characters (breaks image files/URLs)')
+
+        image_urls = []
+        if images_col:
+            raw_images = str(row.get(images_col, '')).strip()
+            image_urls = split_image_list(raw_images)
+        if len(image_urls) == 0:
+            reasons.append('images=0')
+        elif len(image_urls) < MIN_IMAGES:
+            reasons.append(f'images<{MIN_IMAGES} (has {len(image_urls)})')
+
+        if local_images_available and image_urls:
+            missing_local = [os.path.basename(u) for u in image_urls
+                             if not os.path.exists(os.path.join(IMAGE_ROOT, os.path.basename(u)))]
+            if missing_local:
+                reasons.append(f'{len(missing_local)} image file(s) not downloaded locally')
+            # a 60px file and a 1:4 sliver both pass every URL-level check and
+            # both look broken on the storefront
+            if check_images:
+                bad_size = image_dimension_problems(
+                    [os.path.basename(u) for u in image_urls])
+                if bad_size:
+                    reasons.append(f'image_not_a_product_photo ({bad_size[0]}'
+                                   + (f' +{len(bad_size) - 1} more' if len(bad_size) > 1 else '')
+                                   + ')')
+
+        desc = str(row.get(desc_col, '')).strip() if desc_col else ''
+        if not desc or desc == PLACEHOLDER:
+            reasons.append('missing_description')
+
+        cats = str(row.get(categories_col, '')).strip() if categories_col else ''
+        if not cats:
+            reasons.append('missing_category')
+        elif valid_categories and cats not in valid_categories:
+            reasons.append(f'category_not_in_map ({cats})')
+
+        reg = to_number(row.get(reg_col, '')) if reg_col else None
+        sale = to_number(row.get(sale_col, '')) if sale_col else None
+        if reg is None and sale is None:
+            reasons.append('missing_price')
+        elif reg is not None and sale is not None and reg <= sale:
+            reasons.append(f'regular_price<=sale_price ({reg:g} <= {sale:g})')
+        # an MRP several times the price is a number scraped off the wrong
+        # element, not a discount
+        if reg is not None and sale is not None and sale > 0 and reg > sale * 4:
+            reasons.append(f'mrp_implausible ({reg:g} is {reg / sale:.1f}x {sale:g})')
+        # a price far below the category's floor means an accessory was matched
+        key, floor = price_floor_for(cats)
+        if sale is not None and floor and sale < floor:
+            reasons.append(f'price_too_low_for_category ({sale:g} < {floor} '
+                           f'for {key} - accessory?)')
+        # and the other end: a bundle or a mis-read MRP sitting in the price
+        key_hi, ceiling = price_ceiling_for(cats)
+        if sale is not None and ceiling and sale > ceiling:
+            reasons.append(f'price_too_high_for_category ({sale:g} > {ceiling} '
+                           f'for {key_hi} - bundle or wrong number?)')
+        over = implausible_tv_price(title, sale)
+        if over:
+            reasons.append(f'{over} ({sale:g})')
+
+        # the taxonomy declares which axes this sub-category needs; app.py
+        # writes the ones it could not fill into _spec_gaps
+        gaps = str(row.get(gaps_col, '')).strip() if gaps_col else ''
+        if gaps:
+            reasons.append(f'missing_required_attribute ({gaps})')
+
+        if title and mostly_non_latin(title):
+            reasons.append('title_not_in_english (wrong locale page)')
+        if title and len(title) < 15:
+            reasons.append(f'title_suspiciously_short ({len(title)} chars)')
+        # the SKU normally leads with the brand; if that word is nowhere in the
+        # title, the row probably belongs to a different product
+        sku_brand = re.split(r'[-\s]', re.sub(r'^(WM|WH|AP)-', '', sku))[0].lower()
+        if len(sku_brand) > 3 and title and sku_brand not in title.lower():
+            reasons.append(f'brand_missing_from_title (sku says {sku_brand})')
+
+        blob = ' '.join([str(row.get(c, '')) for c in df.columns])
+        found_dead = [p for p in DEAD_PLACEHOLDERS if p in blob]
+        if found_dead:
+            reasons.append(f'placeholder_spec_text ({found_dead[0]}) - rebuild '
+                           f'this CSV, it predates the KI-14 fix')
+
+        joined = ' '.join([title.lower(), cats.lower(), desc.lower()])
+        if 'front load' in title.lower() and 'top load' in joined.replace(title.lower(), ''):
+            reasons.append('front_load_titled_but_top_load_labelled')
+
+        records.append({'idx': idx, 'sku': sku, 'title': title,
+                        'images': image_urls, 'reasons': reasons})
+
+    # ---- cross-row checks: two SKUs that resolved to the SAME listing -------
+    # This is the classic wrong-match signature and no per-row check can see it.
+    for label, key_of in (
+        ('same_first_image_as', lambda r: r['images'][0] if r['images'] else ''),
+        ('identical_gallery_as', lambda r: ','.join(sorted(r['images'])) if len(r['images']) > 1 else ''),
+        ('same_title_as', lambda r: r['title'].strip().lower()),
+    ):
+        groups = {}
+        for rec in records:
+            key = key_of(rec)
+            if key:
+                groups.setdefault(key, []).append(rec)
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            for rec in group:
+                others = [g['sku'] for g in group if g is not rec][:3]
+                rec['reasons'].append(f'{label} {", ".join(others)}')
+    # partial gallery overlap: different listings of the same wrong product
+    shared_image_pairs(records)
+    # ...and the same check against the FILES, which is the only one that can
+    # see a duplicate gallery once app.py has renamed every image per SKU
+    if local_images_available and check_images:
+        duplicate_image_content(records)
+
+    for rec in records:
+        if rec['reasons']:
+            issues.append({'row': rec['idx'] + 2, 'sku': rec['sku'],
+                           'title': rec['title'][:120],
+                           'reasons': '; '.join(rec['reasons']),
+                           'first_image': ', '.join(rec['images'][:1])})
+
+    counts = Counter()
+    for item in issues:
+        for reason in item['reasons'].split('; '):
+            counts[summary_key(reason)] += 1
+
+    print('\nIssue summary:')
+    if not counts:
+        print('  none - file looks import-ready')
+    for reason, count in counts.most_common():
+        print(f'  - {reason}: {count}')
+
+    print(f'\nRows with issues: {len(issues)} / {len(df)}')
+    for item in issues[:30]:
+        print(f"  row {item['row']}: sku={item['sku']} | {item['reasons']}")
+    if len(issues) > 30:
+        print(f'  ... and {len(issues) - 30} more (see validation_issues.csv)')
+
+    if issues and write_issues:
+        pd.DataFrame(issues).to_csv('validation_issues.csv', index=False)
+        print('\nSaved details to validation_issues.csv')
+
+    return issues
+
+
+def main():
+    csv_path = pick_input_path()
+    try:
+        if csv_path.lower().endswith(('.xlsx', '.xls')):
+            df = pd.read_excel(csv_path, dtype=str).fillna('')
+        else:
+            df = pd.read_csv(csv_path, dtype=str).fillna('')
+    except FileNotFoundError:
+        print(f'File not found: {csv_path}')
+        print('Usage: python validate_csv.py [csv_path|filled.xlsx]')
+        sys.exit(1)
+
+    # an enricher sheet and a WooCommerce CSV need different checks; the
+    # 'status' + 'url_link' pair only exists on the former
+    lowered = {str(c).strip().lower() for c in df.columns}
+    if {'status', 'url_link'} <= lowered:
+        issues = validate_filled(df, csv_path)
+    else:
+        issues = validate_export(df, csv_path)
+
+    # A-4: exit non-zero when anything was flagged, so this can gate a script.
+    # It used to always exit 0, which made "clean" and "16 rows are wrong"
+    # indistinguishable to anything calling it. --warn-only keeps the old
+    # behaviour for a chain that wants the report without the gate.
+    if issues and '--warn-only' not in sys.argv:
+        print(f'\nExiting 1: {len(issues)} row(s) flagged. '
+              f'Pass --warn-only to report without failing.')
+        sys.exit(1)
+    sys.exit(0)
+
+
+if __name__ == '__main__':
+    main()

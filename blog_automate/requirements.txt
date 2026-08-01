@@ -1,0 +1,4 @@
+# blog_automate. The deterministic path needs only `requests` (already a
+# dependency of the parent pipeline). `anthropic` is needed only for --llm.
+requests>=2.31
+anthropic>=0.116

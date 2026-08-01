@@ -1,0 +1,89 @@
+# Python environment and cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local environment/secrets files
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+
+# Browser clearance cookie for wc_publish.py --cookie-file. A live session
+# credential for the storefront - never commit it.
+cookie.txt
+cookie*.txt
+*.cookie
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build / packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Runtime-generated catalogue outputs
+*_filled.xlsx
+*_recovery.xlsx
+wordpress_ready*.csv
+validation_issues.csv
+product_images_for_upload/
+*_report.md
+seo_changes.csv
+
+# Generated blog drafts and their briefs. Regenerable from the catalogue.
+blog_automate/out/
+
+# Page/search cache (sku_enricher --cache-*). Regenerable, and a full batch is
+# a few hundred MB of compressed HTML.
+.cache/
+
+# Store checkpoints (wc_checkpoint.py). These are copies of live product data,
+# including whatever meta the plugins keep - not something to push to a remote.
+# They are also the rollback, so do NOT delete them casually.
+checkpoints/
+seo_dryrun.*
+seo_applied.csv
+seo_apply.*
+seo_one.csv
+
+# Archived batches (batches/<name>/) and dated file backups. Kept on disk,
+# out of git - a single batch is ~30 MB of .webp.
+batches/
+backups/
+
+# _push_export is a SEPARATE nested repo with its own remote. Committing it from
+# the outer repo records a gitlink that no clone can resolve. `git add -A` did
+# exactly that once; this stops it happening again. Commit inside it instead.
+_push_export/
+
+# Local input datasets and exports
+*.xlsx
+*.xls
+*.tsv
+
+# ...EXCEPT the taxonomy, which is configuration, not data. app.py cannot map a
+# single category without it, and it has no other backup. Must come after the
+# *.xlsx rule above to override it.
+!category_map.xlsx
+!SubCategory_Attributes_Master.xlsx
+
+# Portable dev tooling (a full Node distribution, ~100 MB). Installed per
+# machine, not source. node.exe alone trips GitHub's 50 MB file warning.
+Code_Unrelated/_tools/

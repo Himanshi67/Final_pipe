@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe *)",
+      "Bash(.venv\\Scripts\\python.exe *)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git hash-object *)",
+      "PowerShell(.venv\\Scripts\\python.exe *)",
+      "PowerShell(git status*)",
+      "PowerShell(git diff*)",
+      "PowerShell(git log*)",
+      "PowerShell(git add *)",
+      "PowerShell(git commit *)",
+      "PowerShell(git hash-object *)",
+      "PowerShell(Copy-Item *)",
+      "PowerShell(Get-FileHash *)"
+    ],
+    "deny": [
+      "Read(.venv/**)",
+      "Read(**/__pycache__/**)",
+      "Read(product_images_for_upload/**)"
+    ]
+  }
+}
