@@ -6,13 +6,18 @@ description: Sync sku_enricher.py (and shared docs) from root to Sku_enrichment/
 # Sync the duplicate copies
 
 Root files are the source of truth. `_push_export\` is an UNTRACKED NESTED git repo
-(own remote: SKU_Scripts.git); the outer repo pushes to Pipe.git.
+(own remote: SKU_Scripts.git). The outer repo is a local git repo with no remote
+configured — `git remote -v` before assuming a push target.
+
+`_push_export\` keeps a FLAT layout: docs that live in `docs\` at root land at the
+ROOT of `_push_export\`, not in a `docs\` subfolder there. Do not restructure it.
 
 ## Copy map
 | Source (root) | Targets |
 |---|---|
 | `sku_enricher.py` | `Sku_enrichment\`, `_push_export\`, `_push_export\Sku_enrichment\` |
-| `README.md`, `requirements.txt`, `PIPELINE_GUIDE.md`, `claude_prompt.md`, `data_flow.svg`, `app.py`, `validate_csv.py`, `build_csv.py`, `wc_publish.py`, `HANDOFF.md`, `AUTOMATION_OPPORTUNITIES.md` | `_push_export\` (only those that exist there — check first) |
+| `README.md`, `requirements.txt`, `app.py`, `validate_csv.py`, `build_csv.py`, `wc_publish.py` | `_push_export\` (only those that exist there — check first) |
+| `docs\PIPELINE_GUIDE.md`, `docs\claude_prompt.md`, `docs\data_flow.svg`, `docs\HANDOFF.md`, `docs\AUTOMATION_OPPORTUNITIES.md` | `_push_export\` **root** (flatten — drop the `docs\` prefix) |
 | `category_map.xlsx`, `SubCategory_Attributes_Master.xlsx` | `_push_export\` — app.py is unrunnable without the taxonomy. Both repos un-ignore these two despite ignoring `*.xlsx`. |
 | `Sku_enrichment\README.md`, `Sku_enrichment\requirements.txt` | `_push_export\Sku_enrichment\` |
 

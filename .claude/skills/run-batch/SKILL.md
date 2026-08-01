@@ -39,4 +39,4 @@ context.
 User runs `.venv\Scripts\python.exe -m streamlit run app.py`, uploads the
 `_filled.xlsx`, sets the WordPress upload month, downloads the CSV into this folder →
 `validate_csv.py` → upload `product_images_for_upload\*.webp` to WordPress Media
-(same month) → WooCommerce > Products > Import. Details: PIPELINE_GUIDE.md §2–3.
+(same month) → WooCommerce > Products > Import. Details: docs/PIPELINE_GUIDE.md §2–3.

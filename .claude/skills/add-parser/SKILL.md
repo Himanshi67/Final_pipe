@@ -23,4 +23,4 @@ description: Add a new retailer site parser to sku_enricher.py. Use when the use
 4. **Verify** (runner agent): scratch input with 2–3 SKUs known to exist on that
    retailer, `--limit` run; confirm FOUND rows cite the new domain and capture
    price + ≥3 images.
-5. **/sync-copies**, and add the domain to the site list in PIPELINE_GUIDE.md §3.
+5. **/sync-copies**, and add the domain to the site list in docs/PIPELINE_GUIDE.md §3.

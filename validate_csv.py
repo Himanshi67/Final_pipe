@@ -140,6 +140,14 @@ def implausible_tv_price(title, sale):
     return ''
 
 
+def issues_report_path(source_path):
+    """Where to write validation_issues.csv: NEXT TO the file being validated,
+    not in whatever directory the command happened to be run from. Keeps a
+    `validate_csv.py runs\\led-2026-07\\out.csv` from littering the repo root."""
+    folder = os.path.dirname(os.path.abspath(str(source_path)))
+    return os.path.join(folder, 'validation_issues.csv')
+
+
 def summary_key(reason):
     """The reason with its per-row detail stripped, so the summary counts
     kinds of problem rather than instances. Everything after '(' is detail,
@@ -453,12 +461,13 @@ def validate_filled(df, path):
         print(f'  ... and {len(issues) - 30} more (see validation_issues.csv)')
 
     if issues:
+        report = issues_report_path(path)
         pd.DataFrame([{'row': r['idx'] + 2, 'sku': r['sku'],
                        'title': r['title'][:120],
                        'reasons': '; '.join(r['reasons']),
                        'url': r['url']} for r in issues]
-                     ).to_csv('validation_issues.csv', index=False)
-        print('\nSaved details to validation_issues.csv')
+                     ).to_csv(report, index=False)
+        print(f'\nSaved details to {report}')
     print('\nFix what matters, then run app.py / build_csv.py on this file.')
     return issues
 
@@ -675,8 +684,9 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
         print(f'  ... and {len(issues) - 30} more (see validation_issues.csv)')
 
     if issues and write_issues:
-        pd.DataFrame(issues).to_csv('validation_issues.csv', index=False)
-        print('\nSaved details to validation_issues.csv')
+        report = issues_report_path(csv_path)
+        pd.DataFrame(issues).to_csv(report, index=False)
+        print(f'\nSaved details to {report}')
 
     return issues
 

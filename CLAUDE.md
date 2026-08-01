@@ -38,7 +38,24 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
 - `.cache\` (gitignored) holds gzipped pages and search results, TTL 14 days.
   Only successes are cached; a cache error is always a miss, never a failure.
 
-## Commands (full flag semantics: PIPELINE_GUIDE.md §3 — don't guess flags)
+## Repo layout
+    *.py                  the 7 pipeline scripts — MUST stay at root (see below)
+    category_map.xlsx     taxonomy; app.py loads it from NEXT TO app.py
+    SubCategory_Attributes_Master.xlsx
+    docs\                 all reference docs (KNOWN_ISSUES, PIPELINE_GUIDE, HANDOFF, …)
+    inputs\               source SKU lists
+    runs\<name>\          loose outputs + logs from one run (gitignored)
+    batches\<name>\       curated archived batch: filled xlsx, CSV, images, README
+    checkpoints\  .cache\  product_images_for_upload\  backups\   generated state
+    blog_automate\        isolated blog generator
+    Sku_enrichment\  _push_export\   mirrors — never edit directly, use /sync-copies
+    Code_Unrelated\       portable Node toolchain, nothing to do with the pipeline
+
+The scripts are anchored on `Path(__file__).parent`: `sku_enricher.py` → `.cache\`,
+`wc_checkpoint.py` → `checkpoints\`, `app.py`/`validate_csv.py` → `category_map.xlsx`.
+Moving a `.py` file out of root silently relocates the directory it owns — don't.
+
+## Commands (full flag semantics: docs/PIPELINE_GUIDE.md §3 — don't guess flags)
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --limit 3          # smoke
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --min-price 8000 --delay 5 8
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --retry-incomplete # re-do half-filled rows
@@ -86,10 +103,10 @@ Main loop does: designing fixes, editing code, judgment calls. Prefer one well-b
 subagent over 20 tool calls in the main context.
 
 ## Docs (load on demand only)
-- `KNOWN_ISSUES.md` — pre-diagnosed bugs with line anchors + acceptance tests. Read it
+- `docs/KNOWN_ISSUES.md` — pre-diagnosed bugs with line anchors + acceptance tests. Read it
   BEFORE diagnosing any enricher misbehavior; most failure modes are already there.
-- `PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
-- `claude_prompt.md` — legacy manual prompt for humans; never load as instructions.
+- `docs/PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
+- `docs/claude_prompt.md` — legacy manual prompt for humans; never load as instructions.
 
 ## Session hygiene
 `/clear` between unrelated tasks · `/context` to audit window usage · long batches run

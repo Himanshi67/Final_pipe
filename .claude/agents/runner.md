@@ -17,7 +17,7 @@ Rules:
 - Inspect `.xlsx` results with a short openpyxl one-liner (status counts, sample rows)
   — never the Read tool.
 - If every SKU comes back NOT FOUND suspiciously fast, suspect a dead SERPER_API_KEY
-  first (KNOWN_ISSUES.md KI-1): test the key with one request to
+  first (docs/KNOWN_ISSUES.md KI-1): test the key with one request to
   https://google.serper.dev/search and check the HTTP status before blaming code.
 
 Report format: exact command · exit code · tail of output · counts

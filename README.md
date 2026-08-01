@@ -20,10 +20,10 @@ separate, opt-in tool that can use one for prose only; see the bottom.)
   WooCommerce  <-  Products > Import (by hand)  or  wc_publish.py (REST API)
 ```
 
-Full documentation: **PIPELINE_GUIDE.md** (every flag, every column, where data
-goes). Visual overview: **data_flow.svg**. Pre-diagnosed bugs with line anchors:
-**KNOWN_ISSUES.md**. What else could be automated: **AUTOMATION_OPPORTUNITIES.md**.
-State for a fresh session: **HANDOFF.md**.
+Full documentation: **docs/PIPELINE_GUIDE.md** (every flag, every column, where data
+goes). Visual overview: **docs/data_flow.svg**. Pre-diagnosed bugs with line anchors:
+**docs/KNOWN_ISSUES.md**. What else could be automated: **docs/AUTOMATION_OPPORTUNITIES.md**.
+State for a fresh session: **docs/HANDOFF.md**.
 
 ## One-time setup
 
@@ -258,7 +258,7 @@ line lands in your shell history.
 **The manual route is unaffected** — your browser passes the challenge, so
 Media upload + WooCommerce > Products > Import work today.
 
-Details in KNOWN_ISSUES.md (KI-15).
+Details in docs/KNOWN_ISSUES.md (KI-15).
 
 ## What is on the store right now
 

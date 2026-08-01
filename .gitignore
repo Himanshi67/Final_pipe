@@ -58,10 +58,14 @@ blog_automate/out/
 # including whatever meta the plugins keep - not something to push to a remote.
 # They are also the rollback, so do NOT delete them casually.
 checkpoints/
-seo_dryrun.*
-seo_applied.csv
-seo_apply.*
-seo_one.csv
+
+# runs/<name>/ - the loose CSVs and logs one run leaves behind (seo_apply.log,
+# seo_dryrun.csv, a _filled.xlsx, ...). Kept on disk for reference, out of git.
+# Anything worth keeping gets promoted to batches/<name>/ instead.
+runs/
+
+# inputs/ - source SKU lists. Customer data, and already covered by *.xlsx.
+inputs/
 
 # Archived batches (batches/<name>/) and dated file backups. Kept on disk,
 # out of git - a single batch is ~30 MB of .webp.

@@ -19,5 +19,5 @@ When a parser under-extracts:
    with sample HTML/JSON fragments trimmed to the relevant elements only.
 
 For search/API issues: check serper.dev status and response codes (a dead key returns
-non-200 with a JSON error body — see KNOWN_ISSUES.md KI-1) and whether DuckDuckGo
+non-200 with a JSON error body — see docs/KNOWN_ISSUES.md KI-1) and whether DuckDuckGo
 fallback is engaging in the run logs.
