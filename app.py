@@ -83,8 +83,18 @@ WEBP_METHOD = 4
 # only has to be big enough for the zoom/lightbox; past this it is bandwidth.
 MAX_IMAGE_EDGE = 2400
 # Below this a photo is a thumbnail, not a product image. Skipped outright -
-# one image fewer beats a blurry one on the storefront.
-MIN_IMAGE_EDGE = 500
+# one image fewer beats a blurry one on the storefront. Raised from 500 to an
+# HD floor: 500px filled a product tile but went soft the moment a customer
+# opened the zoom/lightbox. Measured against the LED batch this rejects the
+# bottom ~11% of images; drop it back toward 500 if a category is coming out
+# with too few photos (the count is reported per run).
+MIN_IMAGE_EDGE = 1000
+
+# Catalogue tiles only line up if every master shares one aspect ratio, so each
+# photo is padded - never cropped - onto a square canvas. Padding keeps wide
+# products (TVs, front-load washers) whole; a centre-crop cut their edges off.
+SQUARE_IMAGES = True
+SQUARE_BACKGROUND = (255, 255, 255)
 BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36')
 
@@ -93,6 +103,26 @@ BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 # -> 2392x1479/220 KB. Magento stores do the same once resize params go.
 _AMAZON_HOSTS = ('media-amazon.com', 'images-amazon.com', 'ssl-images-amazon.com')
 _AMAZON_RENDITION_RE = re.compile(r'\._[A-Z0-9_,%-]+_\.(?=[A-Za-z]{3,4}$)')
+
+# Haier serves TWO files per photo. '..._1200_p1911.jpg' is a 1200x628 SHARE
+# BANNER - the product sits in the middle of a letterbox and fills under half
+# the frame. The bare name is the same shot at 1200x1200, properly framed.
+# Measured on W020250724478599787988: 1200x628 -> 1200x1200. This is also what
+# validate_csv flags as image_not_a_product_photo on Haier rows.
+_HAIER_HOSTS = ('image.haier.com',)
+_HAIER_RENDITION_RE = re.compile(r'_\d{3,4}(?:_p\d+)?(?=\.[A-Za-z]{3,4}$)')
+
+# Shopify renders any width on demand; the stored original is usually far
+# larger than the page asked for. Measured on foxskyindia: ?width=1946 gave
+# 1946x1946, dropping it gave 3600x3600. Where the theme already asked for the
+# original this is a no-op, so it is safe to apply blindly.
+_SHOPIFY_WIDTH_PARAMS = {'width', 'height'}
+_SHOPIFY_SUFFIX_RE = re.compile(r'_(?:\d{2,4}x\d{0,4}|\d{2,4}x)(?=\.[A-Za-z]{3,4}$)')
+
+# Thumbor/imgproxy style filter segments. 'filters:quality(70)' is the CDN
+# being told to throw detail away; measured +161% bytes at identical pixel
+# dimensions once removed.
+_THUMBOR_FILTER_RE = re.compile(r'/filters:[a-z_]+\([^)]*\)', re.IGNORECASE)
 
 
 def largest_rendition(url):
@@ -109,10 +139,25 @@ def largest_rendition(url):
         parts = urlsplit(text)
     except Exception:
         return text
-    if any(h in parts.netloc.lower() for h in _AMAZON_HOSTS):
+    host = parts.netloc.lower()
+    if any(h in host for h in _AMAZON_HOSTS):
         return urlunsplit((parts.scheme, parts.netloc,
                            _AMAZON_RENDITION_RE.sub('.', parts.path),
                            parts.query, parts.fragment))
+    if any(h in host for h in _HAIER_HOSTS):
+        return urlunsplit((parts.scheme, parts.netloc,
+                           _HAIER_RENDITION_RE.sub('', parts.path),
+                           parts.query, parts.fragment))
+    if _THUMBOR_FILTER_RE.search(parts.path):
+        return urlunsplit((parts.scheme, parts.netloc,
+                           _THUMBOR_FILTER_RE.sub('', parts.path),
+                           parts.query, parts.fragment))
+    if '/cdn/shop/' in parts.path.lower():        # Shopify storefront
+        keep = [kv for kv in parts.query.split('&')
+                if kv and kv.split('=')[0].lower() not in _SHOPIFY_WIDTH_PARAMS]
+        return urlunsplit((parts.scheme, parts.netloc,
+                           _SHOPIFY_SUFFIX_RE.sub('', parts.path),
+                           '&'.join(keep), parts.fragment))
     if '/media/catalog/product/' in parts.path.lower() and parts.query:
         drop = {'width', 'height', 'w', 'h', 'quality', 'fit', 'resize', 'size'}
         keep = [kv for kv in parts.query.split('&')
@@ -625,10 +670,53 @@ def price_band_tag(sale_price):
     return ''
 
 
+CATEGORY_SEO_FILE = 'category_seo.xlsx'
+
+
+def load_category_seo():
+    """Curated per-category tags and SEO keywords from category_seo.xlsx.
+
+    Hand-written, because tags exist to group products the way a customer
+    searches and nobody searches a model code. Missing file is not an error -
+    the derived tags below still work, they are just not topped up.
+    Regenerate with tools\\build_category_seo.py."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        CATEGORY_SEO_FILE)
+    table = {}
+    if not os.path.exists(path):
+        return table
+    try:
+        rows = pd.read_excel(path, dtype=str).fillna('').values.tolist()
+    except Exception:
+        return table
+    for row in rows:
+        parent = compact(row[0] if len(row) > 0 else '')
+        sub = compact(row[1] if len(row) > 1 else '')
+        if not parent or _cat_norm(parent) == 'parent category':
+            continue
+        table[_cat_norm(f'{parent} > {sub}')] = {
+            'tags': [compact(t) for t in str(row[2] if len(row) > 2 else '').split(',') if compact(t)],
+            'focus': compact(row[3] if len(row) > 3 else ''),
+            'keywords': [compact(k) for k in str(row[4] if len(row) > 4 else '').split(',') if compact(k)],
+        }
+    return table
+
+
+CATEGORY_SEO = load_category_seo()
+
+
+def category_seo_for(parent, sub):
+    """Curated entry for 'Parent > Sub', falling back to the parent alone."""
+    return (CATEGORY_SEO.get(_cat_norm(f'{parent} > {sub}'))
+            or CATEGORY_SEO.get(_cat_norm(f'{parent} > {parent}'))
+            or {})
+
+
 def build_tags(brand, parent, sub, title, sale_price, category_family):
     """WooCommerce product tags, driven by the taxonomy file's attribute sheet
-    plus specs read off the title. Deterministic - the same product always
-    produces the same tags, and editing the Excel changes the output."""
+    plus specs read off the title, then topped up with the curated per-category
+    tags in category_seo.xlsx. Deterministic - the same product always produces
+    the same tags, and editing either Excel changes the output."""
     tags, seen = [], set()
 
     def add(value):
@@ -670,6 +758,11 @@ def build_tags(brand, parent, sub, title, sale_price, category_family):
         add(specs['screen'])
     add(configuration_text(title, category_family))
     add(price_band_tag(sale_price))
+
+    # curated category tags last: the product's own specs are the more specific
+    # signal, and these are the broad terms customers actually search
+    for tag in category_seo_for(parent, sub).get('tags', ()):
+        add(tag)
     return ', '.join(tags)
 
 
@@ -869,11 +962,15 @@ def build_descriptions(sku, title, brand, category, scraped=()):
     rows = product_specs(title, brand, category, scraped)
     extra = [(label, value) for label, value in rows if label != 'Brand']
 
+    # Paragraph, not a bullet list: the storefront renders this inline under the
+    # title, where a <ul> broke the flow. Still one sentence per VERIFIED spec
+    # pair - nothing is written here that product_specs() did not produce, so a
+    # missing spec stays missing instead of being smoothed over with prose.
     configuration_points = compact(
-        '<ul class="product-key-features">'
-        + ''.join(f'<li>{label}: {value}.</li>' for label, value in rows)
-        + '</ul>'
-    )
+        '<p class="product-key-features">'
+        + ' '.join(f'{label}: {value}.' for label, value in rows)
+        + '</p>'
+    ) if rows else ''
     short_desc = html_block([
         ('Brand', brand),
         ('Product SKU', sku),
@@ -939,7 +1036,7 @@ def seo_plugin_keys(plugin):
 
 
 def seo_columns(plugin):
-    names = ['slug']
+    names = ['slug', 'category focus keyword', 'category seo keywords']
     for keys in seo_plugin_keys(plugin):
         names.extend([keys['title'], keys['description'], keys['focus']])
     return names
@@ -1054,16 +1151,30 @@ def seo_description(title, brand, category_hierarchy, spec_rows,
     return out or trim_to(f'{compact(title)}.', SEO_DESC_MAX)
 
 
+def split_hierarchy(category_hierarchy):
+    """'LED > Mini LED' -> ('LED', 'Mini LED'). A bare parent returns itself."""
+    parts = [compact(p) for p in str(category_hierarchy or '').split('>')]
+    parts = [p for p in parts if p]
+    if not parts:
+        return '', ''
+    return parts[0], (parts[-1] if len(parts) > 1 else parts[0])
+
+
 def seo_focus_keyword(brand, sku, category_hierarchy):
     """One phrase a shopper would actually type. Model code when there is one,
-    because that is the query that converts; brand + category otherwise."""
+    because that is the query that converts; otherwise the curated category
+    phrase from category_seo.xlsx, which is a real search term - 'brand + leaf'
+    produced things like 'haier qned' that nobody types."""
     code = model_code(sku)
     brand = compact(brand)
     if brand.lower() == 'authorized brand':
         brand = ''
-    leaf = compact(str(category_hierarchy).split('>')[-1])
-    parts = [p for p in (brand, code or leaf) if p]
-    return ' '.join(parts).lower().strip()
+    if code:
+        return ' '.join(p for p in (brand, code) if p).lower().strip()
+    parent, sub = split_hierarchy(category_hierarchy)
+    curated = category_seo_for(parent, sub).get('focus', '')
+    leaf = curated or sub
+    return ' '.join(p for p in (brand, leaf) if p).lower().strip()
 
 
 def seo_fields(sku, title, brand, category_hierarchy, spec_rows,
@@ -1073,7 +1184,18 @@ def seo_fields(sku, title, brand, category_hierarchy, spec_rows,
     meta_desc = seo_description(title, brand, category_hierarchy, spec_rows,
                                 regular_price, sale_price)
     focus = seo_focus_keyword(brand, sku, category_hierarchy)
-    out = {'slug': seo_slug(sku, title)}
+    parent, sub = split_hierarchy(category_hierarchy)
+    curated = category_seo_for(parent, sub)
+    out = {
+        'slug': seo_slug(sku, title),
+        # category-level terms, the same for every product in the category.
+        # They are what the CATEGORY page should rank for, so they are carried
+        # here rather than merged into the product's own focus keyword - two
+        # products competing for one phrase is what suppressed focus keywords
+        # across the catalogue last time.
+        'category focus keyword': curated.get('focus', ''),
+        'category seo keywords': ', '.join(curated.get('keywords', ())),
+    }
     for keys in seo_plugin_keys(plugin):
         out[keys['title']] = meta_title
         out[keys['description']] = meta_desc
@@ -1102,6 +1224,22 @@ def split_image_urls(row):
     return [compact(x) for x in split_image_list(normalised) if compact(x)]
 
 
+def pad_to_square(image):
+    """Centre the photo on a square white canvas without cropping or upscaling.
+
+    Returns RGB: the alpha channel is composited onto white rather than kept,
+    because a transparent PNG and an opaque JPEG side by side on the storefront
+    render as two different backgrounds. Already-square photos come back
+    unchanged apart from that flattening."""
+    side = max(image.size)
+    source = image if image.mode == 'RGBA' else image.convert('RGBA')
+    canvas = Image.new('RGB', (side, side), SQUARE_BACKGROUND)
+    canvas.paste(source,
+                 ((side - image.size[0]) // 2, (side - image.size[1]) // 2),
+                 source)                      # alpha as mask -> transparent = white
+    return canvas
+
+
 def download_urls_for_sku(sku, urls):
     """Download and convert images. Returns the list of indexes actually
     saved, so the exported Images column never references files that were
@@ -1109,8 +1247,9 @@ def download_urls_for_sku(sku, urls):
 
     Quality rules, all enforced here so the browser app and build_csv.py cannot
     diverge: ask the CDN for its largest rendition, refuse anything below
-    MIN_IMAGE_EDGE as unusable on a product page, never upscale, and only
-    downscale past MAX_IMAGE_EDGE."""
+    MIN_IMAGE_EDGE as unusable on a product page, never upscale, only downscale
+    past MAX_IMAGE_EDGE, and finish on a 1:1 canvas so every catalogue tile is
+    the same shape."""
     root = os.path.join(os.getcwd(), IMAGE_ROOT)
     os.makedirs(root, exist_ok=True)
     rejected = []
@@ -1140,6 +1279,9 @@ def download_urls_for_sku(sku, urls):
             image = image.resize((max(1, round(image.size[0] * ratio)),
                                   max(1, round(image.size[1] * ratio))),
                                  Image.LANCZOS)
+        # last, so the pad is measured against the final pixel size
+        if SQUARE_IMAGES:
+            image = pad_to_square(image)
         target = os.path.join(root, f'{sku}_{index}.webp')
         image.save(target, format='WEBP', quality=WEBP_QUALITY,
                    method=WEBP_METHOD)

@@ -1,0 +1,546 @@
+diff --git a/app.py b/app.py
+index 988eee1..efdd4b8 100644
+--- a/app.py
++++ b/app.py
+@@ -3,14 +3,22 @@ import pandas as pd
+ import re
+ import io
+ import os
++from datetime import datetime
+ import requests
+ from concurrent.futures import ThreadPoolExecutor, as_completed
++from PIL import Image
+ 
+ 
+-REQUIRED_INPUT_COLUMNS = ['sku', 'title', 'categories', 'Brands', 'regular price', 'sale price', 'url_link']
++REQUIRED_INPUT_COLUMNS = ['sku', 'title', 'categories', 'Brands', 'regular price', 'sale price', 'url_link', 'image_url']
+ EXPORTED_OUTPUT_COLUMNS = ['sku', 'cross reference tag', 'configuration', 'short description', 'description', 'title', 'categories', 'regular price', 'sale price', 'Brands', '_consolidated_sku', 'Images']
+ IMAGE_ROOT = 'product_images_for_upload'
+-MEDIA_BASE = 'https://shreejeeelectronics.in/wp-content/uploads/2026/05'
++
++
++def build_media_base():
++    return f"https://shreejeeelectronics.in/wp-content/uploads/{datetime.now():%Y/%m}"
++
++
++MEDIA_BASE = build_media_base()
+ IRON_WORD_RE = re.compile(r'\biron\b', re.IGNORECASE)
+ 
+ 
+@@ -66,6 +74,56 @@ def infer_category(title, sku, categories):
+     return 'Home Appliances'
+ 
+ 
++def resolve_product_category(raw_item_name, raw_categories='', detected_brand=''):
++    text_to_scan = ' '.join([
++        compact(raw_item_name).lower(),
++        compact(raw_categories).lower().replace(',', ' '),
++        compact(detected_brand).lower(),
++    ])
++
++    # Washing Machines tree
++    if 'top load' in text_to_scan or re.search(r'\btl\b', text_to_scan):
++        return 'Washing Machines > Top load'
++    if 'front load' in text_to_scan or re.search(r'\bfl\b', text_to_scan):
++        return 'Washing Machines > Front Load'
++    if 'semi auto' in text_to_scan or 'semi automatic' in text_to_scan or re.search(r'\bsemi\b', text_to_scan):
++        return 'Washing Machines > Semi Auto'
++    if 'washing machine' in text_to_scan or 'wash' in text_to_scan or 'wm-' in text_to_scan:
++        return 'Washing Machines > Top load'
++
++    # Air Conditioner tree
++    if 'inverter ac' in text_to_scan or 'air conditioner inverter' in text_to_scan or 'inverter air conditioner' in text_to_scan:
++        return 'Air Conditioner > Inverter AC'
++    if 'split ac' in text_to_scan or re.search(r'\bsplit\b', text_to_scan) or 'sp ac' in text_to_scan:
++        return 'Air Conditioner > Split AC'
++    if 'window ac' in text_to_scan or re.search(r'\bwindow\b', text_to_scan) or 'win ac' in text_to_scan:
++        return 'Air Conditioner > Window AC'
++    if re.search(r'\bac\b', text_to_scan) or 'air conditioner' in text_to_scan or 'conditioner' in text_to_scan:
++        return 'Air Conditioner > Non-Inverter AC'
++
++    # Cooling and Freezing tree
++    if 'deep freezer' in text_to_scan or re.search(r'\bdf\b', text_to_scan):
++        return 'Cooling & Freezing > Deep Freezers'
++    if 'air cooler' in text_to_scan or 'cooler' in text_to_scan:
++        return 'Cooling & Freezing > Air Coolers'
++
++    # LED tree
++    if 'qled' in text_to_scan:
++        return 'LED > QLED'
++    if 'oled' in text_to_scan:
++        return 'LED > OLED'
++    if 'mini led' in text_to_scan or 'led' in text_to_scan or 'tv' in text_to_scan:
++        return 'LED > Mini LED'
++
++    # Home Appliances tree
++    if 'refrigerator' in text_to_scan or 'fridge' in text_to_scan:
++        return 'Home Appliances > Refrigerators'
++    if 'fan' in text_to_scan:
++        return 'Home Appliances > Fans'
++
++    return 'Home Appliances'
++
++
+ def prefixed_sku(raw_sku, category):
+     sku = compact(raw_sku)
+     if sku.startswith(('WM-', 'WH-', 'AP-')):
+@@ -85,6 +143,8 @@ def wattage(text):
+ def capacity_label(category, title):
+     if category == 'Washing Machines':
+         return 'Washing Capacity'
++    if category == 'Air Conditioner':
++        return 'Cooling Capacity'
+     if category == 'Water Heaters':
+         return 'Tank Volume'
+     if category == 'Microwave Ovens':
+@@ -105,6 +165,12 @@ def capacity_value(title, category):
+     if category == 'Washing Machines':
+         m = re.search(r'(\d+(?:\.\d+)?\s*(?:kg|kgs?|ltr|L|litre|litres))', text, re.IGNORECASE)
+         return m.group(1) if m else 'Standard Washing Capacity'
++    if category == 'Air Conditioner':
++        m_ton = re.search(r'(\d+(?:\.\d+)?\s*(?:ton|tr))', text, re.IGNORECASE)
++        if m_ton:
++            return m_ton.group(1)
++        m_btu = re.search(r'(\d{4,5}\s*(?:btu))', text, re.IGNORECASE)
++        return m_btu.group(1) if m_btu else 'Standard Cooling Capacity'
+     if category == 'Water Heaters':
+         m = re.search(r'(\d+(?:\.\d+)?\s*(?:L|liter|liters|litre|litres))', text, re.IGNORECASE)
+         return m.group(1) if m else 'Standard Tank Volume'
+@@ -128,6 +194,14 @@ def configuration_text(title, category):
+     t = compact(title).lower()
+     if category == 'Washing Machines':
+         return 'Semi-Automatic Top Load' if 'semi' in t else 'Fully Automatic Top Load'
++    if category == 'Air Conditioner':
++        if 'inverter' in t:
++            return 'Inverter AC'
++        if 'split' in t:
++            return 'Split AC'
++        if 'window' in t:
++            return 'Window AC'
++        return 'Non-Inverter AC'
+     if category == 'Water Heaters':
+         return 'Storage Water Geyser' if 'storage' in t else 'Instant Water Heater'
+     if category == 'Microwave Ovens':
+@@ -148,12 +222,81 @@ def html_block(rows):
+     return compact(f'<table><tbody>{content}</tbody></table>')
+ 
+ 
++def parse_dynamic_attributes_from_html(html_content, category_family=''):
++    if not html_content or not isinstance(html_content, str):
++        return []
++
++    family = compact(category_family)
++    family_prefix_map = {
++        'Washing Machines': 'WM',
++        'Air Conditioner': 'AC',
++        'Water Heaters': 'GY',
++    }
++    family_prefix = family_prefix_map.get(family, '')
++
++    function_label = 'Function Type'
++    capacity_label = 'Capacity'
++    if family_prefix:
++        function_label = f'{family_prefix} Function Type'
++        capacity_label = f'{family_prefix} Capacity'
++    if family == 'Washing Machines':
++        capacity_label = 'WM Washing Capacity'
++    elif family == 'Air Conditioner':
++        capacity_label = 'AC Cooling Capacity'
++    elif family == 'Water Heaters':
++        capacity_label = 'GY Tank Volume'
++
++    li_matches = re.findall(r'<li>(.*?)</li>', html_content, re.IGNORECASE | re.DOTALL)
++    parsed_attributes = []
++    attribute_name_map = {
++        'brand': 'Brand',
++        'configuration': function_label,
++        'function type': function_label,
++        'washing capacity': capacity_label,
++        'cooling capacity': capacity_label,
++        'storage capacity': capacity_label,
++        'tank volume': capacity_label,
++        'capacity': capacity_label,
++        'power rating': 'Power Rating',
++        'rated power': 'Power Rating',
++        'water level': 'Water Level',
++        'control type': 'Control Type',
++    }
++
++    for item in li_matches:
++        if ':' not in item:
++            continue
++
++        name_part, value_part = item.split(':', 1)
++        attr_name = compact(name_part)
++        attr_value = compact(value_part).rstrip('.')
++
++        if not attr_name or not attr_value:
++            continue
++
++        normalized_name = compact(attribute_name_map.get(attr_name.lower(), attr_name))
++
++        if not normalized_name:
++            continue
++
++        parsed_attributes.append((normalized_name, attr_value))
++
++    return parsed_attributes
++
++
+ def build_descriptions(sku, title, brand, category):
+     cap_label = capacity_label(category, title)
+     cap_value = capacity_value(title, category)
+     config = configuration_text(title, category)
+     power = wattage(title)
+-    bullets = compact(f'<ul class="product-key-features"><li>Brand: {brand}.</li><li>{cap_label}: {cap_value}.</li><li>Configuration: {config}.</li><li>Power Rating: {power}.</li></ul>')
++    configuration_points = compact(
++        f'<ul class="product-key-features">'
++        f'<li>Brand: {brand}.</li>'
++        f'<li>{cap_label}: {cap_value}.</li>'
++        f'<li>Configuration: {config}.</li>'
++        f'<li>Power Rating: {power}.</li>'
++        f'</ul>'
++    )
+     short_desc = html_block([
+         ('Brand', brand),
+         ('Product SKU', sku),
+@@ -170,7 +313,7 @@ def build_descriptions(sku, title, brand, category):
+         ('Rated Power Draw', power),
+         ('Standard Operational Grid', '230 V / 50 Hz'),
+     ])
+-    return bullets, short_desc, long_desc
++    return configuration_points, short_desc, long_desc
+ 
+ 
+ def template_csv_bytes():
+@@ -181,7 +324,9 @@ def template_csv_bytes():
+ 
+ def split_image_urls(row):
+     raw = ''
+-    if 'images' in row and compact(row.get('images')):
++    if 'image_url' in row and compact(row.get('image_url')):
++        raw = row.get('image_url')
++    elif 'images' in row and compact(row.get('images')):
+         raw = row.get('images')
+     elif 'Images' in row and compact(row.get('Images')):
+         raw = row.get('Images')
+@@ -198,11 +343,13 @@ def download_urls_for_sku(sku, urls):
+     # Save all images into a single root folder (no per-SKU subfolders)
+     def _fetch(pair):
+         index, url = pair
+-        target = os.path.join(root, f'{sku}_{index}.jpg')
+         response = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=7)
+         response.raise_for_status()
+-        with open(target, 'wb') as handle:
+-            handle.write(response.content)
++        target = os.path.join(root, f'{sku}_{index}.webp')
++        image = Image.open(io.BytesIO(response.content))
++        if image.mode not in ('RGB', 'RGBA'):
++            image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
++        image.save(target, format='WEBP', quality=90, method=6)
+ 
+     if not urls:
+         return
+@@ -229,12 +376,79 @@ def format_price_output(value):
+         return value
+ 
+ 
++def format_regular_price_output(value):
++    if value == '' or value is None:
++        return ''
++    try:
++        number = float(value)
++        return int(round(number))
++    except Exception:
++        return value
++
++
+ def require_input_columns(df):
+     missing = [col for col in REQUIRED_INPUT_COLUMNS if col not in df.columns]
+     if missing:
+         raise ValueError('Missing required columns: ' + ', '.join(missing))
+ 
+ 
++def read_uploaded_inventory(uploaded_file):
++    file_name = (getattr(uploaded_file, 'name', '') or '').lower()
++
++    if file_name.endswith(('.xlsx', '.xls')):
++        return pd.read_excel(io.BytesIO(uploaded_file.getvalue()))
++
++    raw_bytes = uploaded_file.getvalue()
++    encodings = ['utf-8-sig', 'utf-8', 'utf-16', 'cp1252', 'latin1']
++    separators = [None, ',', ';', '\t', '|']
++
++    for encoding in encodings:
++        try:
++            decoded_text = raw_bytes.decode(encoding)
++        except UnicodeDecodeError:
++            continue
++
++        for separator in separators:
++            try:
++                if separator is None:
++                    parsed = pd.read_csv(io.StringIO(decoded_text), sep=None, engine='python')
++                else:
++                    parsed = pd.read_csv(io.StringIO(decoded_text), sep=separator)
++
++                if len(parsed.columns) > 1 or len(parsed) > 0:
++                    return parsed
++            except Exception:
++                continue
++
++    raise ValueError('Unable to decode uploaded CSV. Save it as UTF-8 or UTF-16 and try again.')
++
++
++def filter_active_inventory_rows(df):
++    candidate_columns = [
++        'sku',
++        'title',
++        'categories',
++        'Brands',
++        'regular price',
++        'sale price',
++        'url_link',
++        'image_url',
++        'Product Configuration',
++        'configuration',
++        'Images',
++    ]
++    present_columns = [column for column in candidate_columns if column in df.columns]
++    if not present_columns:
++        return df.iloc[0:0].copy()
++
++    cleaned = df.copy()
++    for column in present_columns:
++        cleaned[column] = cleaned[column].map(compact)
++
++    active_mask = cleaned[present_columns].ne('').any(axis=1)
++    return cleaned[active_mask].copy()
++
++
+ def process_inventory(df):
+     require_input_columns(df)
+     working = df.copy()
+@@ -248,9 +462,10 @@ def process_inventory(df):
+     total = len(working)
+     for idx, (_, row) in enumerate(working.iterrows(), start=1):
+         title = compact(row.get('title'))
+-        category = infer_category(title, row.get('sku'), row.get('categories'))
+-        sku = prefixed_sku(row.get('sku'), category)
+         brand = compact(row.get('Brands')) or infer_brand(title)
++        category_hierarchy = resolve_product_category(title, row.get('categories'), brand)
++        category_family = category_hierarchy.split(' > ', 1)[0]
++        sku = prefixed_sku(row.get('sku'), category_family)
+         sale_price = number_or_blank(row.get('sale price'))
+         regular_price = number_or_blank(row.get('regular price'))
+         if regular_price == '' and sale_price != '':
+@@ -264,24 +479,48 @@ def process_inventory(df):
+ 
+         mapped_count = max(2, len(urls))
+         mapped_images = ','.join([f'{MEDIA_BASE}/{sku}_{i}.webp' for i in range(1, mapped_count + 1)])
+-        config, short_desc, long_desc = build_descriptions(sku, title, brand, category)
++        config, short_desc, long_desc = build_descriptions(sku, title, brand, category_family)
++        dynamic_attrs = parse_dynamic_attributes_from_html(config, category_family)
+ 
+-        processed_rows.append({
++        output_row = {
+             'sku': sku,
+-            'cross reference tag': f'{brand} | {category.lower().replace(" ", "_")}',
++            'cross reference tag': f'{brand} | {category_hierarchy.lower().replace(" ", "_")}',
+             'configuration': compact(config),
+             'short description': compact(short_desc),
+             'description': compact(long_desc),
+             'title': title,
+-            'categories': category,
+-            'regular price': format_price_output(regular_price),
++            'categories': category_hierarchy,
++            'regular price': format_regular_price_output(regular_price),
+             'sale price': format_price_output(sale_price),
+             'Brands': brand,
+             '_consolidated_sku': sku,
+             'Images': mapped_images,
+-        })
++        }
+ 
+-    return pd.DataFrame(processed_rows, columns=EXPORTED_OUTPUT_COLUMNS)
++        for index, (attr_name, attr_value) in enumerate(dynamic_attrs, start=1):
++            output_row[f'Attribute {index} name'] = attr_name
++            output_row[f'Attribute {index} value(s)'] = attr_value
++            output_row[f'Attribute {index} visible'] = '1'
++            output_row[f'Attribute {index} global'] = '1'
++
++        processed_rows.append(output_row)
++
++    attribute_columns = []
++    for row in processed_rows:
++        for key in row.keys():
++            if key.startswith('Attribute ') and key not in attribute_columns:
++                attribute_columns.append(key)
++
++    def attribute_sort_key(column_name):
++        match = re.search(r'Attribute (\d+) (name|value\(s\)|visible|global)', column_name)
++        if not match:
++            return (10**9, 10**9)
++        attribute_index = int(match.group(1))
++        field_order = {'name': 0, 'value(s)': 1, 'visible': 2, 'global': 3}[match.group(2)]
++        return (attribute_index, field_order)
++
++    ordered_columns = EXPORTED_OUTPUT_COLUMNS + sorted(attribute_columns, key=attribute_sort_key)
++    return pd.DataFrame(processed_rows).reindex(columns=ordered_columns)
+ 
+ 
+ def main():
+@@ -300,18 +539,22 @@ def main():
+ 
+     uploaded_file = st.file_uploader('Upload inventory CSV', type=['csv'])
+     if uploaded_file is not None:
+-        incoming = pd.read_csv(uploaded_file)
+-        if 'title' in incoming.columns:
+-            incoming = incoming.dropna(subset=['title']).copy()
+-            incoming['title'] = incoming['title'].map(compact)
+-            incoming = incoming[incoming['title'] != '']
+-        st.info(f'Loaded {len(incoming)} active rows')
+-
+-        if st.button('Generate file & apply changes', type='primary'):
+-            try:
+-                st.session_state['final_wordpress_df'] = process_inventory(incoming)
+-            except Exception as exc:
+-                st.error(str(exc))
++        try:
++            incoming = read_uploaded_inventory(uploaded_file)
++            total_rows = len(incoming)
++            incoming = filter_active_inventory_rows(incoming)
++            active_rows = len(incoming)
++            st.info(f'Loaded {active_rows} active rows from {total_rows} total rows')
++            if total_rows > 0 and active_rows == 0:
++                st.warning('The uploaded file has rows, but none contain usable product data in the core columns. If you uploaded the blank template, fill in product rows first.')
++
++            if st.button('Generate file & apply changes', type='primary'):
++                try:
++                    st.session_state['final_wordpress_df'] = process_inventory(incoming)
++                except Exception as exc:
++                    st.error(str(exc))
++        except Exception as exc:
++            st.error(str(exc))
+ 
+     if st.session_state['final_wordpress_df'] is not None:
+         result = st.session_state['final_wordpress_df']
+diff --git a/data added.xlsx b/data added.xlsx
+index 2b38b58..4863b3b 100644
+Binary files a/data added.xlsx and b/data added.xlsx differ
+diff --git a/input_template (1).csv b/input_template (1).csv
+index aacb8df..5a55a45 100644
+--- a/input_template (1).csv	
++++ b/input_template (1).csv	
+@@ -1,49 +1,49 @@
+-sku,title,categories,Brands,regular price,sale price,url_link,image_url
+-WA80F10B3NTL,"Samsung 10.0 kg Top Load Washing Machine with AI Wash and Heater, WA80F10B3N",,,,"32,600",https://www.samsung.com/in/washers-and-dryers/washing-machines/wa80f-21-top-load-washer-ai-wash-ecobubble-ai-energy-mode-10kg-navy-wa80f10b3ntl/?srsltid=AfmBOop5wzM3QJHiP7a54aaBYoeWGsOdoJkDC8PITJZLVFKuRGkjvEAj,"https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/energylabel/in-energylabel-product-wa80f10b3ntl-552916356?$Q90_2052_1641_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/energylabel/in-energylabel-wa80f10b3ntl-552916354?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824302?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824303?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824304?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824305?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824306?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824307?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824308?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824309?$Q90_1368_1094_F_JPG$"
+-WSEDGE-ULT-80-5.0-DB2M-CSRD,"Godrej 8 Kg 5 Star With 460 PowerMax Wash Motor Semi-Automatic Top Load Boderless Design Washing Machine Appliance (WSEDGE ULT 80 5.0 DB2M CSRD, Crystal Red, With Toughened Glass Lid)",,,,"13,999",https://www.amazon.in/Godrej-Ultima-Semi-Automatic-Washing-Machine/dp/B09GB3K3QL?th=1,"https://m.media-amazon.com/images/I/71uNmwWDcZL._SL1500_.jpg,https://m.media-amazon.com/images/I/71a81FrEsWL._SL1500_.jpg,https://m.media-amazon.com/images/I/71dN-AA8J6L._SL1500_.jpg,https://m.media-amazon.com/images/I/7192HHbig4L._SL1500_.jpg,https://m.media-amazon.com/images/I/61UuMXmDCtL._SL1500_.jpg,https://m.media-amazon.com/images/I/711s7mwT3HL._SL1500_.jpg,https://m.media-amazon.com/images/I/61r4-Ua9xsL._SL1500_.jpg"
+-WS-JAZZ-115-5.0-DB3-M-CSGR,Godrej WSEDGE JAZZ 115 5.0 DB3 M CSGR Semi Top load Washing Machine 11.5kg Crystal Grey,,,,"17,220",https://www.flipkart.com/godrej-11-5-kg-semi-automatic-top-load-washing-machine-grey/p/itm99e73c264d767,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/l/9/w/-original-imahmjqs73ghgdhj.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/n/v/k/11-5-56-2-wm-wsedge-jazz-115-5-0-db3-m-csgr-5-530-95-1-36-2-original-imah62cf2gvsdfsf.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/j/g/j/11-5-56-2-wm-wsedge-jazz-115-5-0-db3-m-csgr-5-530-95-1-36-2-original-imah62cfdyahdrf5.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/w/7/m/11-5-56-2-wm-wsedge-jazz-115-5-0-db3-m-csgr-5-530-95-1-36-2-original-imah62cfru8bpbp5.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/7/l/k/11-5-56-2-wm-wsedge-jazz-115-5-0-db3-m-csgr-5-530-95-1-36-2-original-imah62cf2zh6pzbg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/s/d/q/11-5-56-2-wm-wsedge-jazz-115-5-0-db3-m-csgr-5-530-95-1-36-2-original-imah62cffdfv6esg.jpeg?q=90"
+-WM-HTW120-178BK,Haier 12 kg Semi Automatic Top Load Black (HTW120-178BK),,,,"18,950",https://www.flipkart.com/haier-12-kg-semi-automatic-top-load-washing-machine-black/p/itm7837fefe0c92b,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/u/o/b/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5ut4upbpyd.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/j/a/m/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5ucbfjnydu.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/h/r/4/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5uvd3raz2c.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/u/u/f/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5umshmhcxy.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/h/w/h/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5umtqq7mb9.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/v/f/k/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5uwutquphe.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/y/6/d/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5uszfzvmbc.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/c/t/f/12-43-8-htw120-178bk-5-1-77-5-28-haier-92-original-imahke5u33wkf87e.jpeg?q=90"
+-WM-HTW80-178,Haier 8 Kg Semi-Automatic Washing Machine With Toughened Glass,,,,"13,950",https://www.haier.com/in/washing-machines/haier-8-kg-semi-automatic-top-load-washing-machine.shtml,"https://image.haier.com/in/washing-machines/W020240321575110475277_500.jpg,https://image.haier.com/in/washing-machines/W020240320676985843906.jpg,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/f/b/d/8-46-3-htw80-178-flowers-world-5-380-78-24-haier-96-original-imahfp2mdptsynzu.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/k/j/z/8-46-3-htw80-178-flowers-world-5-380-78-24-haier-96-original-imahfp2mb6ehghwc.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/0/8/m/8-46-3-htw80-178-flowers-world-5-380-78-24-haier-96-original-imahfp2mf9amgfqx.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/washing-machine-new/9/p/3/8-46-3-htw80-178-flowers-world-5-380-78-24-haier-96-original-imahfp2mwxmqbcaw.jpeg?q=90"
+-WM-HTW90-196BBK,"Haier 9 Kg 5 Star Semi Automatic Top Loading Washing Machine (HTW90-196BBK Magic Filter, Rat Mesh, Toughened Glass Top Black)",,,,"12,599",https://www.amazon.in/Haier-Automatic-Loading-HTW90-196BBK-Toughened/dp/B0FQ42VHPT,"https://m.media-amazon.com/images/I/61n6P9mHU-L._SL1500_.jpg,https://m.media-amazon.com/images/I/61LgqGcMqBL._SL1500_.jpg,https://m.media-amazon.com/images/I/61gHUnVWMBL._SL1500_.jpg,https://m.media-amazon.com/images/I/619eVjXTT3L._SL1500_.jpg,https://m.media-amazon.com/images/I/71nFyLCErlL._SL1500_.jpg,https://m.media-amazon.com/images/I/71CyL4RV-0L._SL1500_.jpg.https://m.media-amazon.com/images/I/71gRWGDnMwL._SL1500_.jpg"
+-,,,,,,,
+-ES10V-ESTILE,Haier 10L Cylindrical 5 star Water Heater ES10V-ESTILE,,,,"7,156",https://www.haier.com/in/water-heaters/water-heaterscylindricalwaterheater-abses10v-estile.shtml,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/p/j/o/2023-es10v-estile-2000-haier-10-original-imah562jsmkqgwyr.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/v/t/k/2023-es10v-estile-2000-haier-10-original-imah562jzgfkhczg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/6/p/i/2023-es10v-estile-2000-haier-10-original-imah562jpqgzq4ca.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/t/j/7/2023-es10v-estile-2000-haier-10-original-imah562jd2kznz7d.jpeg?q=90,"
+-WH-AQUAGENIE-25L,Usha Aquagenie 25-Litre 2000-Watt 5 Star Storage Water Heater (Ivory Wine),,,,"10,999",https://www.amazon.in/Usha-Aquagenie-25-Litre-2000-Watt-Wine/dp/B00MVVBPX2?th=1,"https://m.media-amazon.com/images/I/71FSoLeMjsL._SL1500_.jpg,https://m.media-amazon.com/images/I/61UYGmBmseL._SL1000_.jpg"
+-WH-MAXIMUS-3L,"Kenstar 3 L Instant Water Geyser (Maximus 3 L Instant Water Geyser | High Grade SS Tank | 2 Years Warranty, White) (White)",,,,"2,560",https://www.flipkart.com/kenstar-maximus-high-grade-ss-tank-2-years-warranty-free-pipes-3-l-instant-water-geyser/p/itmd07e02804621a,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/a/w/p/2025-maximus-high-grade-ss-tank-2-years-warranty-with-free-pipes-original-imahmqks6qbdwgta.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/y/o/d/2025-maximus-high-grade-ss-tank-2-years-warranty-with-free-pipes-original-imahmqks8udmdua7.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/u/f/y/2025-maximus-high-grade-ss-tank-2-years-warranty-with-free-pipes-original-imahmqksgvdneqrj.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/i/r/5/2025-maximus-high-grade-ss-tank-2-years-warranty-with-free-pipes-original-imahmqksamhjcgdu.jpeg?q=90,"
+-ES10V-ESTILE,"Haier 10 L Storage Water Geyser (ES10V-ESTILE, White) (White)",,,,"7,126",https://www.flipkart.com/haier-es10v-estile-10-l-storage-water-geyser/p/itmcd76e76983edb,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/p/j/o/2023-es10v-estile-2000-haier-10-original-imah562jsmkqgwyr.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/v/t/k/2023-es10v-estile-2000-haier-10-original-imah562jzgfkhczg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-geyser/6/p/i/2023-es10v-estile-2000-haier-10-original-imah562jpqgzq4ca.jpeg?q=90"
+-,,,,,,,
+-HIL2302CRSH,"Haier 23 L Convection Microwave Oven (HIL2302CRSH:IN/MWO/DL, Black)",,,,"11,444",https://www.flipkart.com/haier-23-l-convection-microwave-oven/p/itme0a722d720c65,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/j/i/o/-original-imahkxwwsgxhvrdv.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/h/8/v/2020-hil2302crsh-in-mwo-dl-haier-23-original-imaghhwefzyfz7fb.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/4/f/e/2020-hil2302crsh-in-mwo-dl-haier-23-original-imaghhwehjju46tv.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/m/o/4/2020-hil2302crsh-in-mwo-dl-haier-23-original-imaghhwekunnyhzs.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/c/n/r/2020-hil2302crsh-in-mwo-dl-haier-23-original-imaghhwephuwazvy.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/i/p/2/2020-hil2302crsh-in-mwo-dl-haier-23-original-imaghhwezhdr7fbd.jpeg?q=90"
+-HIL3001CBSH,"Haier 30L Convection Microwave Oven (HIL3001CBSH, Black, Crispy Grill)",,,,"14,599",https://www.amazon.in/Haier-Convection-Microwave-HIL3001CBSH-HAL2WBlack/dp/B0861S3BJ1,
+-HIL1901MBPB,"Haier 19 L Inverter Technology, Light Weight, Defrost, 5 Power Levels Solo Microwave Oven (HIL1901MBPB, Black)",,,,"4,899",https://www.flipkart.com/haier-19-l-inverter-technology-light-weight-defrost-5-power-levels-solo-microwave-oven/p/itm3df8526fcef34,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/w/y/z/-original-imahygky6zcmdhrq.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/z/x/n/-original-imah44czkgjm2dzt.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/t/i/c/-original-imah4meg5ycefkw5.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/9/l/m/-original-imahygkykfmb9cjk.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/a/w/s/-original-imahygkyjs8dxtsk.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/g/g/b/-original-imahygky4mgzdngm.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/u/u/g/-original-imahygkyfxkvmbbq.jpeg?q=90"
+-HIL2002MFPH,"Haier 20 L Solo Microwave Oven (HIL2001MFPH, Black)",,,,"6,515",https://www.flipkart.com/haier-20-l-solo-microwave-oven/p/itmer9yvadzhpcfu,"https://www.flipkart.com/haier-20-l-solo-microwave-oven/p/itmer9yvadzhpcfu,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/n/i/e/2020-hil2001mfph-haier-20-original-imahkasmj7vhmskx.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/t/y/l/2020-hil2001mfph-haier-20-original-imahkasmyfbvfttd.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/w/x/2/2020-hil2001mfph-haier-20-original-imahkasmrkdpyhvw.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/l/w/e/2020-hil2001mfph-haier-20-original-imahkasmtvghzgja.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/e/r/z/2020-hil2001mfph-haier-20-original-imahkasmhzbe9h6p.jpeg?q=90"
+-HIL2002MWPH,"Haier 20 L Solo Microwave Oven (HIL2001MWPH, Black)",,,,"6,282",https://www.flipkart.com/haier-20-l-solo-microwave-oven/p/itm51b52d3e5381e,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/c/y/a/-original-imahf4drryezyzfk.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/v/j/o/-original-imahf4druu8ghtad.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/7/a/w/-original-imahf4drxjhqkfyg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/2/n/6/-original-imahf4drffzamasm.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/microwave-new/y/4/1/-original-imahf4drh2bqmzfx.jpeg?q=90,"
+-,,,,,,,
+-CELFROST-FSR,Celfrost FSR Bottled Water Dispenser,,,,"10,499",https://www.justdial.com/jdmart/Delhi/Celfrost-FSR-Bottled-Water-Dispenser/pid-11874938/011PXX11-XX11-130907142944-C3M9,https://gemini.google.com/share/9cc76b8c446c
+-HWD-3MPFMR,Haier HWD-3MPFMR Bottled Water Dispenser with Mount Refrigerator Floor Standing Digital Display Black & White,,,,"8,499",https://www.flipkart.com/haier-hwd-3mpfmr-bottled-water-dispenser-mount-refrigerator-floor-standing-digital-display-black-white/p/itmd79f7ae926712,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/4/k/8/-original-imahgf92hy4mygum.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/u/w/i/-original-imahgf92wxbpu2zg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/q/w/t/-original-imahgf92r2yswjyz.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/p/f/q/-original-imahgf92tyupn9pw.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/b/r/2/-original-imahgf92g9tgd95d.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/d/l/y/-original-imahgf92z4sgv2gs.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/e/n/s/-original-imahgf92gcfswenw.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/t/s/h/-original-imahgf92yrth3hmb.jpeg?q=90"
+-HWD-3BPFMR,Floor Mounted Refrigerator Water Dispenser,,,,"13,499",https://www.haier.com/in/commercial-freezers/floor-mounted-refrigeartor-water-dispenser-hwd-3bpfmr.shtml,"https://harshaindia.com/image/cache/catalog/Product_Images/WaterDispenser/IT00118602-1100x1100.jpg,https://harshaindia.com/image/cache/catalog/Product_Images/WaterDispenser/IT00118602-3-1100x1100.jpg,https://harshaindia.com/image/cache/catalog/Product_Images/WaterDispenser/IT00118602-1-1100x1100.jpg,https://harshaindia.com/image/cache/catalog/Product_Images/WaterDispenser/IT00118602-2-1100x1100.jpg"
+-HWD-3MPFS,"Haier HWD-3MPFS Bottled Water Dispenser with Hot, Cold & Normal, | Floor Standing, | Digital Display, Black & White",,,,"10,141",https://www.flipkart.com/haier-hwd-3mpfs-bottled-water-dispenser-hot-cold-normal-floor-standing-digital-display-black-white/p/itmfe22ba7f84c4b,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/b/y/d/-original-imahf8d55zsyxyqv.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/t/3/t/-original-imahf8d5dfdtf6uw.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/k/q/a/-original-imahf8d5yhz2rd9d.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/p/l/a/-original-imahf8d5bszwctnb.jpeg?q=90https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/k/k/c/-original-imahf8d55p3gsgsg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/h/0/o/-original-imahf8d5wehu2bha.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/v/j/n/-original-imahf8d5fzvewdzj.jpeg?q=90"
+-HWD-3WFMR,"Haier HWD-3WFMR Bottled Water Dispenser with Cold, Hot & Normal Water | Durable & Sleek Design | Low Power Consumption | Environment Friendly | 1Year Brand Warranty",,,,"8,199",https://www.flipkart.com/haier-hwd-3wfmr-bottled-water-dispenser/p/itmdade77278a083,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/p/n/e/-original-imagpy5ewmjgrqhq.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/r/l/j/-original-imagpy5ejmytczny.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/c/v/7/-original-imah4n62j9nzuwg7.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/m/o/r/-original-imah4n6yzfdxgtrt.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/a/e/x/-original-imagpy5exntaf9yz.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/t/a/e/-original-imagpy5eh8kgtzdu.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/c/i/l/-original-imagpy5eegqt4uyv.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/k/i/t/-original-imagpy5eakfmznht.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/v/j/x/-original-imagpy5ej9pkywss.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/6/9/r/-original-imagpy5e4fvbma9x.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/9/5/2/-original-imagpy5eryfgc2f8.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/water-dispenser/9/5/2/-original-imagpy5eryfgc2f8.jpeg?q=90"
+-63HNCCC21V9SN(WATER-DISPENSER),,,,,,,
+-,,,,,,,
+-ICT-1200W-KISTO,Kenstar STOVA 12 Induction Cooktop (KISTO12KP7),,,,"1,899",https://ecommerce.seemshine.com/product/Kenstar--STOVA-12-Induction-Cooktop-KISTO12KP7-XpNFN,"https://m.media-amazon.com/images/I/61BrZvPzRJS._SL1500_.jpg,"
+-INFRARED-IR2200TCW,USHA IR2200TCW Infrared Induction Cooktop with grill | 2200 Watts | 11 Power Level | 4 Preset Menu | Feather Touch Controls | Digital display | 1 Year Warranty| White,,,,"3,499",https://www.flipkart.com/usha-2200-w-infrared-cooktop-touch-panel/p/itm669e0f26941f8,"https://m.media-amazon.com/images/I/51gpQ8M3rzL._SL1000_.jpg,https://m.media-amazon.com/images/I/61DAAVeILlL._SL1000_.jpg,https://m.media-amazon.com/images/I/61TiETEzGuL._SL1000_.jpg,https://m.media-amazon.com/images/I/61pymin5MsL._SL1000_.jpg,https://m.media-amazon.com/images/I/61JzjAdEMfL._SL1000_.jpg,https://m.media-amazon.com/images/I/61GyxQv88aL._SL1000_.jpg,https://m.media-amazon.com/images/I/61DJiMCfvML._SL1000_.jpg,https://m.media-amazon.com/images/I/61pQd+s8lCL._SL1000_.jpg"
+-IC-CJ1360WPC,"Usha Cookjoy (Cj1360Wpc) 1350 Watt Induction Cooktop (Black), Sealed, 1 Burner",,,,"3,290",https://www.amazon.in/CookJoy-CJ1350WPC-Induction-cooktop-Black/dp/B09V1J7XQP,"https://m.media-amazon.com/images/I/71lacswvp8L._SL1500_.jpg,https://m.media-amazon.com/images/I/71h9OvxjQJL._SL1500_.jpg,https://m.media-amazon.com/images/I/81XVUFElUKL._SL1500_.jpg"
+-INDUCTION-COOKTOP-CJ1600WPC,"USHA 1600 W Induction Cooktop Push Button (Black, CJ1600WPC)",,,,"2,532",https://www.flipkart.com/usha-1600-w-induction-cooktop-push-button/p/itm4546622b34a7d,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/n/o/t/-original-imaggx62yuunkzwg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/o/l/t/-original-imagg42aav6vbhtq.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/o/b/r/-original-imagg42a7huyfcqs.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/q/3/y/-original-imagg42arwg6hgad.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/y/0/l/-original-imagg42astyz4rqf.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/m/a/u/-original-imagg42asheqmg62.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/induction-cook-top/q/h/6/-original-imagg42aqzaxskt6.jpeg?q=90"
+-INDUCTION-COOKTOP-CJ2000WTC,"Usha Cookjoy (Cj2000Wtc) 2000 Watt Induction Cooktop with Touch Control (Black), Sealed, 1 Burner",,,,"4,599",https://www.amazon.in/CookJoy-CJ2000WTC-Induction-cooktop-control/dp/B09NBYVK2Z,"https://m.media-amazon.com/images/I/510RX1YQK7L._SL1000_.jpg,https://m.media-amazon.com/images/I/31n0yu4V7IL.jpg,https://m.media-amazon.com/images/I/61rB0jaca+L._SL1000_.jpg,https://m.media-amazon.com/images/I/61MyeFAX-JL._SL1000_.jpg,https://m.media-amazon.com/images/I/61Iy2gWR5CL._SL1000_.jpg,https://m.media-amazon.com/images/I/51kfw0KXxZL._SL1000_.jpg"
+-,,,,,,,
+-DI-ARDO-1000W,Kenstar ARDO 1000 W Dry Iron (Purple),,,,740,https://www.flipkart.com/kenstar-ardo-1000-w-dry-iron/p/itm3c2e7002c1211,https://rukminim2.flixcart.com/image/1536/1536/kdnf98w0/iron/f/d/u/kenstar-ardo-original-imafugmstenkserp.jpeg?q=90
+-DI-BIGSOLE,"Kenstar BIGSOLE 1000 W Dry Iron (Black, LIGHT BROWN)",,,,817,https://www.flipkart.com/kenstar-bigsole-1000-w-dry-iron/p/itm3f279fbf2696b,"https://www.flipkart.com/kenstar-bigsole-1000-w-dry-iron/p/itm3f279fbf2696b,https://rukminim2.flixcart.com/image/1536/1536/xif0q/iron/o/y/j/bigsole-kenstar-original-imahe8v6hphmdf7s.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/iron/3/c/c/bigsole-kenstar-original-imahe8v6ferhk52v.jpeg?q=90"
+-DI-SWIFTO-KDISWI10BPR0,Kenstar Swifto (KDISWI10BPR0-DSU)  1000-Watt dry iron,,,,625,https://kenstar.in/products/swifto-1000w-dry-iron?srsltid=AfmBOopH0oH8-wfw1PGfTXBh_AOBsuoIAiP9hDG3UBazdZ0gnUAv67lb,"https://kenstar.in/cdn/shop/files/Swifto_1000W-01.jpg?v=1733735323,https://kenstar.in/cdn/shop/files/Swifto_1000W-02.jpg?v=1717493397,https://kenstar.in/cdn/shop/files/Swifto_1000W-04.jpg?v=1717493396,https://kenstar.in/cdn/shop/files/Swifto_1000W-05.jpg?v=1717493397,https://kenstar.in/cdn/shop/files/Swifto_1000W-03.jpg?v=1717493397"
+-DI-ZENITH,"KENSTAR Zenith Heavy Weight Iron 1000W, Non-Stick Soleplate",,,,"1,175",https://kenstar.in/products/zenith-heavy-weight-iron-1000w-non-stick-soleplate,"https://kenstar.in/cdn/shop/files/1_215889aa-dcdc-4c5e-8378-853946f778f2.jpg?v=1751630087,https://kenstar.in/cdn/shop/files/2_73b04e1a-17e7-4d7f-a4df-071589da69f1.jpg?v=1751630087,https://kenstar.in/cdn/shop/files/4_3ba69b3e-84ff-44c7-bb9d-3e1187e9f3ec.jpg?v=1751630087,https://kenstar.in/cdn/shop/files/2_73b04e1a-17e7-4d7f-a4df-071589da69f1.jpg?v=1751630087,https://kenstar.in/cdn/shop/files/6_305bba51-5007-4ae2-af69-ea47dc8ed567.jpg?v=1751630087"
+-SI-COMFORT,"KENSTAR COMFORT 1200W Steam Iron, with Temperature Control Knob",,,,"1,200",https://kenstar.in/products/comfort-1200w-steam-iron-with-temperature-control-knob-1?srsltid=AfmBOoqa6XSLx2jKnxQaBew5SPuuXymt2jxqt1_aTRQloK1kI049E_bs,"https://kenstar.in/cdn/shop/files/Comfort_1200W_1_d2b08a25-3763-40ba-8c15-b7dcf105cde8.jpg?v=1717057247,https://kenstar.in/cdn/shop/files/Comfort_1200W_2_98c7922f-2749-4851-9764-f38af41a6581.jpg?v=1717057247,https://kenstar.in/cdn/shop/files/Comfort_1200W_4_55f7aa16-d4d7-4c0d-8770-ae6822b7c2b3.jpg?v=1717057247,https://kenstar.in/cdn/shop/files/Comfort_1200W_5_43ea651a-7809-40e2-ad32-82d59984f755.jpg?v=1717057247,https://kenstar.in/cdn/shop/files/Comfort_1200W_6_1814385f-1987-40a4-bd5f-665e0c4a50a7.jpg?v=1717057247"
+-,,,,,,,
+-EK-MULTICOOK-OLLAE,"KENSTAR aestro 1.5L Multicook Kettle, SS Grill Rack, Egg Tray & Bowl",,,,"1,250",https://kenstar.in/products/maestro-1-2l-multicook-kettle-ss-grill-rack-egg-tray-bowl?srsltid=AfmBOooOADqtBtyqz_XI47eLTvIUVtk34j25Zhj3_mALJMh6MSTLaa-t,"https://kenstar.in/cdn/shop/files/Picture14.jpg?v=1752165539,https://kenstar.in/cdn/shop/files/4_1_1.jpg?v=1776237816,https://kenstar.in/cdn/shop/files/Picture16.jpg?v=1776237816,https://kenstar.in/cdn/shop/files/7_2_57f680e3-9e92-4ddf-949d-a8422feed92d.jpg?v=1776237676"
+-EK-SS-ESTELLA,Kenstar Estella 1.6L Electric Kettle | Stainless Steel Body | Auto Cut-Off & Dry Boil Protection | 360° Swivel Base | 1350 W | SS Finish,,,,439,https://www.amazon.in/Kenstar-Estella-Electric-Stainless-Protection/dp/B0FTZ8R5S3?th=1,"https://m.media-amazon.com/images/I/61sUYTVrJqL._SL1500_.jpg,https://m.media-amazon.com/images/I/6191TmS5ljL._SL1500_.jpg,https://m.media-amazon.com/images/I/61dh9v5ws+L._SL1500_.jpg,https://m.media-amazon.com/images/I/61LH2bKoMzL._SL1500_.jpg,https://m.media-amazon.com/images/I/71x41sWT4ZL._SL1500_.jpg,https://m.media-amazon.com/images/I/61h4ERxF1DL._SL1500_.jpg"
+-EK-STYLEE-1.5L,"Kenstar ESTELLA STYLEE Electric Kettle (1.5 L, STEEL, Black)",,,,774,https://www.flipkart.com/hi/kenstar-estella-stylee-electric-kettle/p/itmdeb5bf6bd9731?pid=EKTH9RZH64YJGAF5&lid=LSTEKTH9RZH64YJGAF5HVUGGG&marketplace=FLIPKART&hl_lid=&store=j9e%2Fm38%2Fxrv&ctx=eyJkZWxpdmVyZWRCeSI6IiIsImRpc3BsYXlQcmljZSI6Ijc0OSJ9&fm=eyJ3dHAiOiJwcm9kdWN0Q2FyZExpc3QiLCJwcnB0Ijoic3AiLCJtaWQiOiJQUk9EVUNUIn0,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/6/t/0/estella-stylee-estella-stylee-kenstar-original-imahg9h5mkmhz8mw.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/i/x/g/estella-stylee-estella-stylee-kenstar-original-imahg9h4py7hcwuz.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/4/v/j/estella-stylee-estella-stylee-kenstar-original-imahg9h4wmvugyxf.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/q/d/n/estella-stylee-estella-stylee-kenstar-original-imahg9h5sphghhz5.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/e/c/t/estella-stylee-estella-stylee-kenstar-original-imahg9h5bkfsuuyj.jpeg?q=90"
+-KETTLE-SF-194,"Sunflame SF-194 Electric Kettle (1.5 L, Black, STEEL)",,,,"1,042",https://www.flipkart.com/sunflame-sf-194-electric-kettle/p/itmff08b5693f584,https://rukminim2.flixcart.com/image/1536/1536/xif0q/electric-kettle/z/d/g/sf-194-sunflame-original-imagpmg33g4c3ecs.jpeg?q=90
+-SF-193-KETTLE,"Sunflame SF-193 Electric Kettle (1.5 L, Silver)",,,,"1,156",https://www.flipkart.com/sunflame-sf-193-electric-kettle/p/itmf33b9b0089294,"https://m.media-amazon.com/images/I/51RLB+kvUwL._SL1450_.jpg,https://m.media-amazon.com/images/I/41FmNRkA9oS.jpg"
+-,,,,,,,
+-ANAND-COMPOSITE-WITH-COVER,USHA Anand Composite H Manual Sewing Machine ( Built-in Stitches 1),,,,"3,099",https://www.flipkart.com/usha-anand-composite-manual-sewing-machine/p/itmf9hxy2pf65dqu,"https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/i/y/j/anand-composite-h-0-1-usha-original-imaheygsmaxybhkg.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/o/5/c/anand-composite-h-0-1-usha-original-imaheygsm5gfegy6.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/g/3/7/anand-composite-h-0-1-usha-original-imaheygsvgcrfd7w.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/j/k/i/anand-composite-h-0-1-usha-original-imaheygs8vshn9kh.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/i/5/p/anand-composite-h-0-1-usha-original-imaheygshzz9tzwf.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/e/t/7/anand-composite-h-0-1-usha-original-imaheygsn7zbnb5h.jpeg?q=90,https://rukminim2.flixcart.com/image/1536/1536/xif0q/sewing-machine/9/j/c/anand-composite-h-0-1-usha-original-imaheygsexvkfp4v.jpeg?q=90"
+-BANDHAN-COMPOSITE-WITH-COVER,"USHA Bandhan Composite Manual Sewing Machine With Cover, Black",,,,"4,890",https://www.amazon.in/USHA-Bandhan-Composite-Manual-Machine/dp/B07BNSSWM1,"https://m.media-amazon.com/images/I/51vSSrGeG9L._SL1500_.jpg,https://m.media-amazon.com/images/I/41+bZipt4LL.jpg"
+-UMANG-COMPOSITE,Usha Umang Straight Stitch Composite Sewing Machine (Black),,,,"4,499",https://www.amazon.in/Usha-Umang-Straight-Composite-Machine/dp/B00A20LK0C/ref=sr_1_2?crid=CU21RHYUN258&dib=eyJ2IjoiMSJ9.qd9QuDP3ApdNY7UFxJgIMQ.1Us_dQ3bnl9uiAMa3CzctyaBxvPga_87DyJq3qlwVK0&dib_tag=se&keywords=B00A20LK0C&nsdOptOutParam=true&qid=1726559637&sprefix=b00a20lk0c%2Caps%2C646&sr=8-2,"https://m.media-amazon.com/images/I/619+KFpVYKL._SL1500_.jpg,https://m.media-amazon.com/images/I/71Wq8zbhsCL._SL1500_.jpg,https://m.media-amazon.com/images/I/61lVmKXKFIL._SL1500_.jpg,https://m.media-amazon.com/images/I/71imlQwv7tL._SL1500_.jpg,"
+-SM-ANAND-DLX-COMPOSITE-WITH-PBC,Usha Anand Straight Stitch Composite Sewing Machine (Black),,,,"5,029",https://www.amazon.in/Usha-Straight-Stitch-Composite-Machine/dp/B075X2VJBH,https://m.media-amazon.com/images/I/41Z3hM6qLBL.jpg
+-SM-BANDHAN-COMPOSITE-W/O-COVER,Usha Bandhan Straight Stitch Composite Sewing Machine (Black),,,,"4,999",https://www.amazon.in/dp/B00Z20LKQG?tag=smbandhan-21,https://m.media-amazon.com/images/I/51GKS4mu2WL._SL1500_.jpg
++sku,title,categories,Brands,regular price,sale price,url_link,image_url,Product Configuration
++WA80F10B3NTL,"Samsung 10.0 kg Top Load Washing Machine with AI Wash and Heater, WA80F10B3N",,,,"32,600",https://www.samsung.com/in/washers-and-dryers/washing-machines/wa80f-21-top-load-washer-ai-wash-ecobubble-ai-energy-mode-10kg-navy-wa80f10b3ntl/?srsltid=AfmBOop5wzM3QJHiP7a54aaBYoeWGsOdoJkDC8PITJZLVFKuRGkjvEAj,"https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/energylabel/in-energylabel-product-wa80f10b3ntl-552916356?$Q90_2052_1641_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/energylabel/in-energylabel-wa80f10b3ntl-552916354?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824302?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824303?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824304?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824305?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824306?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824307?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824308?$Q90_1368_1094_F_JPG$,https://images.samsung.com/is/image/samsung/p6pim/in/wa80f10b3ntl/gallery/in-wa80f21-544055-wa80f10b3ntl-545824309?$Q90_1368_1094_F_JPG$",
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
++,,,,,,,,
+diff --git a/requirements.txt b/requirements.txt
+index 85eab40..1af6e76 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,5 @@
+ pandas
+ requests
+ beautifulsoup4
+-openpyxl
+\ No newline at end of file
++openpyxl
++Pillow
+\ No newline at end of file

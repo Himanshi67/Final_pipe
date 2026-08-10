@@ -47,7 +47,11 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
     *.py                  the 7 pipeline scripts — MUST stay at root (see below)
     category_map.xlsx     taxonomy; app.py loads it from NEXT TO app.py
     SubCategory_Attributes_Master.xlsx
+    category_seo.xlsx     curated per-category tags + SEO keywords (hand-written;
+                          rebuild with tools\build_category_seo.py)
+    tools\                generators for the config sheets, not pipeline stages
     docs\                 all reference docs (KNOWN_ISSUES, PIPELINE_GUIDE, HANDOFF, …)
+    docs\archive\         superseded code kept for reference (scraper2-source.zip)
     inputs\               source SKU lists
     runs\<name>\          loose outputs + logs from one run (gitignored)
     batches\<name>\       curated archived batch: filled xlsx, CSV, images, README
@@ -55,6 +59,13 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
     blog_automate\        isolated blog generator
     Sku_enrichment\  _push_export\   mirrors — never edit directly, use /sync-copies
     Code_Unrelated\       portable Node toolchain, nothing to do with the pipeline
+
+The old standalone `scraper (2)\` was merged in and deleted (1.08 GB, almost all
+of it a .venv and a Chrome profile). Its source is `docs\archive\
+scraper2-source.zip`; only two things were worth keeping and both are ported —
+the persistent browser profile (`--js-profile`) and BUSY ERP input. Its
+`build_contextual_woo_tables()` GUESSED specs (RPM/wattage from the product
+name, hardcoded 230 V) and was deliberately NOT carried over.
 
 The scripts are anchored on `Path(__file__).parent`: `sku_enricher.py` → `.cache\`,
 `wc_checkpoint.py` → `checkpoints\`, `app.py`/`validate_csv.py` → `category_map.xlsx`.

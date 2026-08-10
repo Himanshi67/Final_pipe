@@ -1409,6 +1409,14 @@ PW_MAX_PER_RUN = 25
 PW_NAV_TIMEOUT_MS = 45000
 PW_SETTLE_MS = 2500
 
+# Optional on-disk browser profile (--js-profile). An ephemeral context starts
+# every run with no cookies, so a site that hands out a clearance cookie after
+# one challenge re-challenges on the next run. A persistent profile keeps those
+# cookies, which is the one thing the older standalone scraper did better.
+# Off by default: a shared profile is per-machine state, and two concurrent runs
+# must not point at the same directory.
+PW_PROFILE_DIR = None
+
 _PW = {"state": "off", "pw": None, "browser": None, "ctx": None,
        "used": 0, "sku_used": 0}          # state: off | ready | dead
 
@@ -1427,13 +1435,7 @@ def _pw_start():
     try:
         _PW["pw"] = sync_playwright().start()
         args = ["--disable-blink-features=AutomationControlled"]
-        try:                    # real Chrome if installed: better fingerprint,
-            browser = _PW["pw"].chromium.launch(   # and no 130MB download
-                channel="chrome", headless=True, args=args)
-        except Exception:
-            browser = _PW["pw"].chromium.launch(headless=True, args=args)
-        _PW["browser"] = browser
-        _PW["ctx"] = browser.new_context(
+        ctx_opts = dict(
             locale="en-IN", timezone_id="Asia/Kolkata",
             viewport={"width": 1366, "height": 768},
             # bundled chromium advertises 'HeadlessChrome/...' without this
@@ -1441,6 +1443,28 @@ def _pw_start():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/146.0.0.0 Safari/537.36"),
             extra_http_headers={"Accept-Language": "en-IN,en;q=0.9"})
+        if PW_PROFILE_DIR:
+            # one call both launches and contexts; there is no separate browser
+            profile = Path(PW_PROFILE_DIR).expanduser().resolve()
+            profile.mkdir(parents=True, exist_ok=True)
+            try:
+                ctx = _PW["pw"].chromium.launch_persistent_context(
+                    str(profile), channel="chrome", headless=True,
+                    args=args, **ctx_opts)
+            except Exception:
+                ctx = _PW["pw"].chromium.launch_persistent_context(
+                    str(profile), headless=True, args=args, **ctx_opts)
+            _PW["browser"] = None
+            _PW["ctx"] = ctx
+            log(f"      JS fallback using saved profile: {profile}")
+        else:
+            try:                # real Chrome if installed: better fingerprint,
+                browser = _PW["pw"].chromium.launch(   # and no 130MB download
+                    channel="chrome", headless=True, args=args)
+            except Exception:
+                browser = _PW["pw"].chromium.launch(headless=True, args=args)
+            _PW["browser"] = browser
+            _PW["ctx"] = browser.new_context(**ctx_opts)
         _PW["ctx"].set_default_timeout(PW_NAV_TIMEOUT_MS)
         _PW["state"] = "ready"
         return True
@@ -2680,7 +2704,35 @@ def norm_header(h):
 
 
 SKU_HEADERS = ["sku", "skucode", "skus", "skuid", "model", "modelno",
-               "modelnumber", "modelname", "itemcode", "productcode", "code"]
+               "modelnumber", "modelname", "itemcode", "productcode", "code",
+               # BUSY ERP stock exports: the model lives in the item-detail
+               # column, wrapped in branch/unit noise that clean_busy_sku strips
+               "busyitemdetail", "itemdetails", "itemdetail"]
+
+BUSY_SKU_HEADERS = {"busyitemdetail", "itemdetails", "itemdetail"}
+
+# A split AC exports as two BUSY lines - the indoor and the outdoor unit - for
+# the SAME retail product. Searching '...(IDU)' finds nothing, and enriching
+# both halves would list one air conditioner twice.
+BUSY_UNIT_RE = re.compile(
+    r"\(\s*(?:INNER|OUTER|INV|IDU|ODU|INDOOR|OUTDOOR)\s*\)|"
+    r"\b(?:INNER|OUTER|INDOOR|OUTDOOR|IDU|ODU)\b", re.IGNORECASE)
+
+
+def clean_busy_sku(raw):
+    """BUSY item detail -> the model code a retailer would recognise.
+
+    Only the unit designators and bracketed branch notes are removed. The model
+    itself is left alone, punctuation included: build_queries() already splits
+    brand from model, and stripping every non-alphanumeric here (as the older
+    standalone scraper did) turned 'WA80F10B3NTL' style codes into unsearchable
+    runs of characters."""
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    text = BUSY_UNIT_RE.sub(" ", text)
+    text = re.sub(r"\([^)]*\)", " ", text)          # any remaining branch note
+    return re.sub(r"\s+", " ", text).strip(" -,")
 
 COL_ALIASES = {
     "title": ["title", "producttitle", "productname", "name"],
@@ -2976,7 +3028,7 @@ def write_report(path, rows, out_file, started, args, min_images):
 # --------------------------------- main -----------------------------------
 
 def main():
-    global PW_ENABLED, PW_MAX_PER_RUN, CACHE_ENABLED, CACHE_REFRESH
+    global PW_ENABLED, PW_MAX_PER_RUN, PW_PROFILE_DIR, CACHE_ENABLED, CACHE_REFRESH
     global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED
     global IMAGE_CHECK, IMAGE_MIN_PX
     if hasattr(sys.stdout, "reconfigure"):
@@ -3009,6 +3061,11 @@ def main():
                     metavar="N",
                     help=f"Maximum headless renders per run "
                          f"(default: {PW_MAX_PER_RUN})")
+    ap.add_argument("--js-profile", metavar="DIR", default=None,
+                    help="Keep the headless browser's cookies in DIR between "
+                         "runs, so a site that clears you once does not "
+                         "re-challenge next run. Do not point two concurrent "
+                         "runs at the same directory.")
     ap.add_argument("--probe", metavar="URL",
                     help="Fetch and parse a single URL, print what was "
                          "extracted, and exit. Touches no spreadsheet.")
@@ -3067,6 +3124,7 @@ def main():
     args = ap.parse_args()
 
     PW_ENABLED, PW_MAX_PER_RUN = args.js_fallback, args.js_budget
+    PW_PROFILE_DIR = args.js_profile
     CACHE_ENABLED = not args.no_cache
     CACHE_REFRESH = args.refresh_cache
     CACHE_TTL_DAYS = args.cache_ttl
@@ -3131,6 +3189,11 @@ def main():
 
     sku_col, cols = map_columns(ws, args.sku_col)
     log(f"Sheet: '{ws.title}' | SKU column: {ws.cell(row=1, column=sku_col).value!r} (col {sku_col})")
+    busy_input = norm_header(ws.cell(row=1, column=sku_col).value) in BUSY_SKU_HEADERS
+    busy_seen = {}
+    if busy_input:
+        log("  BUSY ERP export detected - stripping unit designators "
+            "((IDU)/(ODU)/INNER/OUTER) and collapsing split-unit duplicates")
     log("Output columns: " + ", ".join(f"{k} -> col {v}" for k, v in cols.items()))
     ensure_app_columns(ws, sku_col)
     if os.environ.get("SERPER_API_KEY"):
@@ -3145,6 +3208,20 @@ def main():
         sku = ws.cell(row=r, column=sku_col).value
         if sku is None or not str(sku).strip():
             continue
+        if busy_input:
+            cleaned = clean_busy_sku(sku)
+            if not cleaned:
+                continue
+            # the indoor and outdoor halves of one split AC collapse to the same
+            # model: enrich it once, and point the second row at the first
+            first = busy_seen.get(cleaned.upper())
+            if first:
+                ws.cell(row=r, column=cols["status"],
+                        value=f"SKIPPED - same unit as row {first}")
+                log(f"\n  Row {r}: {sku} -> same product as row {first}, skipped")
+                continue
+            busy_seen[cleaned.upper()] = r
+            sku = cleaned
         if not args.force:
             has_url = ws.cell(row=r, column=cols["url_link"]).value
             has_status = str(ws.cell(row=r, column=cols["status"]).value or "").strip()

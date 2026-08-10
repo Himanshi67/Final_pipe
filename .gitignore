@@ -87,7 +87,17 @@ _push_export/
 # *.xlsx rule above to override it.
 !category_map.xlsx
 !SubCategory_Attributes_Master.xlsx
+# curated per-category tags and SEO keywords - hand-written configuration,
+# regenerable with tools\build_category_seo.py but edited by hand in between
+!category_seo.xlsx
 
-# Portable dev tooling (a full Node distribution, ~100 MB). Installed per
-# machine, not source. node.exe alone trips GitHub's 50 MB file warning.
-Code_Unrelated/_tools/
+# Nothing in here belongs to the catalogue pipeline - a portable Node
+# distribution plus scratch DSA work. Ignoring the whole folder rather than
+# just _tools/ stops `git add -A` sweeping another session's files into a
+# pipeline commit, which happened once.
+Code_Unrelated/
+
+# The original 518 MB scraper (2) drop, .git and .venv included. Its source is
+# archived at docs/archive/scraper2-source.zip (0.27 MB) and the working copy
+# was merged in and removed - this is just the download.
+/scraper (2).zip
