@@ -435,6 +435,8 @@ def images_for(row, sku, title, mode, allow_writes=True):
                      f"(dry run); they upload on --commit")
         return [], notes
 
+    if not ready:                  # every URL's local file was missing
+        return [], notes
     if not (os.environ.get("WP_APP_USER", "").strip()
             and os.environ.get("WP_APP_PASSWORD", "").strip()):
         notes.append("WP_APP_USER / WP_APP_PASSWORD not set - cannot upload")
