@@ -556,8 +556,27 @@ FAMILY_BY_SUB = {
 
 def family_for(parent, sub):
     """Product family used for capacity labels, configuration text and SKU
-    prefixes (WM-/WH-/AP-)."""
+    prefixes (see SKU_PREFIX_BY_PARENT)."""
     return FAMILY_BY_SUB.get(_cat_norm(sub), parent)
+
+
+# One prefix per parent category (operator decision 2026-08-11: prefixes
+# encode the category, settled while the catalogue is small because changing
+# them later renames live products). AP- stays the fallback for anything the
+# taxonomy does not know. Keep validate_csv.py's prefix-stripping regex and
+# sku_enricher.CATEGORY_CODES in sync with this map.
+SKU_PREFIX_BY_PARENT = {
+    'Washing Machines': 'WM',          # live products carry these two -
+    'Water Heaters': 'WH',             # never change them
+    'LED': 'TV',
+    'Air Conditioner': 'AC',
+    'Cooling & Freezing': 'CF',
+    'Kitchen Appliances': 'KA',
+    'Home Appliances': 'HA',
+    'Small Appliances': 'SA',
+    'Electronics & Computing': 'EC',
+}
+SKU_PREFIXES = tuple(SKU_PREFIX_BY_PARENT.values()) + ('AP',)
 
 
 def prefixed_sku(raw_sku, category):
@@ -572,13 +591,10 @@ def prefixed_sku(raw_sku, category):
     # inconsistently by different clients.
     sku = re.sub(r'[\\/:*?"<>|()\[\]{}]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
-    if sku.startswith(('WM-', 'WH-', 'AP-')):
-        return sku
-    if category == 'Washing Machines':
-        return f'WM-{sku}' if sku else 'WM-UNKNOWN'
-    if category == 'Water Heaters':
-        return f'WH-{sku}' if sku else 'WH-UNKNOWN'
-    return f'AP-{sku}' if sku else 'AP-UNKNOWN'
+    if sku.startswith(tuple(f'{p}-' for p in SKU_PREFIXES)):
+        return sku                     # already prefixed on an earlier build
+    code = SKU_PREFIX_BY_PARENT.get(category, 'AP')
+    return f'{code}-{sku}' if sku else f'{code}-UNKNOWN'
 
 
 def wattage(text):
@@ -1181,7 +1197,7 @@ def trim_to(text, limit):
 def model_code(sku):
     """The manufacturer's model code inside a prefixed SKU, for the slug and
     the focus keyword. 'WM-SAMSUNG-WW80T504DAB' -> 'WW80T504DAB'."""
-    text = re.sub(r'^(?:WM|WH|AP)-', '', compact(sku))
+    text = re.sub(r'^(?:' + '|'.join(SKU_PREFIXES) + r')-', '', compact(sku))
     tokens = [t for t in re.split(r'[-\s_/]+', text)
               if len(t) >= 4 and re.search(r'\d', t) and re.search(r'[A-Za-z]', t)]
     tokens.sort(key=len, reverse=True)

@@ -657,7 +657,11 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'title_suspiciously_short ({len(title)} chars)')
         # the SKU normally leads with the brand; if that word is nowhere in the
         # title, the row probably belongs to a different product
-        sku_brand = re.split(r'[-\s]', re.sub(r'^(WM|WH|AP)-', '', sku))[0].lower()
+        # prefix list mirrors app.SKU_PREFIX_BY_PARENT (+ AP fallback); this
+        # script stays import-free of app.py on purpose
+        sku_brand = re.split(
+            r'[-\s]',
+            re.sub(r'^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-', '', sku))[0].lower()
         if len(sku_brand) > 3 and title and sku_brand not in title.lower():
             reasons.append(f'brand_missing_from_title (sku says {sku_brand})')
 

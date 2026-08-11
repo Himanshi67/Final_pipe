@@ -54,14 +54,16 @@ committed. One observation: spec/attribute coverage varies by category
   (WooCommerce 10.8.1 / WordPress 7.0.3) and a 2-SKU dry run assembled
   correctly. If Hostinger's "I'm under attack" mode is ever re-enabled the
   403s return; the `--cookie-file` workaround stays wired for that day.
-- **KI-13:** every plain LED TV lands in the premium "Mini LED" sub-category
-  (app.py:483). The taxonomy has no plain-LED bucket (`LED` parent: QLED,
-  OLED, Qned, Mini LED only). Fix = add "LED TV" to category_map.xlsx (a
-  live-store taxonomy change) + split the branch to require the literal
-  phrase "mini led". Code is trivial once the taxonomy call is made.
-- **A-5:** `prefixed_sku` puts `AP-` on everything that isn't a washer/heater,
-  so TVs publish as `AP-SAMSUNG-…`. Changing later renames live products —
-  decide the prefix scheme before the catalogue grows.
+- **KI-13 — operator decided 2026-08-11: keep as-is.** Plain LED TVs stay in
+  "Mini LED" until a plain-LED bucket is wanted; the fix (add "LED TV" to
+  category_map.xlsx + require the literal phrase in app.py) is trivial when
+  that day comes.
+- **A-5 — RESOLVED 2026-08-11 (operator decision): per-category prefixes.**
+  `app.SKU_PREFIX_BY_PARENT` now maps every taxonomy parent (WM/WH kept for
+  live products; TV/AC/CF/KA/HA/SA/EC new; AP- fallback for unknown parents).
+  validate_csv's prefix regex and the enricher's CATEGORY_CODES extended to
+  match; pinned by tests\test_bugfixes.py test_19. Products already published
+  as AP-… (drafts) get the new SKU on their next publish.
 
 ### Fixed in this audit, round 2 (2026-08-11)
 - **A-10** `_IMG_DIMS` memo now clears at 20 000 entries — bounded memory,

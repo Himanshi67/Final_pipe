@@ -197,7 +197,7 @@ def test_03_busy_sku_mirroring():
           mirrored[0] == mirrored[1], True)
     check("what app.py exports is a clean SKU",
           app.prefixed_sku(mirrored[0], "Air Conditioner"),
-          "AP-VOLTAS-185V-VECTRA-PRISM")
+          "AC-VOLTAS-185V-VECTRA-PRISM")
     check("app.py can now collapse the split-AC duplicate",
           app.prefixed_sku(mirrored[0], "Air Conditioner")
           == app.prefixed_sku(mirrored[1], "Air Conditioner"), True)
@@ -220,7 +220,7 @@ def test_03_busy_sku_mirroring():
 
     check("brackets never survive into a SKU",
           app.prefixed_sku("VOLTAS 185V (INNER)", "Air Conditioner"),
-          "AP-VOLTAS-185V-INNER")
+          "AC-VOLTAS-185V-INNER")
 
 
 # --------------------------------------------------------------------------
@@ -619,6 +619,30 @@ def test_18_binary_upload_rejected():
               ["sku", "title"])
 
 
+# --------------------------------------------------------------------------
+def test_19_category_prefixes():
+    section("#19  SKU prefixes encode the parent category (decision 2026-08-11)")
+    for parent, code in {"Washing Machines": "WM", "Water Heaters": "WH",
+                         "LED": "TV", "Air Conditioner": "AC",
+                         "Cooling & Freezing": "CF",
+                         "Kitchen Appliances": "KA", "Home Appliances": "HA",
+                         "Small Appliances": "SA",
+                         "Electronics & Computing": "EC"}.items():
+        check(f"{parent} -> {code}-",
+              app.prefixed_sku("SAMSUNG X100", parent), f"{code}-SAMSUNG-X100")
+    check("unknown category falls back to AP-",
+          app.prefixed_sku("SAMSUNG X100", "Something New"), "AP-SAMSUNG-X100")
+    check("an already-prefixed SKU is never double-prefixed",
+          app.prefixed_sku("TV-SAMSUNG-X100", "LED"), "TV-SAMSUNG-X100")
+    check("a legacy AP- SKU survives a rebuild unchanged",
+          app.prefixed_sku("AP-SAMSUNG-X100", "LED"), "AP-SAMSUNG-X100")
+    check("model_code strips every prefix",
+          app.model_code("TV-SAMSUNG-UA43T5310"), "UA43T5310")
+    check("the map and the tuple agree",
+          set(app.SKU_PREFIXES),
+          set(app.SKU_PREFIX_BY_PARENT.values()) | {"AP"})
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -636,6 +660,7 @@ def main():
     test_16_validate_cli_flags()
     test_17_console_encoding()
     test_18_binary_upload_rejected()
+    test_19_category_prefixes()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

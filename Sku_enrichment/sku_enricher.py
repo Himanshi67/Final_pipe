@@ -132,7 +132,10 @@ BLOCKED_DOMAINS = [                    # never use these results
 # came back 'rejected: brand not found in listing' - the single largest cause
 # of NOT FOUND on ERP-coded lists.
 CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW",
-                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW")
+                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW",
+                  # store-side prefixes from app.SKU_PREFIX_BY_PARENT, so a
+                  # published SKU pasted back in as input still parses
+                  "CF", "KA", "HA", "SA", "EC", "AP")
 
 # ---- strict-match filters: accessories & compatibility listings ----------
 # Listings whose titles contain the model code but are NOT the product
