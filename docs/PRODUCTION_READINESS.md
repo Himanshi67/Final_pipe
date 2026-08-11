@@ -63,17 +63,23 @@ committed. One observation: spec/attribute coverage varies by category
   so TVs publish as `AP-SAMSUNG-…`. Changing later renames live products —
   decide the prefix scheme before the catalogue grows.
 
+### Fixed in this audit, round 2 (2026-08-11)
+- **A-10** `_IMG_DIMS` memo now clears at 20 000 entries — bounded memory,
+  worst case is a re-probe.
+- **A-11** Amazon nav thumbnails (`._SS40_` etc.) dropped at collection time
+  when every size token is < 200 px — no wasted probe per thumb. hiRes URLs
+  come first, so real gallery images are never tiny-only.
+- **KI-7b** ddg_search cool-down is 30 s only for rate-limit exceptions,
+  10 s for any other hiccup.
+
 ### Open — code hardening, deliberately deferred
-(All in files carrying uncommitted work from a parallel session on
-2026-08-11; touch after that lands.)
 - **A-9** whole-workbook save after every SKU (O(n²), deliberate for
   interrupt-safety). If large batches get slow: save every N rows + on exit +
   on Ctrl+C.
-- **A-10** `_IMG_DIMS` cache unbounded (~10 MB/large batch) — cap if it bites.
-- **A-11** Amazon `._SS40_`/`._UL<n>_` nav thumbnails probed then discarded —
-  filter at collection time to skip the probe.
-- **KI-7b** ddg_search sleeps a flat 30 s on first failure (sku_enricher.py:998).
-- **KI-7c** `is_product_url` defaults True for unknown domains (:875).
+- **KI-7c** `is_product_url` defaults True for unknown domains (:875) —
+  INTENTIONAL, do not "fix": unlisted stores are parsed via generic JSON-LD,
+  and a False default would drop every donor from a store the allowlist has
+  never heard of.
 - **KI-7h** Excel lock checked once at start only (:3019) — KI-4 recovery
   file mitigates.
 

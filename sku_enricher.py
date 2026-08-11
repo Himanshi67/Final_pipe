@@ -994,8 +994,11 @@ def ddg_search(query):
                      "title": it.get("title", "")} for it in res]
         except Exception as e:
             if attempt == 1:
-                log(f"      search hiccup ({type(e).__name__}) - waiting 30s...")
-                time.sleep(30)
+                # a rate-limit needs the full cool-down; any other hiccup
+                # (DNS blip, parse error) never benefits from 30 idle seconds
+                wait = 30 if "ratelimit" in type(e).__name__.lower() else 10
+                log(f"      search hiccup ({type(e).__name__}) - waiting {wait}s...")
+                time.sleep(wait)
     return []
 
 
@@ -1148,6 +1151,10 @@ def image_dimensions(url):
                 dims = im.size
     except Exception:
         dims = None                      # unreadable -> unknown, never "small"
+    if len(_IMG_DIMS) >= 20000:
+        # ~10 MB of URL keys on a very large batch; losing the memo costs a
+        # re-probe, growing without bound costs the process
+        _IMG_DIMS.clear()
     _IMG_DIMS[url] = dims
     return dims
 
@@ -1746,6 +1753,14 @@ def parse_amazon(html, soup):
                     pass
             if el.get("src"):
                 imgs.append(el.get("src"))
+    # Nav-strip thumbnails advertise their size in the URL (._SS40_, ._UL80_);
+    # probing them over the network just to discard them wastes a request per
+    # thumb. hiRes URLs come first, so a real gallery image never exists ONLY
+    # in a tiny rendition here - what this drops is other-product/video junk.
+    def _tiny(u):
+        sizes = [int(t) for t in re.findall(r"_(?:S[SXYL]|U[SLXY])(\d+)_", u)]
+        return bool(sizes) and max(sizes) < 200
+    imgs = [u for u in imgs if not _tiny(u)]
     seen_ids, uniq = set(), []
     for u in imgs:
         m = re.search(r"/images/I/([^.]+)\.", u)
