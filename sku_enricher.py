@@ -2178,9 +2178,16 @@ def expected_caps(sku, model, title=""):
         caps.add(float(m.group(1)))
     if NON_CAPACITY_RE.search(f"{title} {sku}"):
         return caps                            # digits here are inches or tons
-    dm = re.search(r"\d+", model or "")
+    dm = re.search(r"(\d+)\s*([A-Za-z]*)", model or "")
+    # A number carrying its own unit is that unit, not a load rating. Measured
+    # live: 'ICT-1200W-KISTO' became 12 kg, 'IC-CJ1360WPC' 13.6 kg and
+    # 'DI-ARDO-1000W' 10 kg, and assess() then rejected every real page for
+    # those cooktops and irons with "title lacks capacity/model info". Watts,
+    # volts, litres and hertz are all coded straight into these model numbers.
+    if dm and dm.group(2)[:1].upper() in ("W", "V", "L", "H"):
+        return caps
     if dm:
-        g = float(dm.group(0))
+        g = float(dm.group(1))
         for v in (g, g / 10.0, g / 100.0):     # 650 -> 6.5, 701 -> 7, 90 -> 9
             if 4 <= v <= 20:
                 caps.add(v)

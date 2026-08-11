@@ -511,6 +511,12 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
     if has('trolly bag', 'trolley bag'):
         return 'Home Appliances', 'Trolly Bag'
     if word('fan') or word('fans'):
+        # The taxonomy separates 'Electronics & Computing > Electronic Fans'
+        # from 'Home Appliances > Fans', and category_seo.xlsx shows what it
+        # means by it: rechargeable / USB / portable fans, not ceiling fans.
+        # Nothing routed anything there, so that category could never fill.
+        if has('rechargeable', 'usb', 'portable', 'battery operated'):
+            return 'Electronics & Computing', 'Electronic Fans'
         return 'Home Appliances', 'Fans'
 
     # nothing in the listing said what this is - fall back to the operator's

@@ -92,10 +92,18 @@ def category_id(name, allow_writes):
     return created["id"]
 
 
-def publish(payload, slug="", category="", commit=False, status="draft"):
+def publish(payload, slug="", category="", commit=False, status="draft",
+            explicit_status=False):
     """Create or update the post. Returns the post dict, or None on a dry run.
 
-    NOTHING is written without commit=True."""
+    NOTHING is written without commit=True.
+
+    `explicit_status` says the caller ASKED for this status rather than falling
+    back to the default. Without it the status was dropped on every update, so
+    a post that already existed could never be taken live - `--status publish`
+    silently did nothing, even though blog_run.py advertises it. Same rule
+    wc_publish.py settled on: never change a live post's status by accident,
+    always honour an explicit request."""
     existing = find_by_slug(slug)
     verb = "UPDATE" if existing else "CREATE"
     print(f"  {verb} post: {payload['title'][:70]}")
@@ -115,8 +123,10 @@ def publish(payload, slug="", category="", commit=False, status="draft"):
         return None
 
     if existing:
-        # never silently flip a published post back to draft on a re-run
-        body.pop("status", None)
+        # never silently flip a published post back to draft on a re-run -
+        # but an explicit --status is how a reviewed draft is taken live
+        if not explicit_status:
+            body.pop("status", None)
         result = call("POST", f"posts/{existing['id']}", json=body)
     else:
         result = call("POST", "posts", json=body)

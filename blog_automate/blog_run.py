@@ -130,9 +130,11 @@ def main():
                     help="Send the post to WordPress")
     ap.add_argument("--commit", action="store_true",
                     help="Actually write. Without this nothing is sent.")
-    ap.add_argument("--status", default="draft",
+    ap.add_argument("--status", default=None,
                     choices=["draft", "publish", "pending", "private"],
-                    help="Status for posts this run creates (default: draft)")
+                    help="Status to set. New posts default to draft. Passing "
+                         "this explicitly ALSO applies it to a post that "
+                         "already exists, which is how a draft goes live.")
     ap.add_argument("--post-category", default="Buying Guides",
                     help="WordPress post category (default: Buying Guides)")
     ap.add_argument("--site-url", default="",
@@ -149,7 +151,7 @@ def main():
 
     import os
     site_url = args.site_url or os.environ.get("WC_URL", "")
-    payload = R.post_payload(brief, prose, site_url, args.status)
+    payload = R.post_payload(brief, prose, site_url, args.status or "draft")
     slug = B.slugify(payload["title"])
 
     OUT_DIR.mkdir(exist_ok=True)
@@ -181,7 +183,8 @@ def main():
           f"{os.environ.get('WC_URL', '(WC_URL not set)')}")
     try:
         P.publish(payload, slug=slug, category=args.post_category,
-                  commit=args.commit, status=args.status)
+                  commit=args.commit, status=args.status or "draft",
+                  explicit_status=args.status is not None)
     except Exception as exc:
         sys.exit(f"\n{exc}")
 

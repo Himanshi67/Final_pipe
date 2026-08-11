@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -434,12 +435,19 @@ def images_for(row, sku, title, mode, allow_writes=True):
                      f"(dry run); they upload on --commit")
         return [], notes
 
-    for local in ready:
-        media_id = upload_image(local, title)
-        if media_id is None:
-            notes.append("WP_APP_USER / WP_APP_PASSWORD not set - cannot upload")
-            break
-        payload.append({"id": media_id, "alt": title})
+    if not (os.environ.get("WP_APP_USER", "").strip()
+            and os.environ.get("WP_APP_PASSWORD", "").strip()):
+        notes.append("WP_APP_USER / WP_APP_PASSWORD not set - cannot upload")
+        return [], notes
+    # A gallery is N independent POSTs and the store's round-trip latency, not
+    # bandwidth, dominates - measured ~1 min for 32 images done one at a time.
+    # map() preserves order, so position 1 stays the featured image; 4 workers
+    # keeps the burst polite. Filenames within one product are distinct
+    # (SKU_n.webp), so the _MEDIA_BY_NAME dedupe cache cannot race against
+    # itself here.
+    with ThreadPoolExecutor(max_workers=min(4, len(ready))) as pool:
+        ids = list(pool.map(lambda p: upload_image(p, title), ready))
+    payload = [{"id": mid, "alt": title} for mid in ids if mid is not None]
     return payload, notes
 
 

@@ -667,8 +667,11 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'placeholder_spec_text ({found_dead[0]}) - rebuild '
                            f'this CSV, it predates the KI-14 fix')
 
-        joined = ' '.join([title.lower(), cats.lower(), desc.lower()])
-        if 'front load' in title.lower() and 'top load' in joined.replace(title.lower(), ''):
+        # check cats+desc directly rather than removing the title's text from a
+        # joined blob: str.replace could splice 'top'+'load' together out of
+        # unrelated fragments (or miss, if the description re-words the title)
+        rest = ' '.join([cats.lower(), desc.lower()])
+        if 'front load' in title.lower() and 'top load' in rest:
             reasons.append('front_load_titled_but_top_load_labelled')
 
         records.append({'idx': idx, 'sku': sku, 'title': title,
