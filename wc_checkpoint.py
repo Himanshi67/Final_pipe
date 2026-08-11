@@ -345,7 +345,21 @@ def restore(store, checkpoint, live_products, fields, only_skus, commit, limit=0
 
 # ---------------------------------- cli ----------------------------------
 
+
+def use_utf8_stdout():
+    """A Windows console is cp1252, and scraped titles/SKUs are not. Without
+    this a single unmappable character aborts the run with a UnicodeEncodeError
+    traceback - mid-batch, after work has already been done. sku_enricher.py
+    has always done this; the rest of the entry points had not."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 def main():
+    use_utf8_stdout()
     ap = argparse.ArgumentParser(
         description="Snapshot WooCommerce products and roll them back. "
                     "Restores are dry runs unless --commit.")

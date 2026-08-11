@@ -30,12 +30,14 @@ Keep that file out of the repo - it is a live session credential.
 """
 
 import argparse
+import html as _html
 import mimetypes
 import os
 import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pandas as pd
 import requests
@@ -322,6 +324,55 @@ def price_str(value):
     return str(int(number)) if number.is_integer() else f"{number:.2f}"
 
 
+_MEDIA_BY_NAME = {}        # filename -> media id, so one run uploads each once
+
+
+def find_media(path):
+    """The id of an attachment ALREADY holding this exact filename, or None.
+
+    Without this, every `--commit` re-uploaded every image: WordPress does not
+    overwrite, it mints `name-1.webp`, `name-2.webp`, ... So the documented
+    workflow - "re-running a corrected batch updates the same products" - grew
+    the Media Library by a full copy of the catalogue each time.
+
+    Reuse is gated on the byte size matching, so a genuinely CHANGED image
+    still uploads rather than silently pointing at the stale one. Servers that
+    do not report filesize (pre-WP 6.0) fall back to reuse, which is the
+    common case of an unchanged re-push."""
+    if path.name in _MEDIA_BY_NAME:
+        return _MEDIA_BY_NAME[path.name]
+    user = os.environ.get("WP_APP_USER", "").strip()
+    password = os.environ.get("WP_APP_PASSWORD", "").strip()
+    if not (user and password):
+        return None
+    base = os.environ["WC_URL"].rstrip("/") + "/wp-json/wp/v2/media"
+    try:
+        r = SESSION.get(base, auth=(user, password), timeout=TIMEOUT,
+                        params={"search": path.stem, "per_page": 100,
+                                "_fields": "id,source_url,media_details"})
+        if looks_like_challenge(r):
+            raise ChallengeError(f"media lookup {path.name} -> {CHALLENGE_HELP}")
+        if r.status_code >= 400:
+            return None            # cannot tell -> fall through and upload
+        local_size = path.stat().st_size
+        for item in r.json():
+            details = item.get("media_details") or {}
+            names = {os.path.basename(str(item.get("source_url", ""))),
+                     os.path.basename(str(details.get("file", "")))}
+            if path.name not in names:
+                continue
+            remote_size = details.get("filesize")
+            if remote_size is not None and int(remote_size) != local_size:
+                return None        # same name, different bytes: upload afresh
+            _MEDIA_BY_NAME[path.name] = item["id"]
+            return item["id"]
+    except ChallengeError:
+        raise
+    except Exception:
+        return None                # a lookup failure must not block the push
+    return None
+
+
 def upload_image(path, alt):
     """Send a local file to the Media Library. Needs a WordPress Application
     Password - WooCommerce consumer keys do not authenticate /wp/v2 routes."""
@@ -329,6 +380,9 @@ def upload_image(path, alt):
     password = os.environ.get("WP_APP_PASSWORD", "").strip()
     if not (user and password):
         return None
+    existing = find_media(path)
+    if existing is not None:
+        return existing
     url = os.environ["WC_URL"].rstrip("/") + "/wp-json/wp/v2/media"
     mime = mimetypes.guess_type(path.name)[0] or "image/webp"
     r = SESSION.post(
@@ -342,6 +396,7 @@ def upload_image(path, alt):
         raise RuntimeError(f"media upload {path.name} -> HTTP {r.status_code} "
                            f"- {r.text[:200]}")
     media_id = r.json()["id"]
+    _MEDIA_BY_NAME[path.name] = media_id
     SESSION.post(f"{url}/{media_id}", auth=(user, password), timeout=TIMEOUT,
                  json={"alt_text": alt, "title": alt})
     return media_id
@@ -361,7 +416,14 @@ def images_for(row, sku, title, mode, allow_writes=True):
 
     payload, notes = [], []
     root = Path(os.getcwd()) / IMAGE_ROOT
-    ready = [root / f"{sku}_{i}.webp" for i in range(1, len(urls) + 1)]
+    # Take the filenames from the URLs, NOT from the position in the list.
+    # app.py names each file after the index of the SOURCE url and only writes
+    # the ones that survived download and the MIN_IMAGE_EDGE floor, so the
+    # numbering is sparse: a row whose Images column holds _2, _3, _5 was being
+    # asked for _1, _2, _3. That reported _1 as missing, silently dropped _5,
+    # and - because nothing prunes product_images_for_upload\ between runs -
+    # could upload a PREVIOUS batch's leftover _1.webp as the primary image.
+    ready = [root / os.path.basename(urlsplit(u).path) for u in urls]
     missing = [p.name for p in ready if not p.exists()]
     if missing:
         notes.append(f"missing local file(s): {', '.join(missing)}")
@@ -482,7 +544,11 @@ def describe(payload, existing):
     if existing:
         old = price_str(existing.get("regular_price"))
         changes = []
-        if existing.get("name", "") != payload["name"]:
+        # WordPress returns the name HTML-escaped ('Haier 1.5 Ton 3 Star
+        # Inverter Split AC &#8211; White'), so a raw != comparison reported
+        # "changes: name" on essentially every update whether or not anything
+        # had actually changed, which made the dry run's diff useless.
+        if compact(_html.unescape(str(existing.get("name", "")))) != payload["name"]:
             changes.append("name")
         if old != payload["regular_price"]:
             changes.append(f"regular_price {old or '-'} -> {payload['regular_price'] or '-'}")
@@ -490,7 +556,21 @@ def describe(payload, existing):
     return "  ".join(bits)
 
 
+
+def use_utf8_stdout():
+    """A Windows console is cp1252, and scraped titles/SKUs are not. Without
+    this a single unmappable character aborts the run with a UnicodeEncodeError
+    traceback - mid-batch, after work has already been done. sku_enricher.py
+    has always done this; the rest of the entry points had not."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 def main():
+    use_utf8_stdout()
     ap = argparse.ArgumentParser(
         description="Upsert products into WooCommerce from the generated CSV. "
                     "Dry run unless --commit is given.")
@@ -564,6 +644,13 @@ def main():
         sys.exit(f"File not found: {path}")
 
     df = pd.read_csv(path, dtype=str).fillna("")
+    # every other input problem in this file exits with a sentence; a CSV
+    # without a sku column used to exit with a bare KeyError traceback
+    if "sku" not in df.columns:
+        sys.exit(f"{path.name} has no 'sku' column, so nothing can be keyed on "
+                 f"it.\nColumns found: {', '.join(map(str, df.columns[:12]))}"
+                 f"{' ...' if len(df.columns) > 12 else ''}\n"
+                 f"Generate the file with build_csv.py, which always writes one.")
     if args.sku:
         wanted = {s.strip().upper() for s in args.sku}
         df = df[df["sku"].str.strip().str.upper().isin(wanted)]

@@ -27,6 +27,7 @@ CSV, so the QA gate is part of generating the file rather than a step someone
 has to remember.
 """
 
+import math
 import os
 import re
 import sys
@@ -107,6 +108,10 @@ DEAD_PLACEHOLDERS = (
     'Standard Capacity', 'Standard Power Rating', 'Standard Washing Capacity',
     'Standard Tank Volume', 'Standard Cavity Volume', 'Standard Liquid Volume',
     'Appliance Utility Core', 'WM Function Type', 'WM Washing Capacity',
+    # the four the KI-14 sweep missed: asserted for every iron / sewing machine
+    # regardless of the listing. The readers that produced them now return ''
+    # unless the title states the fact, so nothing can emit these again.
+    'Premium Non-Stick Glide', 'Built-in Straight Stitching',
 )
 
 
@@ -203,13 +208,17 @@ def image_dimension_problems(filenames, root=IMAGE_ROOT):
                 and 1.85 <= width / height <= 2.05):
             problems.append(f'{name} is {width}x{height} - a share banner is '
                             f'the thumbnail')
+        # Resolution and SHAPE are independent faults, so they are reported
+        # independently. As an elif chain the aspect test was unreachable for
+        # anything under GOOD_IMAGE_PX: a 900x300 sliver reported only "low
+        # resolution" and its 3:1 shape was never mentioned.
         if max(width, height) < MIN_IMAGE_PX:
             problems.append(f'{name} is {width}x{height} (thumbnail)')
         elif max(width, height) < GOOD_IMAGE_PX:
             # not unusable, but it will look soft in the zoom/lightbox and
             # worse again after WooCommerce re-encodes its own sizes from it
             problems.append(f'{name} is only {width}x{height} (low resolution)')
-        elif min(width, height) and max(width, height) / min(width, height) > MAX_IMAGE_ASPECT:
+        if min(width, height) and max(width, height) / min(width, height) > MAX_IMAGE_ASPECT:
             problems.append(f'{name} is {width}x{height} (banner shape)')
     return problems
 
@@ -472,9 +481,28 @@ def validate_filled(df, path):
     return issues
 
 
+USAGE = """QA report for a WooCommerce import file or an enricher _filled.xlsx.
+
+Usage:
+    python validate_csv.py [path] [--warn-only]
+
+    path         the CSV to check, or a *_filled.xlsx (which routes to the
+                 stage-1 checks instead). Defaults to
+                 wordpress_ready_clean_repaired.csv, then wordpress_ready.csv.
+    --warn-only  report without failing: exit 0 even when rows are flagged.
+                 Without it the exit code is 1 when anything is flagged, so
+                 this can gate a script.
+
+Writes validation_issues.csv next to the file being checked."""
+
+
 def pick_input_path():
-    if len(sys.argv) > 1:
-        return sys.argv[1]
+    # Flags are not paths. sys.argv[1] was taken verbatim, so `--help` was read
+    # as a filename ("File not found: --help") and `--warn-only` on its own
+    # became the path instead of selecting the default file.
+    positional = [a for a in sys.argv[1:] if not a.startswith('-')]
+    if positional:
+        return positional[0]
     for candidate in ('wordpress_ready_clean_repaired.csv', 'wordpress_ready.csv'):
         if os.path.exists(candidate):
             return candidate
@@ -489,11 +517,23 @@ def find_col(df, *candidates):
 
 
 def to_number(value):
+    """A price as a float, or None when there isn't one.
+
+    The isfinite guard is load-bearing. float('nan') SUCCEEDS, and app.py runs
+    this validator over `result.astype(str)`, which renders a missing price as
+    the string 'nan' - so `reg is None and sale is None` was never true and
+    missing_price was never reported in the browser, while the same file
+    checked through build_csv.py (which round-trips via CSV, giving '')
+    reported it correctly. Every downstream comparison against NaN is False
+    too, so mrp<=price and the category bands silently passed as well."""
     try:
         text = str(value).replace(',', '').replace('₹', '').strip()
-        return float(text) if text else None
+        if not text:
+            return None
+        number = float(text)
     except Exception:
         return None
+    return number if math.isfinite(number) else None
 
 
 def validate_export(df, csv_path, check_images=True, write_issues=True):
@@ -691,7 +731,30 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
     return issues
 
 
+
+def use_utf8_stdout():
+    """A Windows console is cp1252, and scraped titles/SKUs are not. Without
+    this a single unmappable character aborts the run with a UnicodeEncodeError
+    traceback - mid-batch, after work has already been done. sku_enricher.py
+    has always done this; the rest of the entry points had not."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 def main():
+    use_utf8_stdout()
+    if {'-h', '--help'} & set(sys.argv[1:]):
+        print(USAGE)
+        sys.exit(0)
+    unknown = [a for a in sys.argv[1:]
+               if a.startswith('-') and a not in ('--warn-only',)]
+    if unknown:
+        print(f"Unknown option: {unknown[0]}\n")
+        print(USAGE)
+        sys.exit(2)
     csv_path = pick_input_path()
     try:
         if csv_path.lower().endswith(('.xlsx', '.xls')):

@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import io
 import os
+import sys
 from datetime import datetime
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,23 @@ def split_image_list(raw):
 
 
 
+def safe_print(message):
+    """Print without letting the console's encoding abort a batch.
+
+    A Windows console is cp1252 by default, and a scraped SKU or category can
+    carry a character it has no mapping for. One Greek letter in a SKU used to
+    kill build_csv.py mid-run with a UnicodeEncodeError traceback, after images
+    had already been downloaded. The entry points reconfigure stdout to UTF-8,
+    but this module is also imported by scripts that may not have, so the
+    fallback belongs here too."""
+    text = str(message)
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, 'encoding', None) or 'ascii'
+        print(text.encode(encoding, 'replace').decode(encoding, 'replace'))
+
+
 class _ConsoleUI:
     """Stand-in for `st` when process_inventory() is driven from a CLI instead
     of the browser (build_csv.py). Same call shape, prints instead of drawing."""
@@ -38,13 +56,13 @@ class _ConsoleUI:
         return self
 
     def text(self, message):
-        print(message)
+        safe_print(message)
 
     def warning(self, message):
-        print('[warn] ' + str(message))
+        safe_print('[warn] ' + str(message))
 
     def info(self, message):
-        print('[info] ' + str(message))
+        safe_print('[info] ' + str(message))
 
 
 def _ui():
@@ -174,6 +192,19 @@ def build_media_base():
 MEDIA_BASE = build_media_base()
 IRON_WORD_RE = re.compile(r'\biron\b', re.IGNORECASE)
 
+# Materials a listing has to actually STATE before we put them on the product
+# page. KI-14: the spec readers below used to assert a soleplate finish and a
+# kettle body material for every product in those categories, read off nothing.
+SOLEPLATE_RE = re.compile(
+    r'\b(non-?stick|ceramic|stainless steel|steel|teflon|granite|titanium)\b'
+    r'(?=[^.]{0,30}\b(?:soleplate|sole plate|plate|coating|coated)\b)|'
+    r'\b(?:soleplate|sole plate)\s*[:\-]?\s*'
+    r'(non-?stick|ceramic|stainless steel|steel|teflon|granite|titanium)\b',
+    re.IGNORECASE)
+KETTLE_BODY_RE = re.compile(
+    r'\b(stainless steel|borosilicate glass|glass|plastic|copper)\b',
+    re.IGNORECASE)
+
 
 def compact(value):
     if value is None or pd.isna(value):
@@ -221,28 +252,12 @@ def infer_brand(title, sku=''):
     return 'Authorized Brand'
 
 
-def infer_category(title, sku, categories):
-    t = compact(title).lower()
-    s = compact(sku).lower()
-    c = compact(categories).lower()
-    full = f'{t} {s} {c}'
-    if 'wash' in full or 'wm-' in full:
-        return 'Washing Machines'
-    if 'heater' in full or 'geyser' in full or 'wh-' in full:
-        return 'Water Heaters'
-    if 'microwave' in full or 'oven' in full:
-        return 'Microwave Ovens'
-    if 'dispenser' in full:
-        return 'Water Dispensers'
-    if 'cooktop' in full or 'induction' in full:
-        return 'Induction Cooktops'
-    if IRON_WORD_RE.search(full):
-        return 'Electric Irons'
-    if 'kettle' in full:
-        return 'Electric Kettles'
-    if 'sewing' in full or 'stitch' in full:
-        return 'Sewing Machines'
-    return 'Home Appliances'
+# NOTE: a second categoriser, `infer_category`, used to live here. It had zero
+# call sites and returned a FLAT taxonomy ('Washing Machines', 'Home
+# Appliances') incompatible with the detect_category/canonicalize_category pair
+# below, which is the one that is actually used and which snaps to the exact
+# strings in category_map.xlsx. Two disagreeing categorisers in one file is a
+# trap, so the dead one is gone; use detect_category().
 
 
 # ------------- category taxonomy (loaded from category_map.xlsx) -------------
@@ -311,9 +326,43 @@ def load_category_map():
 CATEGORY_COMBOS, CATEGORY_PARENTS, CATEGORY_MAP_FILE = load_category_map()
 
 
-def detect_category(raw_item_name, raw_categories='', detected_brand=''):
+# The operator's own category code, which is the most reliable signal there is
+# about what a product IS - it was typed by someone holding the box. Used only
+# as a FALLBACK, because a real listing title ('Front Load', '1.5 Ton') is more
+# specific than a prefix that only says "washing machine".
+SKU_PREFIX_CATEGORY = {
+    'WM': ('Washing Machines', ''),
+    'WH': ('Water Heaters', 'Geysers'),
+    'SM': ('Home Appliances', 'sewing machine'),
+    'HWD': ('Home Appliances', 'Water Dispensers'),
+    'REF': ('Home Appliances', 'Refrigerators'),
+    'FRIDGE': ('Home Appliances', 'Refrigerators'),
+    'MWO': ('Kitchen Appliances', 'Microwave Ovens'),
+    'IC': ('Kitchen Appliances', 'Induction Cooktops'),
+    'ICT': ('Kitchen Appliances', 'Induction Cooktops'),
+    'DI': ('Small Appliances', 'Electric Iron'),
+    'DF': ('Cooling & Freezing', 'Deep Freezers'),
+    'AC': ('Air Conditioner', ''),
+    'TV': ('LED', ''),
+}
+
+
+def sku_prefix_category(raw_sku):
+    """(parent, sub) implied by a leading category code, or ('', '')."""
+    token = re.split(r'[-\s_]+', compact(raw_sku).upper())[0].strip()
+    return SKU_PREFIX_CATEGORY.get(token, ('', ''))
+
+
+def detect_category(raw_item_name, raw_categories='', detected_brand='',
+                    raw_sku=''):
     """Guess (parent, subcategory); canonicalize_category() then snaps the
-    guess to the exact strings of the taxonomy file."""
+    guess to the exact strings of the taxonomy file.
+
+    `raw_sku` is consulted only when the title yields nothing. It used not to
+    be passed at all, which made every SKU-code rule in here ('wm-' in t,
+    'wh-' in t) dead in the real pipeline: measured on a live crawl,
+    'KENSTAR-WH MAXIMUS 3L' - a water heater whose SKU literally starts WH -
+    fell through to the bare 'Home Appliances' catch-all."""
     t = ' '.join([
         compact(raw_item_name).lower(),
         compact(raw_categories).lower().replace(',', ' '),
@@ -326,9 +375,29 @@ def detect_category(raw_item_name, raw_categories='', detected_brand=''):
     def word(w):
         return re.search(r'\b' + w + r'\b', t) is not None
 
+    # --- accessories that NAME another category, checked FIRST ----------
+    # 'V-Guard VG 400 Voltage Stabilizer for Air Conditioner' was filed as an
+    # Air Conditioner, because the AC block only had to see the words "air
+    # conditioner" anywhere in the title. A stabilizer is the appliance being
+    # sold; the AC is what it is FOR. Same shape as the dishwasher exclusion
+    # below - decide what it is not, before deciding what it is.
+    if has('stabilizer', 'stabiliser', 'voltage regulator'):
+        return 'Small Appliances', 'Voltage Stabilizers & Regulators'
+
     # --- Washing Machines (dishwashers excluded first) ---
     if has('dishwasher', 'dish washer'):
         return 'Home Appliances', ''
+
+    # A dispenser is a dispenser however the listing describes its bottle or
+    # its chiller. Checked BEFORE the washing-machine and refrigerator rules
+    # because real retail copy for a bottled water dispenser contains both
+    # "Top Load" (how the bottle sits) and "Refrigerator" (the cooling
+    # cabinet). Measured on a live crawl: three sibling Haier HWD-* dispensers
+    # landed in three different categories - Washing Machines > Top load,
+    # Home Appliances > Refrigerators, and the correct Water Dispensers - off
+    # nothing but which word their retailer happened to use.
+    if has('water dispenser', 'dispenser'):
+        return 'Home Appliances', 'Water Dispensers'
     if has('semi auto', 'semi automatic', 'semi-automatic') or word('semi'):
         return 'Washing Machines', 'semi auto'
     if has('front load', 'front-load', 'front loading') or word('fl'):
@@ -345,6 +414,20 @@ def detect_category(raw_item_name, raw_categories='', detected_brand=''):
         return 'Water Heaters', 'Geysers'
 
     # --- Air Conditioner ---
+    # Inverter-vs-fixed-speed is the axis this taxonomy splits on, and it beats
+    # form factor: retail titles read "1.5 Ton 5 Star AI DUAL Inverter Split AC",
+    # so testing for the literal phrase 'inverter ac' never matched and filed
+    # essentially EVERY inverter unit under Split AC. Checked with AC context so
+    # an inverter washing machine or fridge is not dragged in, and non-inverter
+    # first because 'Non-Inverter' contains 'inverter'.
+    # Deliberately narrow: this ONLY promotes a genuine inverter unit ahead of
+    # the form-factor rules. A 'Fixed Speed Split AC' still lands on Split AC
+    # exactly as before, because form factor beating Non-Inverter was the
+    # existing, intended precedence - only the inverter case was broken.
+    ac_context = has('air conditioner', 'split ac', 'window ac') or word('ac')
+    if (ac_context and word('inverter')
+            and not re.search(r'non[\s-]?inverter|fixed\s*speed', t)):
+        return 'Air Conditioner', 'Inverter AC'
     if has('inverter ac', 'inverter air conditioner', 'air conditioner inverter'):
         return 'Air Conditioner', 'Inverter AC'
     if has('split ac') or word('split'):
@@ -417,8 +500,8 @@ def detect_category(raw_item_name, raw_categories='', detected_brand=''):
         return 'Home Appliances', 'Water Purifiers'
     if has('air purifier'):
         return 'Home Appliances', 'Air Purifiers'
-    if has('dispenser'):
-        return 'Home Appliances', 'Water Dispensers'
+    # (the 'dispenser' rule that used to sit here now runs near the top, above
+    #  the washing-machine and refrigerator rules - see the note there)
     if has('room heater', 'heat convector', 'heater'):
         return 'Home Appliances', 'Room Heaters'
     if has('sewing', 'stitch'):
@@ -430,6 +513,11 @@ def detect_category(raw_item_name, raw_categories='', detected_brand=''):
     if word('fan') or word('fans'):
         return 'Home Appliances', 'Fans'
 
+    # nothing in the listing said what this is - fall back to the operator's
+    # own SKU prefix rather than dumping it in the catch-all
+    parent, sub = sku_prefix_category(raw_sku)
+    if parent:
+        return parent, sub
     return 'Home Appliances', ''
 
 
@@ -473,7 +561,10 @@ def prefixed_sku(raw_sku, category):
     sku = re.sub(r'\s+', '-', sku)
     # BUGFIX: filesystem/URL-unsafe characters break image saving on Windows
     # ('WA70A4022FS/TL' made every image download fail -> images=0)
-    sku = re.sub(r'[\\/:*?"<>|]+', '-', sku)
+    # Brackets go too: a BUSY ERP row can carry '(INNER)', and parentheses in a
+    # SKU end up in an image filename and then in a URL, where they are encoded
+    # inconsistently by different clients.
+    sku = re.sub(r'[\\/:*?"<>|()\[\]{}]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
     if sku.startswith(('WM-', 'WH-', 'AP-')):
         return sku
@@ -528,12 +619,23 @@ def capacity_value(title, category):
         m = re.search(r'(\d+\s*(?:Zone|Zones|Burner|Burners))', text, re.IGNORECASE)
         return m.group(1) if m else ''
     if category == 'Electric Irons' or IRON_WORD_RE.search(text):
-        return 'Premium Non-Stick Glide'
+        # KI-14: was an unconditional 'Premium Non-Stick Glide' - a soleplate
+        # claim invented for every iron, whatever the listing actually said.
+        m = SOLEPLATE_RE.search(text)
+        if not m:
+            return ''
+        material = m.group(1) or m.group(2)      # either arm of the alternation
+        return f'{material.title()} Soleplate' if material else ''
     if category == 'Electric Kettles':
         m = re.search(r'(\d+(?:\.\d+)?\s*(?:ml|l|L))', text, re.IGNORECASE)
         return m.group(1) if m else ''
     if category == 'Sewing Machines':
-        return 'Built-in Straight Stitching'
+        # KI-14: was an unconditional 'Built-in Straight Stitching'
+        m = re.search(r'(\d+)\s*stitch', text, re.IGNORECASE)
+        if m:
+            return f'{m.group(1)} Built-in Stitches'
+        m = re.search(r'\b(straight|zigzag|zig-zag)\s*stitch', text, re.IGNORECASE)
+        return f'{m.group(1).title()} Stitch' if m else ''
     return ''
 
 
@@ -547,7 +649,18 @@ def configuration_text(title, category):
             return 'Fully Automatic Front Load'
         return 'Fully Automatic Top Load'
     if category == 'Water Heaters':
-        return 'Storage Water Geyser' if 'storage' in t else 'Instant Water Heater'
+        # KI-14: the old `... if 'storage' in t else 'Instant Water Heater'`
+        # labelled every heater that did not say "storage" as INSTANT - so a
+        # 'Racold 15L Water Heater', which is a storage geyser, shipped with
+        # "Instant Water Heater" on the storefront. Say nothing unless the
+        # listing does.
+        if 'storage' in t:
+            return 'Storage Water Geyser'
+        if 'instant' in t:
+            return 'Instant Water Heater'
+        if 'immersion' in t:
+            return 'Immersion Water Heater'
+        return ''
     if category == 'Microwave Ovens':
         return 'Convection Microwave Oven' if 'convection' in t else 'Solo Microwave Oven'
     if category == 'Induction Cooktops':
@@ -555,7 +668,11 @@ def configuration_text(title, category):
     if category == 'Electric Irons' or IRON_WORD_RE.search(t):
         return 'Heavy Weight Dry Iron' if 'heavy' in t else 'Steam Iron Fabric Care'
     if category == 'Electric Kettles':
-        return 'Stainless Steel Electric Kettle'
+        # KI-14: was an unconditional 'Stainless Steel Electric Kettle', which
+        # is a material claim about a product we know nothing about - a plastic
+        # kettle was being sold as stainless steel.
+        m = KETTLE_BODY_RE.search(t)
+        return f'{m.group(1).title()} Electric Kettle' if m else ''
     if category == 'Sewing Machines':
         return 'Manual Composite Sewing Machine' if 'manual' in t else 'Straight Stitch Sewing Frame'
     return ''                                   # KI-14: was 'Appliance Utility Core'
@@ -1342,6 +1459,20 @@ def read_uploaded_inventory(uploaded_file):
         return pd.read_excel(io.BytesIO(uploaded_file.getvalue()))
 
     raw_bytes = uploaded_file.getvalue()
+
+    # latin1 decodes ANY byte sequence, so the loop below could never fail and
+    # the ValueError at the end was unreachable: an .xlsx or a PNG renamed to
+    # .csv came back as a garbage one-column frame, and the user got
+    # "Missing required columns: sku, title, ..." instead of being told the
+    # file was not a CSV. A text file has no NUL bytes; UTF-16/32 does, so
+    # those are recognised by their BOM first.
+    bom = raw_bytes[:4]
+    utf_wide = bom.startswith((b'\xff\xfe', b'\xfe\xff'))
+    if b'\x00' in raw_bytes[:8192] and not utf_wide:
+        raise ValueError('That file is not a text CSV (it contains binary '
+                         'data). If it is an Excel workbook, upload it as '
+                         '.xlsx; otherwise save it as UTF-8 CSV.')
+
     encodings = ['utf-8-sig', 'utf-8', 'utf-16', 'cp1252', 'latin1']
     separators = [None, ',', ';', '\t', '|']
 
@@ -1358,6 +1489,11 @@ def read_uploaded_inventory(uploaded_file):
                 else:
                     parsed = pd.read_csv(io.StringIO(decoded_text), sep=separator)
 
+                # a real header row has words in it; noise decoded through
+                # latin1 gives columns of control characters
+                if not any(re.search(r'[A-Za-z0-9]', str(c))
+                           for c in parsed.columns):
+                    continue
                 if len(parsed.columns) > 1 or len(parsed) > 0:
                     return parsed
             except Exception:
@@ -1416,7 +1552,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
         title = compact(row.get('title'))
         brand = compact(row.get('Brands')) or infer_brand(title, row.get('sku'))
-        parent_guess, sub_guess = detect_category(title, row.get('categories'), brand)
+        parent_guess, sub_guess = detect_category(title, row.get('categories'),
+                                                  brand, row.get('sku'))
         category_hierarchy, category_mapped = canonicalize_category(parent_guess, sub_guess)
         if not category_mapped:
             unmapped_categories.add(category_hierarchy)

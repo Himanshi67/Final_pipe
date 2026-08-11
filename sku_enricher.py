@@ -122,8 +122,17 @@ BLOCKED_DOMAINS = [                    # never use these results
     "91mobiles.com", "smartprix.com", "pricebaba.com", "mysmartprice.com",
 ]
 
-# generic category codes stripped from SKU text when building search queries
-CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW")
+# Generic category codes: an operator's shorthand for WHAT the product is, not
+# who made it. Stripped from SKU text when building search queries, and - more
+# importantly - never mistaken for the brand (see sku_parts).
+#
+# Measured on a 41-SKU multi-category crawl: 'WM-HTW120-178BK' searched with
+# brand='WM', 'SM-BANDHAN-...' with brand='SM' and 'HWD-3WFMR' with brand='HWD'.
+# assess() then demands the "brand" appear in the listing, so page after page
+# came back 'rejected: brand not found in listing' - the single largest cause
+# of NOT FOUND on ERP-coded lists.
+CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW",
+                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW")
 
 # ---- strict-match filters: accessories & compatibility listings ----------
 # Listings whose titles contain the model code but are NOT the product
@@ -595,11 +604,14 @@ def image_dir(u):
         return ""
 
 
-def dedupe_images(urls, base="", near=""):
-    """Absolutize, drop junk, collapse size variants, cap at MAX_IMAGES.
+def dedupe_images(urls, base="", near="", limit=None):
+    """Absolutize, drop junk, collapse size variants, cap at `limit`
+    (MAX_IMAGES by default).
     `near` is the page's declared product image: anything sitting in the same
     directory is ranked first, which keeps site furniture (logos living under
     /images/ while the gallery lives under /tvs/) out of the top slots."""
+    if limit is None:
+        limit = MAX_IMAGES
     seen, out = {}, []
     for u in urls:
         u = upsize_image_url(absolutize_url(base, u))
@@ -619,7 +631,7 @@ def dedupe_images(urls, base="", near=""):
     # never gets pushed below a thumbnail.
     d = image_dir(absolutize_url(base, near)) if near else ""
     out.sort(key=lambda u: (is_thumbnail(u), 0 if d and image_dir(u) == d else 1))
-    return out[:MAX_IMAGES]
+    return out[:limit]
 
 
 def largest_srcset(val):
@@ -865,18 +877,46 @@ def is_product_url(url):
 # ------------------------------ SKU parsing ------------------------------
 
 def sku_parts(sku):
-    """('SAMSUNG', 'WA70BG4441YYTL') from 'SAMSUNG-WA70BG4441YYTL'"""
+    """('SAMSUNG', 'WA70BG4441YYTL') from 'SAMSUNG-WA70BG4441YYTL'
+
+    A leading CATEGORY_CODE is not a brand. 'WM-HTW120-178BK' means "washing
+    machine, model HTW120-178BK" - taking 'WM' as the brand poisons the search
+    query AND assess()'s brand-presence gate, which is the dominant NOT FOUND
+    cause on ERP-coded lists. When the code is all there is, the brand is
+    simply unknown ('') and assess() skips the brand check rather than
+    rejecting every real page for want of a word that was never a brand."""
     sku = str(sku).strip()
-    brand = re.split(r"[-\s]", sku, maxsplit=1)[0]
+    # '63HNCCC21V9SN(WATER DISPENSER)' - a bracketed note is never the brand
+    sku = re.sub(r"\([^)]*\)", " ", sku).strip(" -,")
+    brand = ""
+    for token in re.split(r"[-\s]", sku):
+        if not token or token.upper() in CATEGORY_CODES:
+            continue                       # a category code, not a maker
+        # A brand name carries no digits. Without this the token AFTER the
+        # category code gets promoted instead, which is the MODEL - 'WM-HTW120
+        # -178BK' would hand back brand='HTW120' and 'IC-CJ1360WPC'
+        # brand='CJ1360WPC'. When the list codes no maker at all the honest
+        # answer is that the brand is unknown.
+        if re.fullmatch(r"[A-Za-z][A-Za-z&.']{1,}", token):
+            brand = token
+        break
     models = []
     for t in re.split(r"[\s,/]+", sku):
         t = t.strip("()-.")
         # strip a brand prefix glued onto the model code
         # ('SAMSUNG-WW12DG5B24ABTL' -> 'WW12DG5B24ABTL', else the quoted
         #  search '"SAMSUNG-WW12DG5B24ABTL"' matches nothing anywhere)
-        t = re.sub(r"^" + re.escape(brand) + r"[-_]+", "", t, flags=re.I)
+        if brand:
+            t = re.sub(r"^" + re.escape(brand) + r"[-_]+", "", t, flags=re.I)
+        # ...and the same for a category code, which is glued on exactly the
+        # same way ('WM-HTW120-178BK' -> 'HTW120-178BK'). This used to happen
+        # for free because the code WAS the brand; now that it is correctly
+        # not, the model still has to be freed of it or the quoted search
+        # '"WM-HTW120-178BK"' matches nothing anywhere either.
+        t = re.sub(r"^(?:" + "|".join(CATEGORY_CODES) + r")[-_]+", "", t,
+                   flags=re.I)
         if (len(t) >= 4 and re.search(r"\d", t) and re.search(r"[A-Za-z]", t)
-                and norm(t) != norm(brand)):
+                and (not brand or norm(t) != norm(brand))):
             models.append(t)
     models.sort(key=len, reverse=True)     # longest token = model code, usually
     return brand, (models[0] if models else "")
@@ -884,25 +924,32 @@ def sku_parts(sku):
 
 def build_queries(sku):
     brand, model = sku_parts(sku)
-    rest = re.sub(r"^\s*" + re.escape(brand) + r"[-\s]*", "", str(sku), flags=re.I)
+    rest = str(sku)
+    if brand:
+        rest = re.sub(r"^\s*" + re.escape(brand) + r"[-\s]*", "", rest, flags=re.I)
     rest = re.sub(r"^(" + "|".join(CATEGORY_CODES) + r")\b[\s-]*", "", rest, flags=re.I).strip()
 
-    brand_site = BRAND_SITES.get(brand.lower(), "")
+    brand_site = BRAND_SITES.get(brand.lower(), "") if brand else ""
+
+    def phrase(*parts):
+        """Join the parts that exist. With no brand this must not emit a query
+        with a leading space or a doubled one."""
+        return " ".join(p for p in parts if p)
 
     queries = []          # (query, restrict-to-domain or None)
     if model:
         # short/ambiguous codes ('600C', '7.0KG') search better with the brand
-        qm = f'"{model}"' if len(model) >= 6 else f'{brand} "{model}"'
+        qm = f'"{model}"' if len(model) >= 6 or not brand else phrase(brand, f'"{model}"')
         queries.append((f'{qm} site:amazon.in', "amazon.in"))
         queries.append((f'{qm} site:flipkart.com', "flipkart.com"))
         queries.append((f'{qm} site:croma.com', "croma.com"))
         if brand_site:
             queries.append((f'{qm} site:{brand_site}', brand_site))
-        queries.append((f'{brand} {model} price buy online', None))
+        queries.append((phrase(brand, model, 'price buy online'), None))
     if rest and norm(rest) != norm(model):
-        queries.append((f'{brand} {rest} site:amazon.in', "amazon.in"))
-        queries.append((f'{brand} {rest} site:flipkart.com', "flipkart.com"))
-        queries.append((f'{brand} {rest} price india', None))
+        queries.append((phrase(brand, rest, 'site:amazon.in'), "amazon.in"))
+        queries.append((phrase(brand, rest, 'site:flipkart.com'), "flipkart.com"))
+        queries.append((phrase(brand, rest, 'price india'), None))
     if not queries:
         queries.append((f'{sku} price india', None))
     return brand, model, queries
@@ -1038,19 +1085,33 @@ def get_session(dom, fresh=False):
     """One cookie jar per domain: cookies are domain-scoped anyway, and a
     burned identity on amazon.in shouldn't reset the jar for flipkart."""
     if fresh or dom not in _SESSIONS:
-        try:
-            _SESSIONS[dom].close()
-        except Exception:
-            pass
+        old = _SESSIONS.get(dom)          # was _SESSIONS[dom]: a KeyError on
+        if old is not None:               # every first use, swallowed silently
+            try:
+                old.close()
+            except Exception:
+                pass
         _SESSIONS[dom] = creq.Session()
         _PROFILES.pop(dom, None)
         _LAST_URL.pop(dom, None)
     return _SESSIONS[dom]
 
 
-IMAGE_MIN_PX = 500        # must match app.py's MIN_IMAGE_EDGE
+# Must equal app.py's MIN_IMAGE_EDGE. It said so before too, but the value was
+# 500 against app.py's 1000, so stage 1 kept every 500-999px image, counted it
+# in the row's image total and reported "FOUND (amazon.in)" with 8 images -
+# then app.py silently refused those same images at download time and the
+# product shipped with fewer, or none. The sheet a human reviews has to state
+# what will actually ship. tests/test_hd_images.py pins the two together.
+IMAGE_MIN_PX = 1000       # HD floor; --min-image-px overrides
 IMAGE_PROBE_BYTES = 65536  # enough of the file to read its header
 IMAGE_PROBE_MAX = 14       # per record; a gallery longer than this is padding
+# extract() keeps this many candidates so the size filter downstream has spares
+# to fall back on. It used to cut to MAX_IMAGES first, so a page whose top 8
+# candidates included 5 thumbnails ended at 3 images even though good ones were
+# sitting just below the cut. Equal to IMAGE_PROBE_MAX so every image in the
+# pool actually gets measured; lookup_sku trims back to MAX_IMAGES afterwards.
+IMAGE_POOL = IMAGE_PROBE_MAX
 IMAGE_PROBE_WORKERS = 8    # concurrent header probes; these are 64 KB GETs to
                            # a CDN, not the polite-delay page fetches
 IMAGE_CHECK = True         # --no-image-check turns this off
@@ -1388,8 +1449,16 @@ def domain_cooling(dom):
 
 
 def is_block_reason(why):
-    """A genuine block, as opposed to a timeout or a missing page."""
+    """A genuine block, as opposed to a timeout or a missing page.
+
+    DEAD_CODES are explicitly NOT blocks. A bare `startswith("http 4")` swept
+    404 and 410 in with 403/429, so ONE dead product URL put the whole domain
+    on a DOMAIN_COOLDOWN_SKUS cooldown, spent a headless render on a page that
+    is gone, and made the row read 'NOT FOUND - all sources blocked
+    (amazon.in http 404)' when nothing had blocked anything."""
     if not why:
+        return False
+    if why in [f"http {c}" for c in DEAD_CODES]:
         return False
     return (why.startswith("http 4") or why == "http 503"
             or any(w in why for w in ("captcha", "challenge", "denied",
@@ -2057,7 +2126,10 @@ def extract(url, html):
         m = ""                       # MRP must exceed sale; >6x is a bundle/mismatch
     specs = format_specs(extract_specs(soup)) if SPECS_ENABLED else ""
     return {"title": t, "regular price": m, "sale price": s,
-            "url_link": url, "image_url": ",".join(dedupe_images(i, url)),
+            "url_link": url,
+            # a POOL, not the final gallery - upgrade_gallery() measures these
+            # and drops the small ones, then the caller trims to MAX_IMAGES
+            "image_url": ",".join(dedupe_images(i, url, limit=IMAGE_POOL)),
             "specs": specs}
 
 # ------------------------------ per-SKU flow ------------------------------
@@ -2082,13 +2154,30 @@ def looks_like_accessory(title, brand):
     return False
 
 
-def expected_caps(sku, model):
+# Products whose model digits are NOT a kilogram capacity. A TV's screen size
+# and an AC's tonnage code sit in exactly the same place as a washer's load
+# rating, so the /10 and /100 guesses below turned 'UA43H4500' into 4.3 kg and
+# '185V' into 18.5 kg. assess() then demanded that phantom capacity appear in
+# the title and rejected perfectly good TV and AC pages as "title lacks
+# capacity/model info". The title always says which kind of product it is.
+NON_CAPACITY_RE = re.compile(
+    r"\b(?:tv|television|qled|oled|qned|led\s*tv|smart\s*tv|inch|"
+    r"air\s*conditioner|split\s*ac|window\s*ac|inverter\s*ac|ton|tr)\b", re.I)
+
+
+def expected_caps(sku, model, title=""):
     """Capacities (kg) implied by the SKU: '7.5KG' text, or model digits
-    (HW90 -> 9, HW120 -> 12, WW12DG -> 12, HWM75 -> 7.5)."""
+    (HW90 -> 9, HW120 -> 12, WW12DG -> 12, HWM75 -> 7.5).
+
+    An explicit '7.5KG' in the SKU is a fact and always counts. The model-digit
+    reading is a GUESS, so it is skipped for product classes whose model digits
+    mean something else entirely (see NON_CAPACITY_RE)."""
     caps = set()
     m = KG_RE.search(str(sku))
     if m:
         caps.add(float(m.group(1)))
+    if NON_CAPACITY_RE.search(f"{title} {sku}"):
+        return caps                            # digits here are inches or tons
     dm = re.search(r"\d+", model or "")
     if dm:
         g = float(dm.group(0))
@@ -2207,7 +2296,7 @@ def assess(rec, sku, model, brand, min_price, max_price):
         return "strong", ""
 
     # -- everything below is UNVERIFIED: guard against wrong variants ------
-    caps = expected_caps(sku, model)
+    caps = expected_caps(sku, model, title)
     tm = KG_RE.search(title)
     if caps and tm:
         v = float(tm.group(1))
@@ -2310,7 +2399,8 @@ def probe(url, min_images=MIN_IMAGES):
     log(f"title  : {rec['title'][:100] or '(none)'}")
     log(f"mrp    : {rec['regular price'] or '(none)'}")
     log(f"sale   : {rec['sale price'] or '(none)'}")
-    log(f"images : {len(imgs)} (need {min_images})")
+    log(f"images : {len(imgs)} candidate(s) (need {min_images}; a real row "
+        f"measures these and keeps at most {MAX_IMAGES})")
     for i in imgs:
         log(f"    {'THUMB' if is_thumbnail(i) else '     '} {i[:110]}")
     spec_rows = parse_spec_cell(rec.get("specs", ""))
@@ -2321,6 +2411,18 @@ def probe(url, min_images=MIN_IMAGES):
 
 def image_count(rec):
     return len(split_image_list(rec.get("image_url", "")))
+
+
+def cap_images(rec, limit=MAX_IMAGES):
+    """Trim a record's candidate pool down to the gallery that ships.
+
+    extract() deliberately over-collects (IMAGE_POOL) so the size filter has
+    spares; anything that reaches the spreadsheet without passing through
+    upgrade_gallery still has to be cut back here."""
+    imgs = split_image_list(rec.get("image_url", ""))
+    if len(imgs) > limit:
+        rec["image_url"] = ",".join(imgs[:limit])
+    return rec
 
 
 def status_for(rec, url, min_images=MIN_IMAGES, donors=()):
@@ -2411,6 +2513,17 @@ def merge_sources(best, hits, min_images=MIN_IMAGES):
         if len(merged) >= min_images and not domain_quality(h.get("url_link", "")):
             continue                  # past the floor, unlisted stores add risk
         extra = split_image_list(h.get("image_url", ""))
+        if not extra:
+            continue
+        # Measure what we are about to splice in. Only the WINNER's gallery went
+        # through upgrade_gallery, so donated images used to bypass the size
+        # filter entirely and a merged row could ship photos under IMAGE_MIN_PX
+        # that the pipeline claims to have removed.
+        probe_many(extra[:IMAGE_PROBE_MAX])
+        extra, too_small = drop_small_images(extra, IMAGE_MIN_PX)
+        if too_small:
+            log(f"      skipped {len(too_small)} donated image(s) under "
+                f"{IMAGE_MIN_PX}px from {domain_of(h.get('url_link', ''))}")
         if not extra:
             continue
         before = len(merged)
@@ -2623,8 +2736,10 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
             # for the probes - most fetched pages never get this far.
             imgs = split_image_list(rec.get("image_url", ""))
             keep, small, note = upgrade_gallery(imgs, IMAGE_MIN_PX)
-            if note or small:
-                rec["image_url"] = ",".join(keep)
+            # ALWAYS reassign: extract() now hands over an IMAGE_POOL-sized
+            # candidate list, so leaving it untouched when nothing was dropped
+            # would write more than MAX_IMAGES into the sheet
+            rec["image_url"] = ",".join(keep[:MAX_IMAGES])
             if note:
                 log(f"      images {note}")
             if small:
@@ -2671,14 +2786,17 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
             log("      merged: " + "; ".join(donors))
         return best_strong
     # best SOURCE first, then completeness - see rec_score
+    # These never went through upgrade_gallery (only a listing we are about to
+    # accept pays for the probes), so they still carry the IMAGE_POOL-sized
+    # candidate list and have to be trimmed before they reach the sheet.
     if close_hits:
         rec = max(close_hits, key=lambda r: rec_score(r, min_images))
         rec["status"] = f"CLOSE MATCH - CHECK ({domain_of(rec['url_link'])})"
-        return rec
+        return cap_images(rec)
     if weak_hits:
         rec = max(weak_hits, key=lambda r: rec_score(r, min_images))
         rec["status"] = f"CHECK MANUALLY ({domain_of(rec['url_link'])})"
-        return rec
+        return cap_images(rec)
     return {"status": not_found_status(candidates, fetched, fail_reasons)}
 
 
@@ -2732,7 +2850,16 @@ def clean_busy_sku(raw):
         return ""
     text = BUSY_UNIT_RE.sub(" ", text)
     text = re.sub(r"\([^)]*\)", " ", text)          # any remaining branch note
-    return re.sub(r"\s+", " ", text).strip(" -,")
+    text = re.sub(r"\s+", " ", text).strip(" -,")
+    # '... - GHAZIABAD' is the stocking branch, not part of the model. It was
+    # going into the search query ('VOLTAS 185V VECTRA PRISM - GHAZIABAD
+    # site:amazon.in' matches nothing) and, once the sku column is mirrored,
+    # onto the storefront. Only a trailing ' - ' segment with NO DIGITS is
+    # dropped: a model code always carries digits, a branch name does not.
+    parts = re.split(r"\s+-\s+", text)
+    while len(parts) > 1 and not re.search(r"\d", parts[-1]):
+        parts.pop()
+    return " - ".join(parts).strip(" -,")
 
 COL_ALIASES = {
     "title": ["title", "producttitle", "productname", "name"],
@@ -2812,9 +2939,19 @@ def map_columns(ws, sku_col_arg):
     return sku_col, cols
 
 
-def ensure_app_columns(ws, sku_col):
+def ensure_app_columns(ws, sku_col, clean=None):
     """Append whatever app.py needs but the lookup never produces, so the
-    filled sheet imports without hand-editing (see APP_EXTRA_COLS)."""
+    filled sheet imports without hand-editing (see APP_EXTRA_COLS).
+
+    `clean` transforms each value on its way into the 'sku' column. It exists
+    for BUSY ERP exports, where the item-detail cell that gets SEARCHED is
+    cleaned ('VOLTAS 185V VECTRA PRISM (INNER) - GHAZIABAD' -> 'VOLTAS 185V
+    VECTRA PRISM') but the RAW cell used to be what was mirrored - so the live
+    WooCommerce SKU came out as 'AP-VOLTAS-185V-VECTRA-PRISM-(INNER)-GHAZIABAD',
+    branch name and unit designator included, and the two halves of one split
+    AC got two different SKUs that app.py could no longer collapse.
+
+    Returns the column index of 'sku'."""
     headers = {}
     for c in range(1, ws.max_column + 1):
         h = norm_header(ws.cell(row=1, column=c).value)
@@ -2835,16 +2972,33 @@ def ensure_app_columns(ws, sku_col):
     # header, while the input's own may be 'Item Details', 'Model No', etc.
     sku_out = headers[norm_header("sku")]
     if sku_out != sku_col:
-        filled = 0
+        filled = repaired = 0
         for r in range(2, ws.max_row + 1):
-            if str(ws.cell(row=r, column=sku_out).value or "").strip():
-                continue
             src = ws.cell(row=r, column=sku_col).value
-            if src is not None and str(src).strip():
-                ws.cell(row=r, column=sku_out, value=safe_cell(str(src).strip()))
+            if src is None or not str(src).strip():
+                continue
+            want = str(src).strip()
+            if clean:
+                want = clean(want) or want
+            have = str(ws.cell(row=r, column=sku_out).value or "").strip()
+            if have == want:
+                continue
+            # Self-healing, like the KI-4 recovery path: a sheet filled by an
+            # earlier run holds the RAW value here, and silently leaving it
+            # would carry the bad SKU through every resume.
+            if have and not clean:
+                continue                    # a value someone may have edited
+            ws.cell(row=r, column=sku_out, value=safe_cell(want))
+            if have:
+                repaired += 1
+            else:
                 filled += 1
         if filled:
             log(f"Copied {filled} SKU value(s) into the 'sku' column")
+        if repaired:
+            log(f"Rewrote {repaired} 'sku' value(s) that still held the raw "
+                f"ERP text instead of the cleaned model code")
+    return sku_out
 
 
 ILLEGAL = re.compile(r"[\x00-\x08\x0b-\x1f]")
@@ -3195,7 +3349,7 @@ def main():
         log("  BUSY ERP export detected - stripping unit designators "
             "((IDU)/(ODU)/INNER/OUTER) and collapsing split-unit duplicates")
     log("Output columns: " + ", ".join(f"{k} -> col {v}" for k, v in cols.items()))
-    ensure_app_columns(ws, sku_col)
+    ensure_app_columns(ws, sku_col, clean_busy_sku if busy_input else None)
     if os.environ.get("SERPER_API_KEY"):
         log("Search: Google via serper.dev (API key detected)")
     else:

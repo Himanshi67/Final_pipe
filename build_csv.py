@@ -38,7 +38,21 @@ def read_inventory(path):
     sys.exit(f"Unable to read {path.name}. Save it as UTF-8 CSV or .xlsx.")
 
 
+
+def use_utf8_stdout():
+    """A Windows console is cp1252, and scraped titles/SKUs are not. Without
+    this a single unmappable character aborts the run with a UnicodeEncodeError
+    traceback - mid-batch, after work has already been done. sku_enricher.py
+    has always done this; the rest of the entry points had not."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
 def main():
+    use_utf8_stdout()
     ap = argparse.ArgumentParser(
         description="Headless WooCommerce CSV build (the app.py formatter, "
                     "without Streamlit).")
