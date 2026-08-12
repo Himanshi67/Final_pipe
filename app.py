@@ -591,9 +591,19 @@ def prefixed_sku(raw_sku, category):
     # inconsistently by different clients.
     sku = re.sub(r'[\\/:*?"<>|()\[\]{}]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
-    if sku.startswith(tuple(f'{p}-' for p in SKU_PREFIXES)):
-        return sku                     # already prefixed on an earlier build
-    code = SKU_PREFIX_BY_PARENT.get(category, 'AP')
+    if sku.startswith(('WM-', 'WH-')):
+        return sku                     # live products carry these - never rename
+    code = SKU_PREFIX_BY_PARENT.get(category)
+    for p in SKU_PREFIXES:
+        if sku.startswith(f'{p}-'):
+            if code is None or p == code:
+                return sku             # right code already, or category unknown
+            # prefixes encode the category (decision 2026-08-11): a stale
+            # legacy AP- or an ERP-supplied code that contradicts the detected
+            # category is re-coded, not trusted
+            sku = sku[len(p) + 1:]
+            break
+    code = code or 'AP'
     return f'{code}-{sku}' if sku else f'{code}-UNKNOWN'
 
 
@@ -1580,7 +1590,11 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         if not category_mapped:
             unmapped_categories.add(category_hierarchy)
         category_family = family_for(parent_guess, sub_guess)
-        sku = prefixed_sku(row.get('sku'), category_family)
+        # the PARENT names the prefix, the family names capacity/config text -
+        # passing the family here sent every FAMILY_BY_SUB product (microwaves,
+        # kettles, irons, dispensers...) to the AP- fallback while its parent
+        # siblings got the real code
+        sku = prefixed_sku(row.get('sku'), parent_guess)
 
         # BUGFIX: identical SKUs used to produce duplicate WooCommerce rows
         if sku in seen_skus:

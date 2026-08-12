@@ -632,15 +632,36 @@ def test_19_category_prefixes():
               app.prefixed_sku("SAMSUNG X100", parent), f"{code}-SAMSUNG-X100")
     check("unknown category falls back to AP-",
           app.prefixed_sku("SAMSUNG X100", "Something New"), "AP-SAMSUNG-X100")
-    check("an already-prefixed SKU is never double-prefixed",
+    check("the right prefix is never doubled",
           app.prefixed_sku("TV-SAMSUNG-X100", "LED"), "TV-SAMSUNG-X100")
-    check("a legacy AP- SKU survives a rebuild unchanged",
-          app.prefixed_sku("AP-SAMSUNG-X100", "LED"), "AP-SAMSUNG-X100")
+    check("a legacy AP- SKU is re-coded once its category is known",
+          app.prefixed_sku("AP-SAMSUNG-X100", "LED"), "TV-SAMSUNG-X100")
+    check("a legacy AP- SKU keeps AP- while the category is unknown",
+          app.prefixed_sku("AP-SAMSUNG-X100", "Something New"),
+          "AP-SAMSUNG-X100")
+    check("an ERP code that contradicts the category is re-coded",
+          app.prefixed_sku("TV-VOLTAS-185V", "Air Conditioner"),
+          "AC-VOLTAS-185V")
+    check("WM- is NEVER renamed, even on a category mismatch (live products)",
+          app.prefixed_sku("WM-HTW120-178BK", "LED"), "WM-HTW120-178BK")
     check("model_code strips every prefix",
           app.model_code("TV-SAMSUNG-UA43T5310"), "UA43T5310")
     check("the map and the tuple agree",
           set(app.SKU_PREFIXES),
           set(app.SKU_PREFIX_BY_PARENT.values()) | {"AP"})
+    # the FAMILY names (family_for output) must never be handed to
+    # prefixed_sku - process_inventory passes the PARENT; pin that no family
+    # string is silently accepted as a category
+    for family in ("Microwave Ovens", "Electric Kettles", "Water Dispensers"):
+        check(f"family name '{family}' is not a prefix key",
+              family in app.SKU_PREFIX_BY_PARENT, False)
+    # cross-file sync: validate_csv's stripping regex and the enricher's
+    # input-code list must cover every prefix app.py can emit
+    for p in app.SKU_PREFIXES:
+        check(f"validate_csv strips {p}-",
+              bool(V.SKU_PREFIX_RE.match(f"{p}-X")), True)
+        check(f"enricher recognises {p} as a category code",
+              p in E.CATEGORY_CODES, True)
 
 
 def main():

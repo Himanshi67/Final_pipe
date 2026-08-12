@@ -147,9 +147,13 @@ def test_step3_scope_options(tmp):
     assert_no_exception(at)
     page_radios = [r for r in at.radio if "Rows to include" in str(r.label)]
     assert page_radios, "scope radio missing on step 3"
+    # AppTest's .options carries the DISPLAYED labels (format_func output);
+    # what must stay stable is the returned .value - a raw key, never the
+    # wording - so built_scope can't be flipped by a label rewrite
     opts = [str(o) for o in page_radios[0].options]
-    assert any("Confirmed rows only" in o for o in opts), opts
-    assert any("FOUND" in o for o in opts), opts
+    assert len(opts) == 2 and "Confirmed rows only" in opts[0], opts
+    assert page_radios[0].value in ("confirmed", "all_found"), \
+        page_radios[0].value
 
 
 def test_steps_4_5_locked_without_csv(tmp):

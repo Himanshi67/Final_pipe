@@ -63,11 +63,11 @@ def test_22_23_dispensers():
                                              "Water Dispensers")
     check("the result is a real taxonomy string", (text, mapped),
           ("Home Appliances > Water Dispensers", True))
-    # a dispenser must never take a washing-machine SKU prefix again
-    check("and it is not prefixed as a washing machine",
-          app.prefixed_sku("HWD-3WFMR", app.family_for("Home Appliances",
-                                                       "Water Dispensers")),
-          "AP-HWD-3WFMR")
+    # a dispenser must never take a washing-machine SKU prefix again - and
+    # process_inventory hands prefixed_sku the PARENT (the family string sent
+    # every FAMILY_BY_SUB product to the AP- fallback), so pin the parent form
+    check("and it takes its parent's prefix, not WM- and not the AP- fallback",
+          app.prefixed_sku("HWD-3WFMR", "Home Appliances"), "HA-HWD-3WFMR")
 
 
 def test_24_sku_is_consulted():
@@ -142,7 +142,17 @@ def test_26_wattage_is_not_weight():
             ("HAIER-HW80-B14959", "HW80-B14959",
              "Haier 8 Kg Front Load Washing Machine", {8.0}),
             ("HAIER-7.5KG-HWM75", "HWM75",
-             "Haier 7.5 kg Washing Machine", {7.5})]:
+             "Haier 7.5 kg Washing Machine", {7.5}),
+            # letters SANDWICHED between digits are a model series, not a
+            # unit - the first-letter bail used to blind the capacity guard
+            # for Samsung H-series and LG V-series washers
+            ("SAMSUNG-WA70H4200", "WA70H4200",
+             "Samsung 7 kg Top Load Washing Machine", {7.0}),
+            ("LG-T70VBMB1Z", "T70VBMB1Z",
+             "LG 7 kg Top Load Washing Machine", {7.0}),
+            # a following SEPARATE word is not a unit either
+            ("MODEL-700", "700 WHITE",
+             "Generic 7 kg Washing Machine", {7.0})]:
         check(f"{sku:24} -> {sorted(want)}",
               E.expected_caps(sku, model, title), want)
 

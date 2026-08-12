@@ -74,6 +74,43 @@ committed. One observation: spec/attribute coverage varies by category
 - **KI-7b** ddg_search cool-down is 30 s only for rate-limit exceptions,
   10 s for any other hiccup.
 
+### Review round (2026-08-11, 7-angle adversarial review of the day's commits)
+All fixed and pinned by tests:
+- `prefixed_sku` was being fed `family_for()` output, so all six FAMILY_BY_SUB
+  product families (microwaves, kettles, irons, dispensers…) silently fell to
+  AP- — now takes the parent; stale/contradicting prefixes are re-coded
+  (WM-/WH- never renamed: live products).
+- `expected_caps` unit bail-out fired on Samsung H-/LG V-series model codes,
+  blinding the capacity guard for major washer brands — now bails only on
+  glued, terminal unit letters.
+- `parse_amazon`'s tiny-thumbnail filter could empty a sparse page's gallery
+  whose only reference was a small rendition — now keeps candidates when
+  filtering would leave zero (upgrade pipeline recovers them).
+- GUI publish gating: pre-scope-tracking CSVs are refused (was warn-and-arm-
+  all); the CSV on disk is verified against `built_skus`; the >200-SKU case
+  chunks `--sku` pinning instead of silently dropping it.
+- GUI `pid_alive` identifies the enricher by process CREATION TIME vs the
+  stored launch timestamp (a syscall) instead of spawning `tasklist` on
+  every 2-second tick; tasklist remains a memoized fallback for old metas.
+- Scope radio uses stable value keys; DDG rate limits matched in the message
+  too; `_IMG_DIMS` evicts half instead of clearing; `media_creds()` is the
+  single (stripped) reader of WP_APP_*; validate_csv's prefix regex is a
+  module constant cross-pinned against `app.SKU_PREFIXES` by test_19.
+
+Accepted risks (reviewed, deliberate):
+- Parallel media uploads share the requests Session (cookie-jar races are
+  theoretical; auth is basic, not cookie-based) and can orphan Media Library
+  items when a gallery fails mid-upload — `find_media`'s name+size dedupe
+  reclaims them on the retry.
+- **Migration note:** products already published as AP-… (drafts only — live
+  products are WM-/WH- and keep their SKUs) get a new prefixed SKU on their
+  next publish; wc_publish upserts by SKU, so the old AP- DRAFT remains as a
+  duplicate. Clean up with `wc_publish.py --delete-sku AP-… --commit` when
+  republishing an old batch.
+- Terminal V-series codes (LG "P75VBAZ") still skip the capacity guess —
+  over-bailing is the safe direction (a wrong expected capacity rejects real
+  pages; a skipped guess only weakens one check).
+
 ### Open — code hardening, deliberately deferred
 - **A-9** whole-workbook save after every SKU (O(n²), deliberate for
   interrupt-safety). If large batches get slow: save every N rows + on exit +

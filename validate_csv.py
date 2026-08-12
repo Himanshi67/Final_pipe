@@ -536,6 +536,14 @@ def to_number(value):
     return number if math.isfinite(number) else None
 
 
+# Mirrors app.SKU_PREFIX_BY_PARENT (+ the AP fallback). This script stays
+# import-free of app.py on purpose (app.py drags in streamlit); the module
+# constant exists so tests can assert the two stay in sync -
+# tests\test_bugfixes.py test_19 fails the moment a prefix is added there
+# and not here.
+SKU_PREFIX_RE = re.compile(r'^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-')
+
+
 def validate_export(df, csv_path, check_images=True, write_issues=True):
     """QA for the generated WooCommerce CSV. Returns the list of issue dicts.
 
@@ -657,11 +665,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'title_suspiciously_short ({len(title)} chars)')
         # the SKU normally leads with the brand; if that word is nowhere in the
         # title, the row probably belongs to a different product
-        # prefix list mirrors app.SKU_PREFIX_BY_PARENT (+ AP fallback); this
-        # script stays import-free of app.py on purpose
-        sku_brand = re.split(
-            r'[-\s]',
-            re.sub(r'^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-', '', sku))[0].lower()
+        sku_brand = re.split(r'[-\s]',
+                             SKU_PREFIX_RE.sub('', sku))[0].lower()
         if len(sku_brand) > 3 and title and sku_brand not in title.lower():
             reasons.append(f'brand_missing_from_title (sku says {sku_brand})')
 
