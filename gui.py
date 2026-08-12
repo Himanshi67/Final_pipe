@@ -241,6 +241,12 @@ def enricher_panel(P):
 def classify(status) -> str:
     s = str(status or "").strip()
     u = s.upper()
+    # two-pass flow (--discover): a link is waiting to be looked at, and the
+    # row is deliberately NOT importable yet. These must not read as failures.
+    if u.startswith("NEEDS CRAWL"):
+        return "review" if "CHECK LINK" in u else "pending"
+    if u.startswith("NEEDS LINK"):
+        return "failed"      # nothing found - a human has to paste a URL
     if u.startswith("FOUND"):
         return "review" if " - " in s else "found"
     if u.startswith(("CLOSE", "CHECK")):
@@ -250,7 +256,8 @@ def classify(status) -> str:
     return "failed"          # NOT FOUND / ERROR / blank (not processed)
 
 
-BADGE = {"found": "🟢", "review": "🟡", "failed": "🔴", "skipped": "⚪"}
+BADGE = {"found": "🟢", "review": "🟡", "failed": "🔴", "skipped": "⚪",
+         "pending": "🔵"}
 
 
 # ------------------------------------------------------------------- step 1 --
@@ -292,6 +299,18 @@ def step_enrich(P):
                 st.markdown(P["report"].read_text(encoding="utf-8",
                                                   errors="replace"))
 
+    two_pass = st.radio(
+        "How do you want to run this?",
+        ["Two passes — find links & photos first, review them, then crawl",
+         "One pass — find and extract everything now"],
+        index=0,
+        help="Two passes costs the same crawling but puts your review BEFORE "
+             "the full extraction: you fix wrong or missing links, and pass 2 "
+             "then replays the cached pages for free, fetching only what you "
+             "changed. It also runs no searches at all, so it spends no "
+             "Serper credits.")
+    discover = two_pass.startswith("Two passes")
+
     with st.form("enrich_opts"):
         c1, c2, c3 = st.columns(3)
         limit = c1.number_input("Limit (0 = all rows)", 0, 10000, 0,
@@ -309,10 +328,12 @@ def step_enrich(P):
             force = st.checkbox("--force — re-process EVERY row (re-pays "
                                 "Serper credits when the cache is cold; only "
                                 "for applying parser fixes on a warm cache)")
-        started = st.form_submit_button("▶ Start enrichment", type="primary")
+        started = st.form_submit_button(
+            "▶ Find links & photos" if discover else "▶ Start enrichment",
+            type="primary")
 
     if started:
-        flags = []
+        flags = ["--discover"] if discover else []
         if limit:
             flags += ["--limit", str(int(limit))]
         if min_price:
@@ -437,35 +458,44 @@ def step_review(P):
     df["_bucket"] = df["status"].map(classify)
 
     n = df["_bucket"].value_counts()
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("🟢 Found (clean)", int(n.get("found", 0)))
-    m2.metric("🟡 Needs review", int(n.get("review", 0)))
-    m3.metric("🔴 Failed / not processed", int(n.get("failed", 0)))
-    m4.metric("✔ Confirmed", int(df["confirmed"].sum()))
+    pending = int(n.get("pending", 0))
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("🔵 Link found, not crawled", pending)
+    m2.metric("🟢 Found (clean)", int(n.get("found", 0)))
+    m3.metric("🟡 Needs review", int(n.get("review", 0)))
+    m4.metric("🔴 No link / failed", int(n.get("failed", 0)))
+    m5.metric("✔ Confirmed", int(df["confirmed"].sum()))
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
                "table; tick ✔ to confirm a row for the CSV. Then press "
                "**Save edits & confirmations**.")
 
     tabs = st.tabs([f"🟡 Needs review ({int(n.get('review', 0))})",
-                    f"🔴 Failed ({int(n.get('failed', 0))})",
+                    f"🔴 No link / failed ({int(n.get('failed', 0))})",
+                    f"🔵 Awaiting crawl ({pending})",
                     f"🟢 Found ({int(n.get('found', 0))})",
                     f"All rows ({len(df)})"])
     parts = []
     with tabs[0]:
         parts.append(review_editor(df[df["_bucket"] == "review"], "ed_review"))
     with tabs[1]:
+        if pending or int(n.get("failed", 0)):
+            st.caption("Paste a product URL into **url_link** for each row "
+                       "here, save, then press **Crawl all info**.")
         parts.append(review_editor(df[df["_bucket"] == "failed"], "ed_failed"))
     with tabs[2]:
-        parts.append(review_editor(df[df["_bucket"] == "found"], "ed_found"))
+        parts.append(review_editor(df[df["_bucket"] == "pending"], "ed_pending"))
     with tabs[3]:
+        parts.append(review_editor(df[df["_bucket"] == "found"], "ed_found"))
+    with tabs[4]:
         parts.append(review_editor(df, "ed_all"))
 
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
         # the All tab duplicates the bucket rows; later parts win, so pass it
-        # first and let bucket edits override it
-        ordered = [parts[3], parts[0], parts[1], parts[2]]
+        # first and let bucket edits override it. parts is in TAB order -
+        # review, failed, pending, found, all - so All is the last one.
+        ordered = [parts[-1]] + parts[:-1]
         try:
             changed = write_edits_back(P, df, ordered)
         except PermissionError:
@@ -488,10 +518,29 @@ def step_review(P):
         st.rerun()
 
     meta = load_meta(P)
+    # --discover MUST be stripped: passing it alongside --crawl-urls is the one
+    # combination the enricher refuses outright
     base_flags = [f for f in meta.get("enricher_flags", [])
                   if f not in ("--force", "--retry-incomplete",
-                               "--retry-missing")]
+                               "--retry-missing", "--discover", "--crawl-urls")]
     total = meta.get("total_rows", 0)
+
+    if pending or int(n.get("review", 0)):
+        no_link = int((df["url_link"].astype(str).str.strip() == "").sum()) \
+            if "url_link" in df.columns else 0
+        st.divider()
+        st.subheader("Pass 2 · crawl the reviewed links")
+        st.caption(f"Crawls the url_link on every row and pulls in the full "
+                   f"specifications. Runs **no searches**, so it spends no "
+                   f"Serper credits — links already crawled replay from cache "
+                   f"for free."
+                   + (f" {no_link} row(s) still have no link and will be "
+                      f"skipped." if no_link else ""))
+        if st.button("🔎 Crawl all info from these links", type="primary",
+                     key="crawl_urls_btn"):
+            start_enricher(P, base_flags + ["--crawl-urls"], total)
+            st.rerun()
+        st.divider()
     if b3.button("🔁 Re-enrich incomplete rows",
                  help="--retry-incomplete: rows FOUND but missing a price or "
                       "enough images; good cells are kept"):

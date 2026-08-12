@@ -164,6 +164,10 @@ MIN_IMAGES = 3            # a listing needs at least this many images to be
                           # accepted as final (else other sources are tried)
 SEARCH_RESULTS = 10       # search results pulled per query
 FETCH_BUDGET = 6          # max product pages fetched per SKU
+SEARCH_POOL = 12          # stop searching once this many candidates wait -
+                          # the fetch budget can never reach the ones beyond
+                          # (2x FETCH_BUDGET keeps round-robin diversity)
+DISCOVER_MODE = False     # --discover: links + photos only (see build_queries)
 FETCH_TIMEOUT = 30        # seconds
 MERGE_BUDGET = 2          # extra pages fetched purely to complete a verified
                           # row (see the price hunt at the end of lookup_sku)
@@ -936,23 +940,35 @@ def build_queries(sku):
         with a leading space or a doubled one."""
         return " ".join(p for p in parts if p)
 
-    queries = []          # (query, restrict-to-domain or None)
+    # Two tiers, run lazily by lookup_sku. The model code is the strongest
+    # signal there is - when its searches produce candidates, the full-title
+    # searches only re-find the same listings, so they cost 3 searches per SKU
+    # for nothing. They still exist as tier 2, for SKUs whose model code
+    # parses badly or is not indexed: tier 2 runs when tier 1 came up empty
+    # or everything it found failed verification.
+    tier1, tier2 = [], []     # [(query, restrict-to-domain or None), ...]
     if model:
         # short/ambiguous codes ('600C', '7.0KG') search better with the brand
         qm = f'"{model}"' if len(model) >= 6 or not brand else phrase(brand, f'"{model}"')
-        queries.append((f'{qm} site:amazon.in', "amazon.in"))
-        queries.append((f'{qm} site:flipkart.com', "flipkart.com"))
-        queries.append((f'{qm} site:croma.com', "croma.com"))
-        if brand_site:
-            queries.append((f'{qm} site:{brand_site}', brand_site))
-        queries.append((phrase(brand, model, 'price buy online'), None))
+        tier1.append((f'{qm} site:amazon.in', "amazon.in"))
+        tier1.append((f'{qm} site:flipkart.com', "flipkart.com"))
+        if not DISCOVER_MODE:
+            # pass 1 of the two-pass flow needs A reviewable link, not every
+            # marketplace's copy - croma and the brand site rarely beat the
+            # two above, and a discover miss is the human's to fix anyway
+            tier1.append((f'{qm} site:croma.com', "croma.com"))
+            if brand_site:
+                tier1.append((f'{qm} site:{brand_site}', brand_site))
+        tier1.append((phrase(brand, model, 'price buy online'), None))
     if rest and norm(rest) != norm(model):
-        queries.append((phrase(brand, rest, 'site:amazon.in'), "amazon.in"))
-        queries.append((phrase(brand, rest, 'site:flipkart.com'), "flipkart.com"))
-        queries.append((phrase(brand, rest, 'price india'), None))
-    if not queries:
-        queries.append((f'{sku} price india', None))
-    return brand, model, queries
+        tier2.append((phrase(brand, rest, 'site:amazon.in'), "amazon.in"))
+        tier2.append((phrase(brand, rest, 'site:flipkart.com'), "flipkart.com"))
+        tier2.append((phrase(brand, rest, 'price india'), None))
+    if not tier1:             # no model code parsed: the title IS the query
+        tier1, tier2 = tier2, []
+    if not tier1:
+        tier1 = [(f'{sku} price india', None)]
+    return brand, model, [t for t in (tier1, tier2) if t]
 
 # -------------------------------- search ---------------------------------
 
@@ -2626,150 +2642,184 @@ def rec_score(rec, min_images=MIN_IMAGES):
     return (domain_quality(rec.get("url_link", "")), completeness)
 
 
+def extract_page(u, html):
+    """extract() plus the JS fallbacks, shared by the search crawl and
+    --crawl-urls. Returns None when the page holds no parseable product."""
+    dom = domain_of(u)
+    rec = extract(u, html)
+    if not rec["title"]:
+        # fetched fine but nothing parsed out, usually a JS-built page.
+        # This used to drop out silently, which read exactly like "checked
+        # it and rejected it" in the log.
+        log("      no product data in the page (built by JavaScript?)"
+            + ("" if PW_ENABLED else " - try --js-fallback"))
+        if PW_ENABLED:
+            rendered = render_fetch(u)
+            if rendered:
+                rec = extract(u, rendered)
+        if not rec["title"]:
+            return None
+    # price built client-side (croma and friends): one more try with a real
+    # browser rather than writing the row off as "no price shown"
+    if not rec["sale price"] and any(j in dom for j in JS_PRICE_DOMAINS):
+        if PW_ENABLED:
+            rendered = render_fetch(u)
+            if rendered:
+                rrec = extract(u, rendered)
+                if rrec["sale price"]:
+                    rec = rrec
+                    log("      price recovered via JS render")
+        elif _PW["state"] != "dead":
+            log("      price looks JS-rendered - rerun with --js-fallback "
+                "to capture it")
+    return rec
+
+
+def finalize_gallery(rec):
+    """Measure the gallery before the row can claim it. Done here rather than
+    in extract() so only a listing we are about to accept pays for the probes -
+    most fetched pages never get this far."""
+    keep, small, note = upgrade_gallery(
+        split_image_list(rec.get("image_url", "")), IMAGE_MIN_PX)
+    # ALWAYS reassign: extract() hands over an IMAGE_POOL-sized candidate
+    # list, so leaving it untouched when nothing was dropped would write more
+    # than MAX_IMAGES into the sheet
+    rec["image_url"] = ",".join(keep[:MAX_IMAGES])
+    if note:
+        log(f"      images {note}")
+    if small:
+        log(f"      dropped {len(small)} image(s) under {IMAGE_MIN_PX}px: "
+            + ", ".join(d for _, d in small[:4]))
+
+
 def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
-    brand, model, queries = build_queries(sku)
+    brand, model, tiers = build_queries(sku)
 
-    # -- phase 1: run ALL searches first (Amazon, Flipkart, brand site, open)
-    # so no marketplace is skipped just because Amazon returned something.
-    seen, candidates = set(), []
-    for q, dom in queries:
-        log(f"    searching: {q}")
-        _net_before = NET_CALLS
-        for r in web_search(q):
-            u = r.get("href", "")
-            if not u or is_blocked(u):
-                continue
-            if dom and not domain_of(u).endswith(dom):
-                continue
-            u = canonical_url(u)
-            if u in seen:
-                continue
-            seen.add(u)
-            if not is_product_url(u):
-                continue
-            if looks_like_accessory(r.get("title", ""), brand):
-                log(f"      skipped accessory result: {str(r.get('title'))[:70]}")
-                continue
-            if not result_looks_relevant(r.get("title", ""), sku, model):
-                log(f"      skipped off-category result: {str(r.get('title'))[:70]}")
-                continue
-            candidates.append(u)
-        polite_sleep(0.6, 1.4, since=_net_before)
-
-    # Round-robin: take the best URL from EACH domain before any domain's
-    # second. Straight domain_rank order let amazon occupy every fetch slot,
-    # so one hostile site could bury a SKU that flipkart or croma had.
-    _nth = {}
-
-    def _order(u):
-        d = domain_of(u)
-        _nth[d] = _nth.get(d, 0) + 1
-        return (_nth[d], domain_rank(u))
-
-    candidates.sort(key=_order)
-
-    # -- phase 2: fetch and strictly verify, best domains first ------------
-    # a strong hit is final only when COMPLETE (has a price and at least
-    # min_images images); otherwise the next sources are still tried and the
-    # best incomplete strong hit is kept as fallback.
     global _SKU_SEQ
     _SKU_SEQ += 1
     _PW["sku_used"] = 0
+    seen = set()
     best_strong, best_score = None, (-1, -1)     # (domain quality, completeness)
     close_hits, weak_hits, strong_hits = [], [], []
     fetched, per_dom, fail_reasons, tried = 0, {}, [], set()
-    for u in candidates:
-        if fetched >= FETCH_BUDGET:
-            break
-        dom = domain_of(u)
-        if domain_cooling(dom):
-            fail_reasons.append((dom, "cooling off"))
-            continue
-        if per_dom.get(dom, 0) >= MAX_PAGES_PER_DOMAIN:
-            continue
-        per_dom[dom] = per_dom.get(dom, 0) + 1
-        fetched += 1
-        tried.add(u)
-        log(f"    checking:  {u[:95]}")
-        _net_before = NET_CALLS
-        html, why = fetch(u)
-        polite_sleep(1.5, 3.0, since=_net_before)
-        if not html:
-            fail_reasons.append((dom, why))
-            if is_block_reason(why):
-                trip_domain(dom, why)
-                html = render_fetch(u)      # headless retry, if --js-fallback
-            if not html:
+    candidates = []           # every URL any tier surfaced, for hunt_donors
+
+    def run_tier(queries):
+        """Search one tier; returns its NEW candidate URLs, best domains first."""
+        found = []
+        for q, dom in queries:
+            if len(found) >= SEARCH_POOL:
+                break         # the fetch budget can never reach more anyway
+            log(f"    searching: {q}")
+            _net_before = NET_CALLS
+            for r in web_search(q):
+                u = r.get("href", "")
+                if not u or is_blocked(u):
+                    continue
+                if dom and not domain_of(u).endswith(dom):
+                    continue
+                u = canonical_url(u)
+                if u in seen:
+                    continue
+                seen.add(u)
+                if not is_product_url(u):
+                    continue
+                if looks_like_accessory(r.get("title", ""), brand):
+                    log(f"      skipped accessory result: {str(r.get('title'))[:70]}")
+                    continue
+                if not result_looks_relevant(r.get("title", ""), sku, model):
+                    log(f"      skipped off-category result: {str(r.get('title'))[:70]}")
+                    continue
+                found.append(u)
+            polite_sleep(0.6, 1.4, since=_net_before)
+        # Round-robin: take the best URL from EACH domain before any domain's
+        # second. Straight domain_rank order let amazon occupy every fetch
+        # slot, so one hostile site could bury a SKU that flipkart had.
+        _nth = {}
+
+        def _order(u):
+            d = domain_of(u)
+            _nth[d] = _nth.get(d, 0) + 1
+            return (_nth[d], domain_rank(u))
+
+        found.sort(key=_order)
+        return found
+
+    def crawl(batch):
+        """Fetch and strictly verify, best domains first. Returns a rec only
+        when it is COMPLETE (price + enough images + a real retailer);
+        anything less is banked in the hit lists for the fallback logic."""
+        nonlocal best_strong, best_score, fetched
+        for u in batch:
+            if fetched >= FETCH_BUDGET:
+                break
+            dom = domain_of(u)
+            if domain_cooling(dom):
+                fail_reasons.append((dom, "cooling off"))
                 continue
-        rec = extract(u, html)
-        # price built client-side (croma and friends): one more try with a real
-        # browser rather than writing the row off as "no price shown"
-        if (not rec["sale price"] and rec["title"]
-                and any(j in dom for j in JS_PRICE_DOMAINS)):
-            if PW_ENABLED:
-                rendered = render_fetch(u)
-                if rendered:
-                    rrec = extract(u, rendered)
-                    if rrec["sale price"]:
-                        rec = rrec
-                        log("      price recovered via JS render")
-            elif _PW["state"] != "dead":
-                log("      price looks JS-rendered - rerun with --js-fallback "
-                    "to capture it")
-        if not rec["title"]:
-            # fetched fine but nothing parsed out, usually a JS-built page.
-            # This used to drop out silently, which read exactly like "checked
-            # it and rejected it" in the log.
-            log("      no product data in the page (built by JavaScript?)"
-                + ("" if PW_ENABLED else " - try --js-fallback"))
-            if PW_ENABLED:
-                rendered = render_fetch(u)
-                if rendered:
-                    rec = extract(u, rendered)
-            if not rec["title"]:
+            if per_dom.get(dom, 0) >= MAX_PAGES_PER_DOMAIN:
+                continue
+            per_dom[dom] = per_dom.get(dom, 0) + 1
+            fetched += 1
+            tried.add(u)
+            log(f"    checking:  {u[:95]}")
+            _net_before = NET_CALLS
+            html, why = fetch(u)
+            polite_sleep(1.5, 3.0, since=_net_before)
+            if not html:
+                fail_reasons.append((dom, why))
+                if is_block_reason(why):
+                    trip_domain(dom, why)
+                    html = render_fetch(u)  # headless retry, if --js-fallback
+                if not html:
+                    continue
+            rec = extract_page(u, html)
+            if rec is None:
                 fail_reasons.append((dom, "no parseable product data"))
                 continue
-        verdict, reason = assess(rec, sku, model, brand, min_price, max_price)
-        if verdict == "strong":
-            # Measure the gallery before the row can claim it. Done here rather
-            # than in extract() so only a listing we are about to accept pays
-            # for the probes - most fetched pages never get this far.
-            imgs = split_image_list(rec.get("image_url", ""))
-            keep, small, note = upgrade_gallery(imgs, IMAGE_MIN_PX)
-            # ALWAYS reassign: extract() now hands over an IMAGE_POOL-sized
-            # candidate list, so leaving it untouched when nothing was dropped
-            # would write more than MAX_IMAGES into the sheet
-            rec["image_url"] = ",".join(keep[:MAX_IMAGES])
-            if note:
-                log(f"      images {note}")
-            if small:
-                log(f"      dropped {len(small)} image(s) under {IMAGE_MIN_PX}px: "
-                    + ", ".join(d for _, d in small[:4]))
-            n_img = image_count(rec)
-            known = domain_quality(u)
-            rec["url_link"] = rec.get("url_link") or u
-            rec["status"] = status_for(rec, u, min_images)
-            strong_hits.append(rec)
-            if (rec["sale price"] and n_img >= min_images and known
-                    and not bogus_mrp(rec["regular price"], rec["sale price"])):
-                return rec                  # complete AND from a real retailer
-            score = rec_score(rec, min_images)
-            if score > best_score:
-                best_strong, best_score = rec, score
-            if not known:
-                log(f"      complete but from an unlisted store ({domain_of(u)}) - "
-                    f"still looking for a known retailer...")
+            verdict, reason = assess(rec, sku, model, brand, min_price, max_price)
+            if verdict == "strong":
+                finalize_gallery(rec)
+                n_img = image_count(rec)
+                known = domain_quality(u)
+                rec["url_link"] = rec.get("url_link") or u
+                rec["status"] = status_for(rec, u, min_images)
+                strong_hits.append(rec)
+                if (rec["sale price"] and n_img >= min_images and known
+                        and not bogus_mrp(rec["regular price"], rec["sale price"])):
+                    return rec              # complete AND from a real retailer
+                score = rec_score(rec, min_images)
+                if score > best_score:
+                    best_strong, best_score = rec, score
+                if not known:
+                    log(f"      complete but from an unlisted store ({domain_of(u)}) - "
+                        f"still looking for a known retailer...")
+                else:
+                    log(f"      verified but incomplete (price: "
+                        f"{'yes' if rec['sale price'] else 'no'}, images: {n_img}) - "
+                        f"trying next source...")
+            elif verdict == "close":
+                close_hits.append(rec)
+            elif verdict == "weak":
+                weak_hits.append(rec)
             else:
-                log(f"      verified but incomplete (price: "
-                    f"{'yes' if rec['sale price'] else 'no'}, images: {n_img}) - "
-                    f"trying next source...")
-            continue
-        if verdict == "close":
-            close_hits.append(rec)
-        elif verdict == "weak":
-            weak_hits.append(rec)
-        else:
-            log(f"      rejected: {reason}")
+                log(f"      rejected: {reason}")
+        return None
+
+    # -- tiers run lazily: search a tier, crawl what it found, and only fall
+    # to the next tier when nothing was verified. The old shape ran ALL the
+    # searches up front, so every SKU paid for the title queries even when
+    # the very first model-code search had already found the listing.
+    for tier in tiers:
+        fresh = run_tier(tier)
+        candidates += fresh
+        winner = crawl(fresh)
+        if winner:
+            return winner
+        if best_strong:
+            # verified, just incomplete. The next tier would only re-find the
+            # same listing; hunt_donors/merge_sources below complete the row.
+            break
 
     if best_strong:
         # the winner is verified but incomplete. Before settling for that, go
@@ -2816,6 +2866,75 @@ def not_found_status(candidates, fetched, fail_reasons):
     return f"NOT FOUND - {fetched} page(s) checked, none matched"[:200]
 
 # ------------------------------ excel I/O ---------------------------------
+
+# ---------------------------------------------------------------------------
+# The two-pass flow: --discover finds a link and photos so a human can review
+# them, --crawl-urls then extracts everything from the link that survived that
+# review. Splitting it this way does not save crawling - the photos only exist
+# on the product page, so pass 1 has to fetch it anyway. What it buys is the
+# ORDER: nobody spends a full extraction on a listing that turns out to be the
+# wrong product, and pass 2 replays pass 1's cached pages for free, paying
+# network only for the URLs a human actually changed.
+# ---------------------------------------------------------------------------
+
+def discovery_status(rec):
+    """Rewrite a pass-1 verdict into review vocabulary.
+
+    Deliberately NOT the FOUND/CLOSE/CHECK words: those mean 'this row is
+    finished', and app.py imports on `status.startswith("FOUND")`. A discovery
+    sheet has no specs and an unreviewed link, so it must not be importable by
+    accident."""
+    url = str(rec.get("url_link") or "").strip()
+    original = str(rec.get("status") or "").strip()
+    if not url:
+        return f"NEEDS LINK - {original or 'NOT FOUND'}"[:250]
+    dom = domain_of(url)
+    if original.startswith("FOUND"):
+        return f"NEEDS CRAWL ({dom})"
+    # CLOSE MATCH / CHECK MANUALLY: there IS a link, it is just not certain to
+    # be the right product. Still crawlable, so the human only has to touch it
+    # if it is actually wrong.
+    return f"NEEDS CRAWL - CHECK LINK ({dom})"
+
+
+def crawl_url(url, sku="", min_images=MIN_IMAGES):
+    """PASS 2: extract everything from ONE known URL. Runs no searches.
+
+    The human chose this listing, so it is the only source: there is no
+    donor-hunting here, because hunting donors means searching, and the whole
+    point of this pass is that it spends no search credits. A page that turns
+    out to have no price says so rather than borrowing one from elsewhere."""
+    _net_before = NET_CALLS
+    html, why = fetch(url)
+    if not html:
+        html = render_fetch(url)          # headless retry, if --js-fallback
+    if not html:
+        return {"status": f"ERROR: {why or 'could not fetch'}"[:250]}
+
+    rec = extract_page(url, html)
+    if rec is None:
+        return {"status": "ERROR: no product data in the page "
+                          "(built by JavaScript? try --js-fallback)"}
+
+    finalize_gallery(rec)
+    rec["url_link"] = rec.get("url_link") or url
+    rec["status"] = status_for(rec, url, min_images)
+
+    # Sanity-check the page against the SKU, but never REJECT it: a human put
+    # this URL here, and silently discarding their choice would be worse than
+    # crawling a row they have to look at again. So it is recorded on the row.
+    if sku:
+        brand, model, _ = build_queries(sku)
+        verdict, reason = assess(rec, sku, model, brand, 0, 0)
+        if verdict != "strong":
+            # assess() does not always give a reason (a 'close' verdict often
+            # has none). "VERIFY:" with nothing after it tells a reviewer
+            # exactly nothing, so fall back to naming the verdict.
+            rec["status"] = (f"{rec['status']} - VERIFY: "
+                             f"{reason or f'{verdict} match only'}")[:250]
+    polite_sleep(1.5, 3.0, since=_net_before)
+    return rec
+
 
 def norm_header(h):
     return re.sub(r"[^a-z0-9]", "", str(h or "").lower())
@@ -3183,7 +3302,7 @@ def write_report(path, rows, out_file, started, args, min_images):
 
 def main():
     global PW_ENABLED, PW_MAX_PER_RUN, PW_PROFILE_DIR, CACHE_ENABLED, CACHE_REFRESH
-    global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED
+    global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED, DISCOVER_MODE
     global IMAGE_CHECK, IMAGE_MIN_PX
     if hasattr(sys.stdout, "reconfigure"):
         try:
@@ -3207,6 +3326,23 @@ def main():
     ap.add_argument("--retry-incomplete", action="store_true",
                     help="Re-attempt rows already FOUND but missing a price or "
                          "enough images; their existing good cells are kept")
+    flow = ap.add_argument_group(
+        "two-pass flow",
+        "Review the links and photos BEFORE paying for a full extraction. "
+        "Run --discover, fix the url_link cells the sheet marks NEEDS LINK, "
+        "then run --crawl-urls on the same file.")
+    flow.add_argument("--discover", action="store_true",
+                      help="PASS 1: find a product link and photos for each SKU "
+                           "and stop there - no spec table, no donor pages. "
+                           "Rows are marked NEEDS CRAWL or NEEDS LINK, never "
+                           "FOUND, so a half-done sheet cannot be imported.")
+    flow.add_argument("--crawl-urls", action="store_true",
+                      help="PASS 2: crawl the url_link already in the sheet and "
+                           "extract everything from it. Runs NO searches, so it "
+                           "spends no serper credits; pass 1's cached pages "
+                           "replay for free and only links you changed are "
+                           "fetched.")
+
     ap.add_argument("--js-fallback", action="store_true",
                     help="Use a headless browser as a last resort for blocked "
                          "or JavaScript-rendered pages (slow; needs: "
@@ -3286,6 +3422,18 @@ def main():
     SPECS_ENABLED = not args.no_specs
     IMAGE_CHECK = not args.no_image_check
     IMAGE_MIN_PX = max(0, args.min_image_px)
+
+    if args.discover and args.crawl_urls:
+        sys.exit("--discover and --crawl-urls are the two halves of one flow. "
+                 "Run --discover, review the sheet, then run --crawl-urls on "
+                 "the same file.")
+    if args.discover:
+        # pass 1 is about the link and the photos. The spec table and the
+        # donor pages are what pass 2 is for, and both cost extra fetches;
+        # DISCOVER_MODE also trims the query set (see build_queries).
+        SPECS_ENABLED = False
+        MERGE_BUDGET = 0
+        DISCOVER_MODE = True
     if args.cache_dir:
         CACHE_DIR = Path(args.cache_dir).expanduser().resolve()
 
@@ -3310,8 +3458,11 @@ def main():
     # scratch, paying the search credits a second time.
     if "_filled" in src.stem:
         original = src.with_name(src.stem.split("_filled")[0] + src.suffix)
+        # the two-pass flow lands here constantly: pass 2 IS about the filled
+        # sheet, so the message has to name the flag the user actually wants
+        want = "--crawl-urls" if args.crawl_urls else "--retry-incomplete"
         hint = (f'  .venv\\Scripts\\python.exe {Path(sys.argv[0]).name} '
-                f'"{original.name}" --retry-incomplete\n'
+                f'"{original.name}" {want}\n'
                 f"  (that reads and updates '{src.name}' in place)"
                 if original.exists() else
                 f"  The original list '{original.name}' is not next to it - put "
@@ -3335,6 +3486,12 @@ def main():
 
     ensure_writable(out)
 
+    if args.crawl_urls and resume_from is None:
+        sys.exit(f"--crawl-urls crawls the links in '{out.name}', and that file "
+                 f"does not exist yet.\nRun pass 1 first:\n"
+                 f'  .venv\\Scripts\\python.exe {Path(sys.argv[0]).name} '
+                 f'"{src.name}" --discover')
+
     if resume_from is not None:
         log(f"Resuming existing output: {resume_from.name}")
         wb, ws = open_sheet(resume_from, args.sheet)
@@ -3350,12 +3507,18 @@ def main():
             "((IDU)/(ODU)/INNER/OUTER) and collapsing split-unit duplicates")
     log("Output columns: " + ", ".join(f"{k} -> col {v}" for k, v in cols.items()))
     ensure_app_columns(ws, sku_col, clean_busy_sku if busy_input else None)
-    if os.environ.get("SERPER_API_KEY"):
+    if args.crawl_urls:
+        log("PASS 2 (--crawl-urls): crawling the links in the sheet. "
+            "No searches will run, so this costs no serper credits.")
+    elif os.environ.get("SERPER_API_KEY"):
         log("Search: Google via serper.dev (API key detected)")
     else:
         log("Search: DuckDuckGo (free). Tip: set SERPER_API_KEY for better results.")
+    if args.discover:
+        log("PASS 1 (--discover): finding a link and photos only - no spec "
+            "table, no donor pages. Review the sheet, then run --crawl-urls.")
 
-    done = found = missed = 0
+    done = found = missed = no_link = 0
     stopped = False
     started = time.time()
     for r in range(2, ws.max_row + 1):
@@ -3376,9 +3539,27 @@ def main():
                 continue
             busy_seen[cleaned.upper()] = r
             sku = cleaned
-        if not args.force:
-            has_url = ws.cell(row=r, column=cols["url_link"]).value
-            has_status = str(ws.cell(row=r, column=cols["status"]).value or "").strip()
+        has_url = str(ws.cell(row=r, column=cols["url_link"]).value or "").strip()
+        has_status = str(ws.cell(row=r, column=cols["status"]).value or "").strip()
+
+        if args.crawl_urls:
+            # PASS 2 crawls exactly the links in the sheet and nothing else. A
+            # row with no link is the human's to fill in, so say so on the row
+            # rather than silently passing over it.
+            if not has_url:
+                ws.cell(row=r, column=cols["status"],
+                        value=has_status if has_status.startswith("NEEDS LINK")
+                        else "NEEDS LINK - no url_link in this row")
+                no_link += 1
+                continue
+            if not args.force and has_status.startswith("FOUND"):
+                continue                  # already crawled from this link
+        elif args.discover:
+            if not args.force and has_url:
+                continue                  # already has a link waiting for review
+            if not args.force and has_status and not args.retry_missing:
+                continue                  # looked before and found nothing
+        elif not args.force:
             if has_url:
                 incomplete = ((has_status.startswith("FOUND") and " - " in has_status)
                               or not ws.cell(row=r, column=cols["sale price"]).value
@@ -3399,8 +3580,14 @@ def main():
         log(f"\n[{done}] Row {r}: {sku}")
         _net_before_sku = NET_CALLS
         try:
-            rec = lookup_sku(str(sku).strip(), args.min_price, args.max_price,
-                             args.min_images)
+            if args.crawl_urls:
+                log(f"    crawling: {has_url[:95]}")
+                rec = crawl_url(has_url, str(sku).strip(), args.min_images)
+            else:
+                rec = lookup_sku(str(sku).strip(), args.min_price, args.max_price,
+                                 args.min_images)
+                if args.discover:
+                    rec["status"] = discovery_status(rec)
         except KeyboardInterrupt:
             log("\nStopped by user - progress saved.")
             stopped = True
@@ -3425,7 +3612,14 @@ def main():
                                           "image_url", "specs"):
                     ws.cell(row=r, column=col, value=None)
             st = rec.get("status", "")
-            if st.startswith(("FOUND", "CLOSE", "CHECK")):
+            if args.discover:
+                # in pass 1 "found" means there is a link to review, which is
+                # the only thing pass 1 was asked for
+                if rec.get("url_link"):
+                    found += 1
+                else:
+                    missed += 1
+            elif st.startswith(("FOUND", "CLOSE", "CHECK")):
                 found += 1
             else:
                 missed += 1
@@ -3464,7 +3658,21 @@ def main():
                                out, started, args, args.min_images)
         if written:
             log(f"Batch report: {written}")
-    if missed:
+    if args.discover:
+        log(f"\nPass 1 done: {found} row(s) have a link to review, "
+            f"{missed} need one pasted in.")
+        log("Next: open the sheet, check the photos and links, and fill "
+            "url_link on every row marked NEEDS LINK. Then run:")
+        log(f'  .venv\\Scripts\\python.exe sku_enricher.py "{out.name}" --crawl-urls')
+        log("Nothing is final yet - NEEDS CRAWL rows are not importable, "
+            "and app.py will not pick them up.")
+    elif args.crawl_urls:
+        if no_link:
+            log(f"\n{no_link} row(s) were skipped for having no url_link. "
+                f"Fill those in and re-run --crawl-urls; the links already "
+                f"crawled will not be fetched again.")
+        log("Next: review the sheet, then build the CSV with build_csv.py.")
+    elif missed:
         log("Rows marked NOT FOUND / CHECK MANUALLY are worth a quick manual look.")
 
 

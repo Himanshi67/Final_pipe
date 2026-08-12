@@ -10,11 +10,11 @@ cost real debugging (KI-15, and the WordPress-session cookie that reads exactly
 like a bad key) and a second copy would mean a second set of the same bugs.
 """
 
+import mimetypes
 import os
 import sys
 from pathlib import Path
-
-import requests
+from urllib.parse import urlparse
 
 PARENT = Path(__file__).resolve().parent.parent
 if str(PARENT) not in sys.path:
@@ -28,6 +28,12 @@ except ImportError as exc:                          # pragma: no cover
         f"({PARENT}); it could not be imported ({exc}).")
 
 TIMEOUT = 60
+
+
+def have_creds():
+    return bool(os.environ.get("WP_APP_USER", "").strip()
+                and os.environ.get("WP_APP_PASSWORD", "").strip()
+                and os.environ.get("WC_URL", "").strip())
 
 
 def wp_auth():
@@ -75,40 +81,109 @@ def find_by_slug(slug):
     return found[0] if isinstance(found, list) and found else None
 
 
-def category_id(name, allow_writes):
-    """Post category id, created if missing. On a dry run nothing is created -
+def term_id(taxonomy, name, allow_writes):
+    """Term id, created if missing. On a dry run nothing is created -
     resolving a payload is not permission to write taxonomy terms (the same
     rule wc_publish.py learned the hard way)."""
     if not name:
         return None
-    for hit in call("GET", "categories", params={"search": name, "per_page": 100}):
+    for hit in call("GET", taxonomy, params={"search": name, "per_page": 100}):
         if hit["name"].strip().lower() == name.strip().lower():
             return hit["id"]
     if not allow_writes:
-        print(f"    ~ would create post category: {name}")
+        print(f"    ~ would create {taxonomy[:-1]}: {name}")
         return None
-    created = call("POST", "categories", json={"name": name})
-    print(f"    + created post category: {name}")
+    created = call("POST", taxonomy, json={"name": name})
+    print(f"    + created {taxonomy[:-1]}: {name}")
     return created["id"]
 
 
-def publish(payload, slug="", category="", commit=False, status="draft"):
+def category_id(name, allow_writes):
+    return term_id("categories", name, allow_writes)
+
+
+def tag_ids(names, allow_writes):
+    ids = []
+    for name in names or ():
+        resolved = term_id("tags", name, allow_writes)
+        if resolved is not None:
+            ids.append(resolved)
+    return ids
+
+
+def upload_featured(image_url, commit):
+    """Sideload the post's lead image into the media library and return its id.
+
+    Hotlinking the store's uploads folder works only once the WooCommerce
+    import has actually put the file there; a post owning its own copy does
+    not depend on that ordering."""
+    if not image_url:
+        return None
+    name = Path(urlparse(image_url).path).name or "blog-image.webp"
+    if not commit:
+        print(f"    ~ would upload featured image: {name}")
+        return None
+    fetched = W.SESSION.get(image_url, timeout=TIMEOUT)
+    if fetched.status_code >= 400 or not fetched.content:
+        print(f"    [warn] featured image not fetchable ({fetched.status_code}) "
+              f"- posting without one: {image_url}")
+        return None
+    mime = fetched.headers.get("Content-Type") or \
+        mimetypes.guess_type(name)[0] or "image/webp"
+    media = call("POST", "media", data=fetched.content, headers={
+        "Content-Type": mime.split(";")[0].strip(),
+        "Content-Disposition": f'attachment; filename="{name}"',
+    })
+    print(f"    + uploaded featured image: {name} -> media {media['id']}")
+    return media["id"]
+
+
+def publish(payload, slug="", category="", commit=False, status="draft",
+            last_seen_modified=None, force_update=False, featured_image=""):
     """Create or update the post. Returns the post dict, or None on a dry run.
 
     NOTHING is written without commit=True."""
+    if not commit and not have_creds():
+        # a dry run is a preview; it should not need credentials just to tell
+        # you what it would send
+        print("  DRY RUN (offline): WP_APP_USER / WP_APP_PASSWORD / WC_URL are "
+              "not all set, so nothing was looked up on the site.")
+        print(f"  WOULD CREATE OR UPDATE: {payload['title'][:70]}")
+        print(f"    slug={slug or '(auto)'}  status={status}  "
+              f"category={category or '(none)'}  "
+              f"tags={', '.join(payload.get('tags') or []) or '(none)'}")
+        print(f"    {len(payload['content'])} chars of HTML")
+        return None
+
     existing = find_by_slug(slug)
     verb = "UPDATE" if existing else "CREATE"
     print(f"  {verb} post: {payload['title'][:70]}")
     print(f"    slug={slug or '(auto)'}  status={status}  "
           f"{len(payload['content'])} chars of HTML")
 
-    body = dict(payload)
+    if existing and last_seen_modified and not force_update:
+        current = existing.get("modified_gmt") or ""
+        if current and current != last_seen_modified:
+            raise RuntimeError(
+                f"Post {existing['id']} was edited on the site "
+                f"({current}) after this tool last wrote it "
+                f"({last_seen_modified}). An update overwrites the title, body "
+                f"and excerpt wholesale, so those edits would be lost. "
+                f"Re-run with --force-update to overwrite anyway.")
+
+    body = {k: v for k, v in payload.items() if k != "tags"}
     body["status"] = status
     if slug:
         body["slug"] = slug
     cat = category_id(category, commit)
     if cat is not None:
         body["categories"] = [cat]
+    tags = tag_ids(payload.get("tags"), commit)
+    if tags:
+        body["tags"] = tags
+    media = upload_featured(featured_image, commit)
+    if media is not None:
+        body["featured_media"] = media
 
     if not commit:
         print("    DRY RUN - nothing was sent. Re-run with --commit to apply.")

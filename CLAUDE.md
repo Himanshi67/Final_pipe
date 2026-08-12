@@ -16,6 +16,11 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   `hunt_donors`/`merge_sources` to complete the row → write row → checkpoint-save.
   Interruption-safe; re-running resumes. Pages and searches are cached in `.cache\`,
   so a re-run does no network I/O. Writes `<output>_report.md` at the end.
+- `gui.py` (~800 lines, Streamlit) — the 5-step wizard over the whole pipeline
+  (upload+enrich → review → build CSV → validate → publish), state in `runs\<name>\`.
+  It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so it
+  adds no pipeline logic of its own. Step 1 offers the two-pass flow; step 2's
+  review table is where `NEEDS LINK` rows get a URL pasted in.
 - `app.py` (~1,300 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
   to exact strings in `category_map.xlsx`; images saved as `SKU_n.webp`; scraped
   specs become WooCommerce attributes; `_spec_gaps` records attributes the
@@ -33,8 +38,14 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   2,500/month ≈ 300 SKUs. No in-code credit tracking.
 - Statuses in `_filled.xlsx`: `FOUND (site)` · `FOUND … - no price shown` /
   `- only N image(s)` (verified but incomplete) · `FOUND … - price from <site>`
-  (merged from another source) · `CLOSE MATCH - CHECK` · `CHECK MANUALLY` ·
-  `NOT FOUND` · `ERROR: …`
+  (merged from another source) · `FOUND … - VERIFY: <why>` (pass 2 crawled the
+  link a human supplied and the page does not match the SKU) · `CLOSE MATCH -
+  CHECK` · `CHECK MANUALLY` · `NOT FOUND` · `ERROR: …`
+- Two-pass statuses (`--discover` only): `NEEDS CRAWL (site)` · `NEEDS CRAWL -
+  CHECK LINK (site)` · `NEEDS LINK - <why>`. **None of them start with FOUND**,
+  which is deliberate: `app.py` and `gui.py` both gate the import on
+  `status.startswith("FOUND")`, so a half-done discovery sheet cannot be
+  imported by accident. `tests\test_two_pass.py` pins that.
 - `.cache\` (gitignored) holds gzipped pages and search results, TTL 14 days.
   Only successes are cached; a cache error is always a miss, never a failure.
 - Politeness delays are owed to the remote host, so `polite_sleep()` skips them
@@ -75,9 +86,14 @@ Moving a `.py` file out of root silently relocates the directory it owns — don
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --limit 3          # smoke
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --min-price 8000 --delay 5 8
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --retry-incomplete # re-do half-filled rows
+    :: two-pass flow: review the links BEFORE paying for the full extraction
+    .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --discover         # pass 1: links + photos only
+    ::   -> review LIST_filled.xlsx, paste a url_link on every NEEDS LINK row
+    .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --crawl-urls       # pass 2: crawl those links, NO searches
     .venv\Scripts\python.exe sku_enricher.py --probe "<url>"                # test ONE page, no spreadsheet
     .venv\Scripts\python.exe sku_enricher.py --cache-info                   # what the page cache holds
-    .venv\Scripts\python.exe -m streamlit run app.py
+    .venv\Scripts\python.exe -m streamlit run gui.py    # 5-step wizard, drives the WHOLE pipeline
+    .venv\Scripts\python.exe -m streamlit run app.py    # just the CSV builder
     .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" -o out.csv --month 2026/07
     .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" --seo          # SEO meta (opt-in)
     .venv\Scripts\python.exe validate_csv.py wordpress_ready_clean_repaired.csv

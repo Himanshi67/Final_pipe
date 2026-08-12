@@ -45,6 +45,27 @@ where it invents one anyway. The deterministic renderer is not a fallback for
 when the LLM is unavailable — it is the baseline the LLM has to beat, and it is
 what runs by default.
 
+## What the verifier actually checks
+
+Not just "is this number in the brief" — that was checkable but not
+attributable, and three of its holes were wide enough to drive a wrong price
+through:
+
+| Check | Why it exists |
+|---|---|
+| Numbers are scoped **per product** | The pooled set made every number valid everywhere, so a blurb could quote another product's price and pass. |
+| Digits **and** number words | `NUMBER_RE` only saw digits, so "forty-three inches" was invisible. |
+| A unit makes a small number a claim | 0–10 used to be unconditionally safe, so "5 star", "2 year warranty" and "8 kg" all passed unchecked. `one of these` is still ordinary English. |
+| Aggregates are not measurements | A roundup of 2 products made "2 Ton" verifiable, because 2 was in the brief as the product count. The count and the price span are excluded wherever they cannot apply. |
+| Model codes, any case | `Gls12i3fwaev` used to slip past an ALL-CAPS-only pattern. `3-star` is not a false positive. |
+| Banned claims vs the brief | A product genuinely titled "… Best Selling …" is the store's own words — that is a warning, not a hold. Invented hype is still a hold. |
+
+Run the suite after any change here:
+
+```
+.venv\Scripts\python.exe tests\test_blog_automate.py
+```
+
 ## Post kinds
 
 | Kind | What it is | Needs |
@@ -89,6 +110,20 @@ Every run writes the brief, the post HTML and the verification result into
 
 Never in the repo, never in chat. Same rule as the rest of the project.
 
+## What holds a publish
+
+Everything here is a warning on a build-only run — you will often generate a
+post before the products are imported — and a refusal on `--publish`.
+
+| Hold | Override | Why |
+|---|---|---|
+| Products cannot be linked | `--allow-no-links` | No `WC_URL`, or the CSV has no `slug` column because `build_csv.py` ran without `--seo`. A buying guide that links to nothing is broken. |
+| Images 404 (`--check-images`) | `--allow-missing-images` | Posts hotlink `wp-content/uploads/…`, which only fills up **after** the WooCommerce import. Publish first and every image is a 404. |
+| A `--sku` is not in the CSV | — | Fix the SKU. It used to be dropped silently. |
+| `--llm` fell back to templates | `--allow-fallback` | A missing key, an API error or a failed fact check used to publish the template post anyway — a different post from the one that was asked for. |
+| Prose failed the fact check | — | `--allow-unverified` keeps it for inspection and can never publish. |
+| The post was edited in WordPress | `--force-update` | An update overwrites title, body and excerpt wholesale, so a human's edits would be lost. |
+
 ## Deliberate limits
 
 - **Drafts by default.** `--status publish` exists and is not the default.
@@ -99,3 +134,21 @@ Never in the repo, never in chat. Same rule as the rest of the project.
   human or a model wrote them.
 - **Prices go stale.** A brief records when it was built, and the renderer
   stamps the post with that date. Re-run rather than editing an old post.
+- **A price is refused rather than guessed.** A cell holding a range
+  (`28000-32000`), a zero, or anything that is not one number leaves the
+  product out of the post with a reason. An unreadable *sale* price no longer
+  falls back to the MRP — that quoted the struck-through price as the selling
+  price, which is a wrong price rather than a missing one.
+- **`--category` matches whole words.** `--category LED` no longer also
+  matches "Bladeless" and "Sealed".
+
+## Not covered
+
+- No topic planner, scheduling, or interlinking between generated posts. What
+  to write about is still a human decision.
+- Deduplication against existing articles is by slug only. A post about the
+  same products under a genuinely different title will not be spotted.
+- Brand detection is a curated vocabulary (extend it with `known_brands.txt`
+  next to this file, one per line, or `$BLOG_EXTRA_BRANDS`). An invented
+  lower-case brand outside that list is not caught; an invented *model code*
+  is.

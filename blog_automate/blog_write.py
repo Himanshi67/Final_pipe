@@ -19,6 +19,10 @@ import os
 MODEL = "claude-opus-5"
 MAX_TOKENS = 16000
 
+# Past this many products the brief stops being a brief and the blurbs get
+# thin. --limit already caps a roundup; an explicit --sku list did not.
+MAX_PRODUCTS = 25
+
 # Kept identical across runs so it caches: the brief varies per post, the
 # instructions do not. Prompt caching is a prefix match, so the stable half
 # must come first - which it does, since `system` renders before `messages`.
@@ -112,7 +116,7 @@ def available():
                 or os.environ.get("ANTHROPIC_AUTH_TOKEN"))
 
 
-def write(brief, effort="medium"):
+def write(brief, effort="medium", model=MODEL):
     """Returns {'title','intro','blurbs':{sku: text},'conclusion'}.
 
     Raises RuntimeError with a readable message on any API problem, so
@@ -120,18 +124,24 @@ def write(brief, effort="medium"):
     """
     try:
         import anthropic
-    except ImportError:
+    except ImportError as exc:
         raise RuntimeError(
             "The anthropic package is not installed. Run:\n"
             "  .venv\\Scripts\\python.exe -m pip install anthropic\n"
-            "or drop --llm to use the deterministic renderer.")
+            "or drop --llm to use the deterministic renderer.") from exc
+
+    if len(brief["products"]) > MAX_PRODUCTS:
+        raise RuntimeError(
+            f"{len(brief['products'])} products is too many for one post "
+            f"(limit {MAX_PRODUCTS}). Use --limit, or split it into several "
+            f"posts.")
 
     client = anthropic.Anthropic()
     payload = json.dumps(brief_for_model(brief), indent=2)
 
     try:
         response = client.beta.messages.create(
-            model=MODEL,
+            model=model,
             max_tokens=MAX_TOKENS,
             # a policy decline would otherwise just stop the run; this re-runs
             # the same request on Anthropic's recommended fallback instead
@@ -153,7 +163,7 @@ def write(brief, effort="medium"):
             }],
         )
     except Exception as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}")
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
 
     # a refusal returns HTTP 200 with an empty or partial content list, so
     # reading content[0] first would raise IndexError instead of explaining
@@ -161,7 +171,7 @@ def write(brief, effort="medium"):
         detail = getattr(response, "stop_details", None)
         category = getattr(detail, "category", None) if detail else None
         raise RuntimeError(
-            f"The model declined this brief"
+            "The model declined this brief"
             + (f" (category: {category})" if category else "")
             + ". Nothing was written.")
 
@@ -171,7 +181,7 @@ def write(brief, effort="medium"):
     try:
         data = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"The model's output was not valid JSON: {exc}")
+        raise RuntimeError(f"The model's output was not valid JSON: {exc}") from exc
 
     known = {p["sku"] for p in brief["products"]}
     blurbs = {}
