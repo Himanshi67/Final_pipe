@@ -664,6 +664,24 @@ def test_19_category_prefixes():
               p in E.CATEGORY_CODES, True)
 
 
+def test_20_inflated_mrp_flagged_not_deleted():
+    section("#20 an MRP many times the price is flagged for a human, not silently dropped")
+    html = """<html><body>
+    <script type="application/ld+json">
+    {"@type": "Product", "name": "Testbrand Model123 Widget", "sku": "MODEL123",
+     "offers": {"@type": "Offer", "price": "21999"},
+     "image": "https://example.com/img.jpg"}
+    </script>
+    <p>MRP: Rs. 199999</p>
+    </body></html>"""
+    rec = E.extract("https://example.com/p/1", html)
+    check("extract() keeps the scraped MRP instead of silently clearing it",
+          (E.price_value(rec["regular price"]) or 0) > 100000, True)
+    status = E.status_for(rec, "https://example.com/p/1")
+    check("status_for() flags the mismatch for a human to check",
+          "x the price" in status and "check" in status, True)
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -682,6 +700,7 @@ def main():
     test_17_console_encoding()
     test_18_binary_upload_rejected()
     test_19_category_prefixes()
+    test_20_inflated_mrp_flagged_not_deleted()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

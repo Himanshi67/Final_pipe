@@ -47,6 +47,11 @@ trusted, and anything unverifiable is flagged instead of guessed.
 
 Also see **data_flow.svg** for the visual version.
 
+**The whole chain above, in one app:** `streamlit run gui.py` wraps every
+script in this diagram into a single 5-step wizard (see §3). The individual
+scripts below still work standalone — useful for headless/scripted runs, or
+when only one stage needs redoing.
+
 ## 3. The scripts
 
 ### sku_enricher.py — data collector
@@ -169,8 +174,61 @@ re-paying every Serper credit — so a parser improvement can be applied
 retroactively to a finished batch. Outside the cache, `--force` still costs
 full price: check `--cache-info` first.
 
+**Two-pass flow — review the links before paying for the full extraction.**
+`--discover` (pass 1) finds a candidate product link and photos for each SKU
+only — no spec table, no donor-page merges — so it is cheap. Rows it can link
+confidently get `NEEDS CRAWL (site)` — a link found, ready for pass 2; rows it
+can't get `NEEDS LINK - <why>`, for a human to paste a `url_link` in by hand.
+Neither status starts with `FOUND`, on purpose (see below). Once every row has a
+link, `--crawl-urls` (pass 2) crawls exactly those links and does **no
+searches at all** — it fetches the page you already told it about instead of
+asking Serper to find one, so it costs zero Serper credits regardless of
+whether that page is cached or fetched fresh.
+
+```
+.venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --discover
+::   -> open LIST_filled.xlsx, paste a url_link on every NEEDS LINK row
+.venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --crawl-urls
+```
+
+None of the discovery statuses (`NEEDS CRAWL (site)`, `NEEDS CRAWL - CHECK
+LINK (site)`, `NEEDS LINK - <why>`) start with `FOUND`, which is deliberate:
+app.py/gui.py/build_csv.py all gate the import on `status.startswith("FOUND")`,
+so a half-discovered sheet can never be imported by accident even if you build
+the CSV before pass 2 finishes. `tests\test_two_pass.py` pins that invariant.
+
+**When to use it instead of the normal single-pass run:** a normal run is
+fine for a small or well-behaved batch. Reach for two-pass on a large batch,
+or one where you expect a lot of manual link-pasting anyway (obscure brands,
+BUSY ERP exports) — you pay full search cost only once, on pass 1, and every
+later re-crawl (a fixed parser, a corrected link, a retry) is free.
+
 Recommended once: `setx SERPER_API_KEY "<key>"` (free at serper.dev) — Google
 search quality instead of DuckDuckGo, and much faster.
+
+### gui.py — the whole pipeline, one wizard (recommended GUI)
+
+**What it does:** a 5-step Streamlit wizard — Upload & Enrich (runs
+`sku_enricher.py` as a subprocess with a live log, offers the two-pass toggle),
+Review & Confirm (edit price/title/URLs inline, paste links for NEEDS LINK
+rows, confirm rows), Build CSV (`app.process_inventory` — same code as
+`app.py`/`build_csv.py`), Validate (`validate_csv.validate_export`), and
+Publish (`wc_publish.py`, dry-run first, `--commit` gated behind a checkbox).
+
+Everything for one batch lives under `runs\<name>\`: input, `_filled.xlsx`,
+enricher log, the CSV, `validation_issues.csv`, review/run state. State is
+re-derived from those files, so closing the browser tab mid-enrichment loses
+nothing — the enricher checkpoints after every row and reopening the wizard
+resumes where it left off.
+
+**Command:**
+```
+.venv\Scripts\python.exe -m streamlit run gui.py
+```
+
+`app.py` still exists and still works on its own (just the CSV-build step) —
+useful if you already have a `_filled.xlsx` from a script-driven run and only
+need the formatter, without the rest of the wizard's state-tracking.
 
 ### app.py — WooCommerce formatter (browser app)
 
@@ -394,7 +452,8 @@ QA gate matching the site's real failure modes · reusable Claude prompt
 | File | Role |
 |---|---|
 | `sku_enricher.py` | Step 1 — fill SKU list from marketplaces |
-| `app.py` | Step 2 — WooCommerce CSV + WebP images (browser) |
+| `gui.py` | Recommended — 5-step wizard driving the whole pipeline (browser) |
+| `app.py` | Step 2 — WooCommerce CSV + WebP images (browser, standalone) |
 | `build_csv.py` | Step 2 headless — same formatter, no browser |
 | `validate_csv.py` | Step 3 — QA before import |
 | `wc_publish.py` | Step 4 — publish to WooCommerce over the REST API |
