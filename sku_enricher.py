@@ -2003,6 +2003,15 @@ SPEC_VALUE_DENY_RE = re.compile(
     r"click|select|choose|add to|available|\d+\s*(?:ratings?|reviews?))",
     re.I)
 
+# an offer dressed as a spec row ('SuperDost Cashback: 100 for new SuperDost
+# Users* + 3% or 250 Cashback'). The deny lists above only anchor on the START
+# of a label; promo wording disqualifies the pair wherever it appears, in the
+# label OR the value.
+SPEC_PROMO_RE = re.compile(
+    r"cash\s?back|coupon|voucher|promo|superdost|super\s?coin|bank offer|"
+    r"exchange offer|no.?cost emi|instant discount|%\s*off\b|flat\s*off|"
+    r"free gift|t&c|terms apply", re.I)
+
 SPEC_SPLIT_RE = re.compile(r"\s*[:∶]\s+")
 
 
@@ -2024,6 +2033,8 @@ def usable_spec(label, value):
         return False
     if SPEC_LABEL_DENY_RE.match(label) or SPEC_VALUE_DENY_RE.match(value):
         return False
+    if SPEC_PROMO_RE.search(label) or SPEC_PROMO_RE.search(value):
+        return False                      # an offer, not a product fact
     if value.count(".") >= 2 and len(value.split()) > 12:
         return False                      # a paragraph, not a spec value
     if "<" in value or "{" in value:

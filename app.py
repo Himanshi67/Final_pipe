@@ -83,6 +83,11 @@ REQUIRED_INPUT_COLUMNS = ['sku', 'title', 'categories', 'Brands', 'regular price
 EXPORTED_OUTPUT_COLUMNS = ['sku', 'cross reference tag', 'configuration', 'short description', 'description', 'title', 'categories', 'Tags', 'regular price', 'sale price', 'Brands', '_consolidated_sku', 'Images', '_spec_gaps']
 IMAGE_ROOT = 'product_images_for_upload'
 MAX_ATTRIBUTES = 15   # each one costs 4 CSV columns, so the sheet stays usable
+# The short description renders right under the price; a 15-row table there
+# pushes the buy button off the screen. The essentials (brand, capacity,
+# screen, resolution, rating...) always rank first in product_specs, so the
+# cap keeps the best rows. The LONG description still carries everything.
+SHORT_DESC_MAX_SPECS = 6
 
 # ---- image quality ---------------------------------------------------------
 # 90 was visibly soft on a 1500px product shot once WooCommerce re-encoded its
@@ -1029,6 +1034,16 @@ SPEC_LABEL_DROP = {
     'in the box', 'sales package',
 }
 
+# an offer dressed as a spec row ('SuperDost Cashback: 100 for new SuperDost
+# Users* + 3% or 250 Cashback'). Checked against the label AND the value, so
+# already-enriched sheets carrying the junk are cleaned here without a
+# re-scrape. Mirrors sku_enricher.SPEC_PROMO_RE - kept in both places for the
+# same reason parse_scraped_specs itself is (see its docstring).
+PROMO_SPEC_RE = re.compile(
+    r"cash\s?back|coupon|voucher|promo|superdost|super\s?coin|bank offer|"
+    r"exchange offer|no.?cost emi|instant discount|%\s*off\b|flat\s*off|"
+    r"free gift|t&c|terms apply", re.I)
+
 
 def canon_spec_label(label):
     text = compact(label).strip(': ')
@@ -1052,9 +1067,81 @@ def parse_scraped_specs(cell):
             continue
         if len(label) > 40 or len(value) > 120 or label.lower() == value.lower():
             continue
+        if PROMO_SPEC_RE.search(label) or PROMO_SPEC_RE.search(value):
+            continue                      # an offer, not a product fact
         seen.add(key)
         rows.append((label, value))
     return rows
+
+
+# WooCommerce turns every attribute name into a GLOBAL attribute taxonomy
+# whose slug is capped at 28 characters and must not collide with a term
+# WordPress reserves for itself - break either rule and the importer rejects
+# the whole product row ('Slug "..." is too long' / 'reserved term').
+# Scraped retailer spec labels break both, so every label goes through
+# woo_attribute_name() before it becomes an attribute or a spec row.
+WOO_ATTR_SLUG_MAX = 28
+# Known scraped labels that need a human rename, not a mechanical trim.
+ATTRIBUTE_RENAMES = {
+    'display backlight configuration': 'Backlight Type',
+    'picture quality enhancement technology': 'Picture Technology',
+    'motion enhancement technology': 'Motion Technology',
+    'category': 'Product Category',
+}
+# WordPress query vars + built-in taxonomies (what WooCommerce's
+# wc_check_if_attribute_name_is_reserved refuses).
+RESERVED_ATTRIBUTE_SLUGS = frozenset((
+    'attachment', 'attachment_id', 'author', 'author_name', 'calendar', 'cat',
+    'category', 'category_name', 'cb', 'comments_per_page', 'comments_popup',
+    'custom', 'customize_messenger_channel', 'customized', 'day', 'debug',
+    'embed', 'error', 'exact', 'feed', 'fields', 'hour', 'link_category', 'm',
+    'minute', 'monthnum', 'more', 'name', 'nav_menu', 'nonce', 'nopaging',
+    'offset', 'order', 'orderby', 'p', 'page', 'page_id', 'paged', 'pagename',
+    'pb', 'perm', 'post', 'post_format', 'post_mime_type', 'post_status',
+    'post_tag', 'post_type', 'posts', 'posts_per_archive_page',
+    'posts_per_page', 'preview', 'robots', 's', 'search', 'second', 'sentence',
+    'showposts', 'static', 'status', 'subpost', 'subpost_id', 'tag', 'tag_id',
+    'taxonomy', 'tb', 'term', 'terms', 'theme', 'title', 'type', 'types', 'w',
+    'withcomments', 'withoutcomments', 'year',
+))
+# Words a spec-table label can lose without losing its meaning.
+_ATTR_FILLER_WORDS = frozenset((
+    'technology', 'technologies', 'configuration', 'specification',
+    'specifications', 'feature', 'features', 'capability', 'capabilities',
+    'system', 'details', 'information',
+))
+
+
+def woo_slug(label):
+    """How WooCommerce derives an attribute taxonomy slug from its name."""
+    return re.sub(r'[^a-z0-9]+', '-', compact(label).lower()).strip('-')
+
+
+def woo_attribute_name(label):
+    """Shorten/rename a label until its WooCommerce slug is importable.
+
+    Curated renames first; otherwise drop filler words, then trailing words,
+    until the slug fits WOO_ATTR_SLUG_MAX. A reserved slug gets a 'Product '
+    prefix. The loop re-checks both rules because fixing one can expose the
+    other (shortening can land ON a reserved word; prefixing adds length)."""
+    label = compact(label)
+    if not label:
+        return label
+    label = ATTRIBUTE_RENAMES.get(label.lower(), label)
+    for _ in range(3):
+        if len(woo_slug(label)) > WOO_ATTR_SLUG_MAX:
+            words = [w for w in label.split()
+                     if w.lower() not in _ATTR_FILLER_WORDS]
+            label = ' '.join(words) or label
+            while len(woo_slug(label)) > WOO_ATTR_SLUG_MAX:
+                words = label.split()
+                label = (' '.join(words[:-1]) if len(words) > 1
+                         else label[:WOO_ATTR_SLUG_MAX])
+        if woo_slug(label) in RESERVED_ATTRIBUTE_SLUGS:
+            label = f'Product {label}'
+        else:
+            break
+    return label
 
 
 def product_specs(title, brand, category, scraped=()):
@@ -1074,7 +1161,7 @@ def product_specs(title, brand, category, scraped=()):
     rows, used = [], set()
 
     def add(label, value):
-        label, value = compact(label), compact(value)
+        label, value = woo_attribute_name(label), compact(value)
         # one row per LABEL: a WooCommerce product with two attributes of the
         # same name renders both, and the second is always the worse one
         if label and value and label.lower() not in used:
@@ -1131,7 +1218,7 @@ def build_descriptions(sku, title, brand, category, scraped=()):
     short_desc = html_block([
         ('Brand', brand),
         ('Product SKU', sku),
-    ] + extra)
+    ] + extra[:SHORT_DESC_MAX_SPECS])
     long_desc = html_block([
         ('Brand Designation', brand),
         ('Model Identifier Code', sku),

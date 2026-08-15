@@ -724,6 +724,96 @@ def test_22_image_floor_fallback():
           "below" in status and "floor" in status, True)
 
 
+def test_23_attribute_slugs_importable():
+    section("#23 attribute names survive WooCommerce's slug rules")
+    # the exact labels the 2026-08-15 TV import rejected
+    for scraped_label, expect in [
+            ("Display Backlight Configuration", "Backlight Type"),
+            ("Picture Quality Enhancement Technology", "Picture Technology"),
+            ("Motion Enhancement Technology", "Motion Technology"),
+            ("Category", "Product Category")]:
+        check(f"{scraped_label[:40]:42} -> {expect}",
+              app.woo_attribute_name(scraped_label), expect)
+
+    # labels with no curated rename still come out under the cap, mechanically
+    for raw in ("Refrigerator Compressor Warranty Period Details",
+                "Integrated Digital Television Reception Capability"):
+        slug = app.woo_slug(app.woo_attribute_name(raw))
+        check(f"generic shortening fits: {slug!r}",
+              len(slug) <= app.WOO_ATTR_SLUG_MAX, True)
+    check("short labels pass through untouched",
+          app.woo_attribute_name("Energy Rating"), "Energy Rating")
+    check("a reserved word is prefixed, not shipped",
+          app.woo_attribute_name("Status"), "Product Status")
+
+    # product_specs applies the rule to what retailers actually scraped
+    rows = app.product_specs(
+        "Samsung 138 cm (55 inches) Crystal 4K Ultra HD Smart LED TV",
+        "Samsung", "LED TV",
+        scraped=[("Motion Enhancement Technology", "Motion Xcelerator"),
+                 ("Category", "QLED")])
+    bad = [l for l, _v in rows
+           if len(app.woo_slug(l)) > app.WOO_ATTR_SLUG_MAX
+           or app.woo_slug(l) in app.RESERVED_ATTRIBUTE_SLUGS]
+    check("every product_specs label is importable", bad, [])
+
+    # both sides of the gate use the same rules - same pattern as the HD floors
+    check("app and validate_csv agree on the cap",
+          app.WOO_ATTR_SLUG_MAX, V.WOO_ATTR_SLUG_MAX)
+    check("app and validate_csv agree on the reserved list",
+          app.RESERVED_ATTRIBUTE_SLUGS, V.RESERVED_ATTRIBUTE_SLUGS)
+    check("app and validate_csv derive the same slug",
+          app.woo_slug("Display Backlight Configuration"),
+          V.woo_attr_slug("Display Backlight Configuration"))
+
+    # and validate_csv catches a bad name that slipped through anyway
+    row = {"Attribute 1 name": "Brand",
+           "Attribute 2 name": "Picture Quality Enhancement Technology",
+           "Attribute 3 name": "Category"}
+    cols = ["Attribute 1 name", "Attribute 2 name", "Attribute 3 name"]
+    problems = V.attribute_name_problems(row, cols)
+    check("validator flags the overlong slug",
+          any("attribute_slug_too_long" in p for p in problems), True)
+    check("validator flags the reserved term",
+          any("attribute_name_reserved" in p for p in problems), True)
+    check("validator does not flag the good name", len(problems), 2)
+
+
+def test_24_promos_are_not_specs():
+    section("#24 an offer is not a spec, and the short description stays short")
+    # the exact row the 2026-08-15 report complained about
+    check("enricher refuses the SuperDost cashback row",
+          E.usable_spec("SuperDost Cashback",
+                        "100 for new SuperDost Users* + 3% or 250 Cashback ."),
+          False)
+    for label, value in [("Bank Offer", "10% Instant Discount on HDFC cards"),
+                         ("Exchange Offer", "Up to 11000 off"),
+                         ("EMI", "No Cost EMI from 1,541/month")]:
+        check(f"enricher refuses: {label}", E.usable_spec(label, value), False)
+    check("a real spec still passes",
+          E.usable_spec("Refresh Rate", "60 Hz"), True)
+    check("a value that merely mentions an offer word is also out",
+          E.usable_spec("Special Feature", "Extra 5% cashback with SuperCoins"),
+          False)
+
+    # app.py cleans sheets that were ALREADY enriched with the junk
+    cell = ("SuperDost Cashback: 100 for new SuperDost Users* + 3% or 250 "
+            "Cashback . | Refresh Rate: 60 Hz | Bank Offer: 10% off with ICICI")
+    rows = app.parse_scraped_specs(cell)
+    check("parse_scraped_specs keeps only the real spec",
+          rows, [("Refresh Rate", "60 Hz")])
+
+    # short description carries the essentials, not the whole spec table
+    scraped = [(f"Extra Spec {n}", f"Value {n}") for n in range(1, 13)]
+    _c, short_desc, long_desc, rows = app.build_descriptions(
+        "TV-TEST-1", "Samsung 138 cm (55 inches) 4K Ultra HD Smart LED TV",
+        "Samsung", "LED TV", scraped=scraped)
+    check("short description row count is capped",
+          short_desc.count("<tr>") <= 2 + app.SHORT_DESC_MAX_SPECS, True)
+    check("the long description still carries the full table",
+          long_desc.count("<tr>") > short_desc.count("<tr>"), True)
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -745,6 +835,8 @@ def main():
     test_20_inflated_mrp_flagged_not_deleted()
     test_21_gallery_collision_flagged()
     test_22_image_floor_fallback()
+    test_23_attribute_slugs_importable()
+    test_24_promos_are_not_specs()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

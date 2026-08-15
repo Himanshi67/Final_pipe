@@ -16,6 +16,8 @@ Checks per row:
   - price problems: both prices missing, regular price <= sale price, or a
     price outside the plausible band for the category
   - attributes the product's own sub-category requires but nothing filled
+  - attribute names whose WooCommerce slug is over 28 characters or is a
+    reserved WordPress term - either one makes the importer reject the ROW
   - titles that say "front load" while the category/description says Top Load
 
 Cross-row (the wrong-match signatures no per-row check can see):
@@ -40,6 +42,47 @@ import pandas as pd
 # split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
 # images on one product. Split only where a comma is followed by a URL start.
 _URL_SPLIT_RE = re.compile(r',(?=\s*(?:https?://|//))')
+
+# WooCommerce global attribute slugs: over this and the importer rejects the
+# whole product row. app.py shortens names to fit (woo_attribute_name); this
+# gate re-derives the slug the same way and catches anything that slipped by.
+# tests/test_bugfixes.py pins that both sides use the same limit and list.
+WOO_ATTR_SLUG_MAX = 28
+RESERVED_ATTRIBUTE_SLUGS = frozenset((
+    'attachment', 'attachment_id', 'author', 'author_name', 'calendar', 'cat',
+    'category', 'category_name', 'cb', 'comments_per_page', 'comments_popup',
+    'custom', 'customize_messenger_channel', 'customized', 'day', 'debug',
+    'embed', 'error', 'exact', 'feed', 'fields', 'hour', 'link_category', 'm',
+    'minute', 'monthnum', 'more', 'name', 'nav_menu', 'nonce', 'nopaging',
+    'offset', 'order', 'orderby', 'p', 'page', 'page_id', 'paged', 'pagename',
+    'pb', 'perm', 'post', 'post_format', 'post_mime_type', 'post_status',
+    'post_tag', 'post_type', 'posts', 'posts_per_archive_page',
+    'posts_per_page', 'preview', 'robots', 's', 'search', 'second', 'sentence',
+    'showposts', 'static', 'status', 'subpost', 'subpost_id', 'tag', 'tag_id',
+    'taxonomy', 'tb', 'term', 'terms', 'theme', 'title', 'type', 'types', 'w',
+    'withcomments', 'withoutcomments', 'year',
+))
+
+
+def woo_attr_slug(name):
+    """The taxonomy slug WooCommerce will derive from an attribute name."""
+    return re.sub(r'[^a-z0-9]+', '-', str(name).strip().lower()).strip('-')
+
+
+def attribute_name_problems(row, attr_name_cols):
+    """Import-blocking attribute names on one CSV row, as reason strings."""
+    problems = []
+    for col in attr_name_cols:
+        name = str(row.get(col, '') or '').strip()
+        if not name or name.lower() == 'nan':
+            continue
+        slug = woo_attr_slug(name)
+        if len(slug) > WOO_ATTR_SLUG_MAX:
+            problems.append(f'attribute_slug_too_long ("{slug}" is '
+                            f'{len(slug)} chars, max {WOO_ATTR_SLUG_MAX})')
+        elif slug in RESERVED_ATTRIBUTE_SLUGS:
+            problems.append(f'attribute_name_reserved ("{name}")')
+    return problems
 
 
 def split_image_list(raw):
@@ -573,6 +616,9 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
     else:
         print('Note: category_map.xlsx not found - skipping the category check.')
 
+    attr_name_cols = [c for c in df.columns
+                      if re.fullmatch(r'Attribute \d+ name', str(c))]
+
     issues = []
     seen_skus = {}
     records = []                    # kept for the cross-row pass after the loop
@@ -628,6 +674,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append('missing_category')
         elif valid_categories and cats not in valid_categories:
             reasons.append(f'category_not_in_map ({cats})')
+
+        reasons.extend(attribute_name_problems(row, attr_name_cols))
 
         reg = to_number(row.get(reg_col, '')) if reg_col else None
         sale = to_number(row.get(sale_col, '')) if sale_col else None
