@@ -814,6 +814,44 @@ def test_24_promos_are_not_specs():
           long_desc.count("<tr>") > short_desc.count("<tr>"), True)
 
 
+def test_25_live_site_audit_findings():
+    section("#25 live-site audit: Mini LED catch-all, 3x TV MRP, raw-SKU titles")
+    # the exact live product that was filed under Mini LED
+    check("a plain Full HD TV goes to the bare LED parent",
+          app.detect_category(
+              "Foxsky 109 cm (43 Inch) Full HD Smart LED TV, 43FSFHS"),
+          ("LED", ""))
+    check("a real Mini LED still gets the sub-category",
+          app.detect_category("TCL 55 inch 4K Mini LED Google TV 55C755"),
+          ("LED", "Mini LED"))
+    check("bare-parent products keep their required-axes check",
+          app.SUBCATEGORY_ATTRIBUTES.get("led") is not None, True)
+
+    # the live Foxsky price (41,499 -> 12,999 = 3.2x) now gets flagged
+    check("TV context tightens the MRP limit to 3x",
+          V.mrp_ratio_limit("LED", "Foxsky 43 inch Full HD Smart LED TV"),
+          V.MRP_RATIO_LIMIT_TV)
+    check("non-TV categories keep the 4x limit",
+          V.mrp_ratio_limit("Kitchen Appliances > Kettles", "Electric Kettle"),
+          V.MRP_RATIO_LIMIT)
+
+    df = pd.DataFrame([
+        {"sku": "TV-FOXSKY-43FSFHS", "title": "Foxsky 43 Full HD Smart LED TV",
+         "categories": "LED", "description": "d", "Images": "",
+         "regular price": 41499, "sale price": 12999},
+        {"sku": "TV-ACER-1", "title": "Acer-AR32GT2841HDFL",
+         "categories": "LED", "description": "d", "Images": "",
+         "regular price": 15990, "sale price": 12670},
+    ])
+    issues = V.validate_export(df, "audit.csv", check_images=False,
+                               write_issues=False)
+    by_sku = {i["sku"]: i["reasons"] for i in issues}   # reasons: joined str
+    check("3.2x TV MRP is now flagged",
+          "mrp_implausible" in by_sku.get("TV-FOXSKY-43FSFHS", ""), True)
+    check("a bare model code as the title is flagged",
+          "title_looks_like_raw_sku" in by_sku.get("TV-ACER-1", ""), True)
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -837,6 +875,7 @@ def main():
     test_22_image_floor_fallback()
     test_23_attribute_slugs_importable()
     test_24_promos_are_not_specs()
+    test_25_live_site_audit_findings()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

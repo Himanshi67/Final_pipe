@@ -64,6 +64,22 @@ RESERVED_ATTRIBUTE_SLUGS = frozenset((
 ))
 
 
+# Discounts beyond these ratios are a wrongly-scraped MRP, not a deal. TVs
+# get a tighter band: a real TV MRP is rarely 3x the street price (seen live:
+# a Foxsky 43" shipped at 41,499 -> 12,999, a 69% "discount" that sailed
+# under the old flat 4x limit), while small appliances legitimately hit 4x.
+MRP_RATIO_LIMIT = 4.0
+MRP_RATIO_LIMIT_TV = 3.0
+_TV_CONTEXT_RE = re.compile(r'\bled\b|\btv\b|television|qled|oled|qned', re.I)
+
+
+def mrp_ratio_limit(*context_texts):
+    """The regular/sale ratio above which the MRP is implausible, picked from
+    whatever category/title context the caller has."""
+    text = ' '.join(str(t or '') for t in context_texts)
+    return MRP_RATIO_LIMIT_TV if _TV_CONTEXT_RE.search(text) else MRP_RATIO_LIMIT
+
+
 def woo_attr_slug(name):
     """The taxonomy slug WooCommerce will derive from an attribute name."""
     return re.sub(r'[^a-z0-9]+', '-', str(name).strip().lower()).strip('-')
@@ -471,10 +487,12 @@ def validate_filled(df, path):
             if len(images) < MIN_IMAGES:
                 reasons.append(f'verified_but_images<{MIN_IMAGES} (has {len(images)})')
             if reg is not None and sale is not None and sale > 0:
+                limit = mrp_ratio_limit(title)
                 if reg <= sale:
                     reasons.append(f'mrp<=price ({reg:g} <= {sale:g})')
-                elif reg > sale * 4:
-                    reasons.append(f'mrp_implausible ({reg:g} is {reg / sale:.1f}x)')
+                elif reg > sale * limit:
+                    reasons.append(f'mrp_implausible ({reg:g} is '
+                                   f'{reg / sale:.1f}x, limit {limit:g}x)')
             over = implausible_tv_price(title, sale)
             if over:
                 reasons.append(f'{over} ({sale:g})')
@@ -632,6 +650,11 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append('missing_sku')
         if not title:
             reasons.append('missing_title')
+        elif ' ' not in title and re.search(r'\d', title):
+            # 'Acer-AR32GT2841HDFL' shipped as a product NAME (seen live) -
+            # a bare model code with no brand words, size or series
+            reasons.append('title_looks_like_raw_sku (a model code is not a '
+                           'product name)')
 
         if sku:
             if sku in seen_skus:
@@ -685,8 +708,11 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'regular_price<=sale_price ({reg:g} <= {sale:g})')
         # an MRP several times the price is a number scraped off the wrong
         # element, not a discount
-        if reg is not None and sale is not None and sale > 0 and reg > sale * 4:
-            reasons.append(f'mrp_implausible ({reg:g} is {reg / sale:.1f}x {sale:g})')
+        if reg is not None and sale is not None and sale > 0:
+            limit = mrp_ratio_limit(cats, title)
+            if reg > sale * limit:
+                reasons.append(f'mrp_implausible ({reg:g} is {reg / sale:.1f}x '
+                               f'{sale:g}, limit {limit:g}x)')
         # a price far below the category's floor means an accessory was matched
         key, floor = price_floor_for(cats)
         if sale is not None and floor and sale < floor:

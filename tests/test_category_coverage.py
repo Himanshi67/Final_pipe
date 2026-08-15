@@ -47,7 +47,12 @@ CASES = [
     ("LED > QLED", "Samsung 55 inch 4K Ultra HD QLED Smart TV QA55Q60C"),
     ("LED > OLED", "LG 55 inch 4K Ultra HD OLED evo Smart TV OLED55C3"),
     ("LED > Qned", "LG 65 inch 4K Ultra HD QNED Smart TV 65QNED80"),
-    ("LED > Mini LED", "Samsung 32 inch HD Ready Smart LED TV UA32H4500"),
+    # a PLAIN LED TV goes to the bare parent - Mini LED is a premium panel
+    # tech the listing has to actually claim (a live Full HD Foxsky was
+    # shipped under Mini LED when this was the catch-all arm)
+    ("LED", "Samsung 32 inch HD Ready Smart LED TV UA32H4500"),
+    ("LED", "Foxsky 109 cm (43 Inch) Full HD Smart LED TV, 43FSFHS"),
+    ("LED > Mini LED", "TCL 55 inch 4K Mini LED Google TV 55C755"),
     # ---- Kitchen Appliances ----------------------------------------------
     ("Kitchen Appliances > Chimneys",
      "Elica 60 cm 1200 m3/hr Auto Clean Kitchen Chimney WDFL 606 HAC"),

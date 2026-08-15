@@ -493,8 +493,14 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
         return 'LED', 'OLED'
     if has('qned'):
         return 'LED', 'Qned'
-    if has('mini led') or word('led') or word('tv') or has('television'):
+    if has('mini led'):
         return 'LED', 'Mini LED'
+    if word('led') or word('tv') or has('television'):
+        # A plain LED TV is NOT a Mini LED - that is a premium backlight
+        # tech the listing has to actually claim. Seen live: a Full HD
+        # Foxsky filed under Mini LED because this arm was the catch-all.
+        # No stated panel tech -> the bare parent category.
+        return 'LED', ''
 
     # --- Electronics & Computing ---
     if has('laptop'):
@@ -762,6 +768,13 @@ def load_subcategory_attributes():
                 one = compact(one)
                 if one:
                     out[_cat_norm(one)] = axes
+            # a product filed under the bare parent (split_hierarchy turns
+            # 'LED' into ('LED', 'LED')) keeps the same required axes as the
+            # parent's sub-categories; setdefault so a real sub named like a
+            # parent still wins
+            parent_name = compact(row.get('Parent Category'))
+            if parent_name:
+                out.setdefault(_cat_norm(parent_name), axes)
         break
     return out
 
