@@ -682,6 +682,48 @@ def test_20_inflated_mrp_flagged_not_deleted():
           "x the price" in status and "check" in status, True)
 
 
+def test_21_gallery_collision_flagged():
+    section("#21 a second SKU with an identical gallery is flagged against the first")
+    seen = {}
+    rec_a = {"url_link": "https://a.example.com/p", "status": "FOUND (a.example.com)",
+              "image_url": "https://img.example.com/1.jpg,https://img.example.com/2.jpg"}
+    E.flag_gallery_collision(rec_a, "SKU-A", 2, seen)
+    check("the first row to claim a gallery is not flagged",
+          "gallery matches" in rec_a["status"], False)
+
+    rec_b = {"url_link": "https://b.example.com/p", "status": "FOUND (b.example.com)",
+              "image_url": "https://img.example.com/2.jpg,https://img.example.com/1.jpg"}
+    E.flag_gallery_collision(rec_b, "SKU-B", 3, seen)
+    check("a DIFFERENT sku with the same gallery (any order) is flagged",
+          "gallery matches row 2 (SKU-A), verify" in rec_b["status"], True)
+
+    rec_c = {"url_link": "https://a.example.com/p", "status": "FOUND (a.example.com)",
+              "image_url": "https://img.example.com/1.jpg,https://img.example.com/2.jpg"}
+    E.flag_gallery_collision(rec_c, "SKU-A", 9, seen)
+    check("the SAME sku reappearing (e.g. a retry) is never flagged against itself",
+          "gallery matches" in rec_c["status"], False)
+
+
+def test_22_image_floor_fallback():
+    section("#22 an all-below-floor gallery keeps its largest photos instead of shipping zero")
+    urls = ["https://example.com/tiny-a.jpg", "https://example.com/tiny-b.jpg",
+            "https://example.com/tiny-c.jpg"]
+    E._IMG_DIMS[urls[0]] = (400, 400)
+    E._IMG_DIMS[urls[1]] = (800, 600)     # the largest of the three
+    E._IMG_DIMS[urls[2]] = (300, 300)
+    rec = {"image_url": ",".join(urls)}
+    E.finalize_gallery(rec)
+    check("keeps images instead of shipping zero",
+          bool(rec["image_url"]), True)
+    check("picks the LARGEST of the too-small candidates first",
+          rec["image_url"].split(",")[0], urls[1])
+    check("marks the row so status_for() can surface it",
+          rec.get("_gallery_below_floor"), True)
+    status = E.status_for(rec, "https://example.com/p/1", min_images=0)
+    check("status_for() mentions the floor",
+          "below" in status and "floor" in status, True)
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -701,6 +743,8 @@ def main():
     test_18_binary_upload_rejected()
     test_19_category_prefixes()
     test_20_inflated_mrp_flagged_not_deleted()
+    test_21_gallery_collision_flagged()
+    test_22_image_floor_fallback()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

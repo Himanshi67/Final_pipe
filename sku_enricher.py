@@ -2501,12 +2501,37 @@ def status_for(rec, url, min_images=MIN_IMAGES, donors=()):
     n_img = image_count(rec)
     if n_img < min_images:
         status += f" - only {n_img} image(s)"
+    if rec.get("_gallery_below_floor"):
+        status += f" - gallery below {IMAGE_MIN_PX}px floor, verify"
     why = bogus_mrp(rec.get("regular price"), rec.get("sale price"))
     if why:
         status += f" - {why}, check"
     if not domain_quality(url):
         status += " - unlisted store, verify"
     return status
+
+
+def flag_gallery_collision(rec, sku, row, seen_galleries):
+    """If `rec`'s gallery exactly matches an EARLIER row's under a different
+    SKU, append a flag to its status - the wrong-match signature
+    validate_csv.py otherwise only catches after the CSV is built
+    (docs/PIPELINE_GUIDE.md: "one matched the other's listing"). Records this
+    row's gallery either way, mutating `seen_galleries` in place so later rows
+    can be compared against it. Only the WHOLE gallery matching fires; a
+    single shared marketing photo between two real listings is normal and
+    would just be noise on every row."""
+    if not (rec.get("url_link")
+            and str(rec.get("status", "")).startswith(("FOUND", "CLOSE"))):
+        return
+    imgs = frozenset(split_image_list(rec.get("image_url", "")))
+    if not imgs:
+        return
+    prior = seen_galleries.get(imgs)
+    if prior and prior[1] and prior[1] != sku:
+        rec["status"] = (f"{rec['status']} - gallery matches "
+                         f"row {prior[0]} ({prior[1]}), verify")
+    else:
+        seen_galleries[imgs] = (row, sku)
 
 
 def merge_sources(best, hits, min_images=MIN_IMAGES):
@@ -2725,15 +2750,30 @@ def finalize_gallery(rec):
     most fetched pages never get this far."""
     keep, small, note = upgrade_gallery(
         split_image_list(rec.get("image_url", "")), IMAGE_MIN_PX)
-    # ALWAYS reassign: extract() hands over an IMAGE_POOL-sized candidate
-    # list, so leaving it untouched when nothing was dropped would write more
-    # than MAX_IMAGES into the sheet
-    rec["image_url"] = ",".join(keep[:MAX_IMAGES])
     if note:
         log(f"      images {note}")
     if small:
         log(f"      dropped {len(small)} image(s) under {IMAGE_MIN_PX}px: "
             + ", ".join(d for _, d in small[:4]))
+    if not keep and small:
+        # Every candidate was measured and IS a real photo, just under the HD
+        # floor - a small photo on the storefront beats an imageless listing,
+        # and a human can always ask for a better one later. Largest-first,
+        # capped at MIN_IMAGES so a thin fallback gallery does not silently
+        # read as a full one. status_for() surfaces _gallery_below_floor so
+        # the reviewer knows these did not clear the normal bar.
+        def _area(u):
+            d = image_dimensions(u)
+            return d[0] * d[1] if d else 0
+        ranked = sorted(small, key=lambda t: -_area(t[0]))
+        keep = [u for u, _ in ranked[:MIN_IMAGES]]
+        rec["_gallery_below_floor"] = True
+        log(f"      none reached {IMAGE_MIN_PX}px - kept the {len(keep)} "
+            f"largest available instead of shipping zero images")
+    # ALWAYS reassign: extract() hands over an IMAGE_POOL-sized candidate
+    # list, so leaving it untouched when nothing was dropped would write more
+    # than MAX_IMAGES into the sheet
+    rec["image_url"] = ",".join(keep[:MAX_IMAGES])
 
 
 def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
@@ -3546,6 +3586,21 @@ def main():
     log(f"Sheet: '{ws.title}' | SKU column: {ws.cell(row=1, column=sku_col).value!r} (col {sku_col})")
     busy_input = norm_header(ws.cell(row=1, column=sku_col).value) in BUSY_SKU_HEADERS
     busy_seen = {}
+    # A second SKU whose gallery byte-for-byte matches an earlier row's is the
+    # wrong-match signature validate_csv.py otherwise only catches after the
+    # CSV is built (docs/PIPELINE_GUIDE.md: "one matched the other's listing").
+    # Seeding from rows already FOUND/CLOSE lets a retry/resume run catch a
+    # collision against OLD rows too, not just ones touched this run.
+    seen_galleries = {}
+    for pr in range(2, ws.max_row + 1):
+        pr_status = str(ws.cell(row=pr, column=cols["status"]).value or "")
+        if not pr_status.startswith(("FOUND", "CLOSE")):
+            continue
+        pr_imgs = frozenset(split_image_list(
+            str(ws.cell(row=pr, column=cols["image_url"]).value or "")))
+        if pr_imgs and pr_imgs not in seen_galleries:
+            pr_sku = str(ws.cell(row=pr, column=sku_col).value or "").strip()
+            seen_galleries[pr_imgs] = (pr, pr_sku)
     if busy_input:
         log("  BUSY ERP export detected - stripping unit designators "
             "((IDU)/(ODU)/INNER/OUTER) and collapsing split-unit duplicates")
@@ -3649,6 +3704,7 @@ def main():
             # ERROR rec carries only a status, so a failed retry still cannot
             # wipe a good row.
             relisted = bool(rec.get("url_link"))
+            flag_gallery_collision(rec, str(sku).strip(), r, seen_galleries)
             for key, col in cols.items():
                 if rec.get(key):
                     ws.cell(row=r, column=col, value=safe_cell(rec[key]))
