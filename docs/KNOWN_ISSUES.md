@@ -1,5 +1,11 @@
 # Known Issues — pre-diagnosed backlog (sku_enricher.py unless noted)
 
+> **STATUS NOTE (2026-08-11):** several Status lines below are stale. The
+> re-verified ledger is **docs/PRODUCTION_READINESS.md** — check there first;
+> fixed since this file's last update: KI-7a/b/g (partial), KI-15 stopgap
+> (and the CDN block itself is currently OFF), A-4/6/7/8/10/11, A-5 resolved
+> by decision. KI-13 operator-deferred.
+
 **Contract:** every entry below is already diagnosed; line anchors were verified
 against the code. To fix one: read ONLY the cited lines (±20 context), apply the fix
 sketch, run the acceptance test on a SCRATCH COPY (never live spreadsheets), update

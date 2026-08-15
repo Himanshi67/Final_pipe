@@ -511,6 +511,12 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
     if has('trolly bag', 'trolley bag'):
         return 'Home Appliances', 'Trolly Bag'
     if word('fan') or word('fans'):
+        # The taxonomy separates 'Electronics & Computing > Electronic Fans'
+        # from 'Home Appliances > Fans', and category_seo.xlsx shows what it
+        # means by it: rechargeable / USB / portable fans, not ceiling fans.
+        # Nothing routed anything there, so that category could never fill.
+        if has('rechargeable', 'usb', 'portable', 'battery operated'):
+            return 'Electronics & Computing', 'Electronic Fans'
         return 'Home Appliances', 'Fans'
 
     # nothing in the listing said what this is - fall back to the operator's
@@ -550,8 +556,27 @@ FAMILY_BY_SUB = {
 
 def family_for(parent, sub):
     """Product family used for capacity labels, configuration text and SKU
-    prefixes (WM-/WH-/AP-)."""
+    prefixes (see SKU_PREFIX_BY_PARENT)."""
     return FAMILY_BY_SUB.get(_cat_norm(sub), parent)
+
+
+# One prefix per parent category (operator decision 2026-08-11: prefixes
+# encode the category, settled while the catalogue is small because changing
+# them later renames live products). AP- stays the fallback for anything the
+# taxonomy does not know. Keep validate_csv.py's prefix-stripping regex and
+# sku_enricher.CATEGORY_CODES in sync with this map.
+SKU_PREFIX_BY_PARENT = {
+    'Washing Machines': 'WM',          # live products carry these two -
+    'Water Heaters': 'WH',             # never change them
+    'LED': 'TV',
+    'Air Conditioner': 'AC',
+    'Cooling & Freezing': 'CF',
+    'Kitchen Appliances': 'KA',
+    'Home Appliances': 'HA',
+    'Small Appliances': 'SA',
+    'Electronics & Computing': 'EC',
+}
+SKU_PREFIXES = tuple(SKU_PREFIX_BY_PARENT.values()) + ('AP',)
 
 
 def prefixed_sku(raw_sku, category):
@@ -566,13 +591,20 @@ def prefixed_sku(raw_sku, category):
     # inconsistently by different clients.
     sku = re.sub(r'[\\/:*?"<>|()\[\]{}]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
-    if sku.startswith(('WM-', 'WH-', 'AP-')):
-        return sku
-    if category == 'Washing Machines':
-        return f'WM-{sku}' if sku else 'WM-UNKNOWN'
-    if category == 'Water Heaters':
-        return f'WH-{sku}' if sku else 'WH-UNKNOWN'
-    return f'AP-{sku}' if sku else 'AP-UNKNOWN'
+    if sku.startswith(('WM-', 'WH-')):
+        return sku                     # live products carry these - never rename
+    code = SKU_PREFIX_BY_PARENT.get(category)
+    for p in SKU_PREFIXES:
+        if sku.startswith(f'{p}-'):
+            if code is None or p == code:
+                return sku             # right code already, or category unknown
+            # prefixes encode the category (decision 2026-08-11): a stale
+            # legacy AP- or an ERP-supplied code that contradicts the detected
+            # category is re-coded, not trusted
+            sku = sku[len(p) + 1:]
+            break
+    code = code or 'AP'
+    return f'{code}-{sku}' if sku else f'{code}-UNKNOWN'
 
 
 def wattage(text):
@@ -1175,7 +1207,7 @@ def trim_to(text, limit):
 def model_code(sku):
     """The manufacturer's model code inside a prefixed SKU, for the slug and
     the focus keyword. 'WM-SAMSUNG-WW80T504DAB' -> 'WW80T504DAB'."""
-    text = re.sub(r'^(?:WM|WH|AP)-', '', compact(sku))
+    text = re.sub(r'^(?:' + '|'.join(SKU_PREFIXES) + r')-', '', compact(sku))
     tokens = [t for t in re.split(r'[-\s_/]+', text)
               if len(t) >= 4 and re.search(r'\d', t) and re.search(r'[A-Za-z]', t)]
     tokens.sort(key=len, reverse=True)
@@ -1558,7 +1590,11 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         if not category_mapped:
             unmapped_categories.add(category_hierarchy)
         category_family = family_for(parent_guess, sub_guess)
-        sku = prefixed_sku(row.get('sku'), category_family)
+        # the PARENT names the prefix, the family names capacity/config text -
+        # passing the family here sent every FAMILY_BY_SUB product (microwaves,
+        # kettles, irons, dispensers...) to the AP- fallback while its parent
+        # siblings got the real code
+        sku = prefixed_sku(row.get('sku'), parent_guess)
 
         # BUGFIX: identical SKUs used to produce duplicate WooCommerce rows
         if sku in seen_skus:

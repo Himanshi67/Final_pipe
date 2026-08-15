@@ -258,9 +258,11 @@ def main():
                     help="Send the post to WordPress")
     ap.add_argument("--commit", action="store_true",
                     help="Actually write. Without this nothing is sent.")
-    ap.add_argument("--status", default="draft",
+    ap.add_argument("--status", default=None,
                     choices=["draft", "publish", "pending", "private"],
-                    help="Status for posts this run creates (default: draft)")
+                    help="Status to set. New posts default to draft. Passing "
+                         "this explicitly ALSO applies it to a post that "
+                         "already exists, which is how a draft goes live.")
     ap.add_argument("--post-category", default="Buying Guides",
                     help="WordPress post category (default: Buying Guides)")
     ap.add_argument("--site-url", default="",
@@ -292,7 +294,7 @@ def main():
     prose, publishable = make_prose(brief, args)
 
     site_url = (args.site_url or os.environ.get("WC_URL", "")).strip()
-    payload = R.post_payload(brief, prose, site_url, args.status,
+    payload = R.post_payload(brief, prose, site_url, args.status or "draft",
                              schema=not args.no_schema)
 
     out_dir = Path(args.out)
@@ -352,10 +354,11 @@ def main():
                                              and brief["products"]) else ""
     try:
         result = P.publish(payload, slug=slug, category=args.post_category,
-                           commit=args.commit, status=args.status,
+                           commit=args.commit, status=args.status or "draft",
                            last_seen_modified=last_seen,
                            force_update=args.force_update,
-                           featured_image=lead)
+                           featured_image=lead,
+                           explicit_status=args.status is not None)
     except Exception as exc:
         raise Held(f"\n{exc}") from exc
 

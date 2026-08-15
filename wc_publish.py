@@ -36,6 +36,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -341,8 +342,7 @@ def find_media(path):
     common case of an unchanged re-push."""
     if path.name in _MEDIA_BY_NAME:
         return _MEDIA_BY_NAME[path.name]
-    user = os.environ.get("WP_APP_USER", "").strip()
-    password = os.environ.get("WP_APP_PASSWORD", "").strip()
+    user, password = media_creds()
     if not (user and password):
         return None
     base = os.environ["WC_URL"].rstrip("/") + "/wp-json/wp/v2/media"
@@ -373,11 +373,19 @@ def find_media(path):
     return None
 
 
+def media_creds():
+    """(user, password) for the Media Library, both stripped - the ONE reader
+    of WP_APP_USER / WP_APP_PASSWORD. Every caller must use this: an unstripped
+    read elsewhere once let whitespace-only creds pass the CLI's presence
+    check while every actual upload then refused them."""
+    return (os.environ.get("WP_APP_USER", "").strip(),
+            os.environ.get("WP_APP_PASSWORD", "").strip())
+
+
 def upload_image(path, alt):
     """Send a local file to the Media Library. Needs a WordPress Application
     Password - WooCommerce consumer keys do not authenticate /wp/v2 routes."""
-    user = os.environ.get("WP_APP_USER", "").strip()
-    password = os.environ.get("WP_APP_PASSWORD", "").strip()
+    user, password = media_creds()
     if not (user and password):
         return None
     existing = find_media(path)
@@ -434,12 +442,20 @@ def images_for(row, sku, title, mode, allow_writes=True):
                      f"(dry run); they upload on --commit")
         return [], notes
 
-    for local in ready:
-        media_id = upload_image(local, title)
-        if media_id is None:
-            notes.append("WP_APP_USER / WP_APP_PASSWORD not set - cannot upload")
-            break
-        payload.append({"id": media_id, "alt": title})
+    if not ready:                  # every URL's local file was missing
+        return [], notes
+    if not all(media_creds()):
+        notes.append("WP_APP_USER / WP_APP_PASSWORD not set - cannot upload")
+        return [], notes
+    # A gallery is N independent POSTs and the store's round-trip latency, not
+    # bandwidth, dominates - measured ~1 min for 32 images done one at a time.
+    # map() preserves order, so position 1 stays the featured image; 4 workers
+    # keeps the burst polite. Filenames within one product are distinct
+    # (SKU_n.webp), so the _MEDIA_BY_NAME dedupe cache cannot race against
+    # itself here.
+    with ThreadPoolExecutor(max_workers=min(4, len(ready))) as pool:
+        ids = list(pool.map(lambda p: upload_image(p, title), ready))
+    payload = [{"id": mid, "alt": title} for mid in ids if mid is not None]
     return payload, notes
 
 
@@ -619,7 +635,7 @@ def main():
 
     if args.check:
         store.check()
-        have_media = bool(os.environ.get("WP_APP_USER") and os.environ.get("WP_APP_PASSWORD"))
+        have_media = all(media_creds())
         print(f"  media upload credentials: {'present' if have_media else 'NOT set'}"
               f"{'' if have_media else ' (set WP_APP_USER / WP_APP_PASSWORD to upload images)'}")
         return
@@ -661,9 +677,7 @@ def main():
 
     image_mode = args.images
     if image_mode == "auto":
-        image_mode = ("upload"
-                      if os.environ.get("WP_APP_USER") and os.environ.get("WP_APP_PASSWORD")
-                      else "url")
+        image_mode = "upload" if all(media_creds()) else "url"
 
     print(f"{'PUBLISHING' if args.commit else 'DRY RUN'}: {len(df)} product(s) "
           f"from {path.name} -> {store.base}  (images: {image_mode}, "

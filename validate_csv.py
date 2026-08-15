@@ -536,6 +536,14 @@ def to_number(value):
     return number if math.isfinite(number) else None
 
 
+# Mirrors app.SKU_PREFIX_BY_PARENT (+ the AP fallback). This script stays
+# import-free of app.py on purpose (app.py drags in streamlit); the module
+# constant exists so tests can assert the two stay in sync -
+# tests\test_bugfixes.py test_19 fails the moment a prefix is added there
+# and not here.
+SKU_PREFIX_RE = re.compile(r'^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-')
+
+
 def validate_export(df, csv_path, check_images=True, write_issues=True):
     """QA for the generated WooCommerce CSV. Returns the list of issue dicts.
 
@@ -657,7 +665,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'title_suspiciously_short ({len(title)} chars)')
         # the SKU normally leads with the brand; if that word is nowhere in the
         # title, the row probably belongs to a different product
-        sku_brand = re.split(r'[-\s]', re.sub(r'^(WM|WH|AP)-', '', sku))[0].lower()
+        sku_brand = re.split(r'[-\s]',
+                             SKU_PREFIX_RE.sub('', sku))[0].lower()
         if len(sku_brand) > 3 and title and sku_brand not in title.lower():
             reasons.append(f'brand_missing_from_title (sku says {sku_brand})')
 
@@ -667,8 +676,11 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'placeholder_spec_text ({found_dead[0]}) - rebuild '
                            f'this CSV, it predates the KI-14 fix')
 
-        joined = ' '.join([title.lower(), cats.lower(), desc.lower()])
-        if 'front load' in title.lower() and 'top load' in joined.replace(title.lower(), ''):
+        # check cats+desc directly rather than removing the title's text from a
+        # joined blob: str.replace could splice 'top'+'load' together out of
+        # unrelated fragments (or miss, if the description re-words the title)
+        rest = ' '.join([cats.lower(), desc.lower()])
+        if 'front load' in title.lower() and 'top load' in rest:
             reasons.append('front_load_titled_but_top_load_labelled')
 
         records.append({'idx': idx, 'sku': sku, 'title': title,

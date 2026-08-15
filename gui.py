@@ -26,6 +26,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -37,8 +38,27 @@ REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 RUNS_DIR = REPO_ROOT / "runs"
 
-SKU_HEADER_HINTS = {"sku", "skus", "sku code", "item code", "itemcode",
-                    "model", "model no", "part no", "item"}
+def _sku_header_match(value) -> bool:
+    """Does this header name the SKU column?
+
+    Delegated to the enricher rather than kept as a parallel list here. The
+    local copy compared raw lowercase text ('item details') against a hand
+    written set, while the enricher normalises to alphanumerics
+    ('itemdetails'), so the two disagreed on real headers - the GUI then fell
+    back to column 1 and reported the wrong SKU total in the progress bar."""
+    global _SKU_HEADER_LOOKUP
+    try:
+        if _SKU_HEADER_LOOKUP is None:
+            import sku_enricher
+            _SKU_HEADER_LOOKUP = (sku_enricher.norm_header,
+                                  frozenset(sku_enricher.SKU_HEADERS))
+        norm, headers = _SKU_HEADER_LOOKUP
+        return norm(value) in headers
+    except Exception:
+        return str(value or "").strip().lower() in {"sku", "skus", "model"}
+
+
+_SKU_HEADER_LOOKUP = None
 
 STILL_ACTIVE = 259
 
@@ -111,8 +131,7 @@ def count_skus(path: Path) -> int:
         ws = wb.active
         col = 1
         for c, cell in enumerate(next(ws.iter_rows(min_row=1, max_row=1)), 1):
-            h = str(cell.value or "").strip().lower()
-            if h in SKU_HEADER_HINTS:
+            if _sku_header_match(cell.value):
                 col = c
                 break
         n = 0
@@ -127,7 +146,34 @@ def count_skus(path: Path) -> int:
 
 # --------------------------------------------------------------- subprocess --
 
-def pid_alive(pid: int) -> bool:
+_PID_IS_PYTHON = {}          # pid -> tasklist verdict, one subprocess per pid
+
+
+def _pid_created(pid: int):
+    """Process creation time as a unix epoch, or None if unreadable."""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    k32 = ctypes.windll.kernel32
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, int(pid))
+    if not h:
+        return None
+    times = [ctypes.c_ulonglong() for _ in range(4)]
+    ok = k32.GetProcessTimes(h, *[ctypes.byref(t) for t in times])
+    k32.CloseHandle(h)
+    if not ok:
+        return None
+    return times[0].value / 1e7 - 11644473600   # FILETIME -> epoch
+
+
+def pid_alive(pid: int, started: float = None) -> bool:
+    """Is this PID still the process we launched?
+
+    Windows recycles PIDs aggressively, and a stale `enricher_pid` left in
+    run_meta.json by a GUI closed mid-batch would sooner or later match some
+    unrelated process, locking Step 2 permanently. The exact identity check
+    is the process CREATION TIME against the launch timestamp we stored - a
+    syscall, safe to call from the 2-second progress fragment. The tasklist
+    image-name check remains only as a fallback for metas that predate the
+    timestamp, memoized so it spawns at most once per PID."""
     if not pid:
         return False
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
@@ -138,14 +184,30 @@ def pid_alive(pid: int) -> bool:
     code = ctypes.c_ulong()
     ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
     k32.CloseHandle(h)
-    return bool(ok) and code.value == STILL_ACTIVE
+    if not (bool(ok) and code.value == STILL_ACTIVE):
+        _PID_IS_PYTHON.pop(pid, None)
+        return False
+    if started:
+        created = _pid_created(pid)
+        if created is not None:
+            return abs(created - started) < 300
+    if pid not in _PID_IS_PYTHON:
+        try:
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {int(pid)}", "/NH", "/FO", "CSV"],
+                capture_output=True, text=True, timeout=10).stdout
+            _PID_IS_PYTHON[pid] = "python" in out.lower()
+        except Exception:
+            return True             # cannot tell -> trust the handle check
+    return _PID_IS_PYTHON[pid]
 
 
 def enricher_running(P) -> bool:
     proc = st.session_state.get(f"proc_{P['run'].name}")
     if proc is not None and proc.poll() is None:
         return True
-    return pid_alive(load_meta(P).get("enricher_pid"))
+    meta = load_meta(P)
+    return pid_alive(meta.get("enricher_pid"), meta.get("enricher_started"))
 
 
 def start_enricher(P, extra_flags: list, total: int):
@@ -160,7 +222,8 @@ def start_enricher(P, extra_flags: list, total: int):
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
     st.session_state[f"proc_{P['run'].name}"] = proc
     st.session_state[f"running_{P['run'].name}"] = True
-    update_meta(P, enricher_pid=proc.pid, enricher_flags=extra_flags,
+    update_meta(P, enricher_pid=proc.pid, enricher_started=time.time(),
+                enricher_flags=extra_flags,
                 total_rows=total, enricher_cmd=" ".join(cmd))
 
 
@@ -182,7 +245,6 @@ def cancel_enricher(P):
         except subprocess.TimeoutExpired:
             pass
     else:
-        import time
         while deadline > 0 and pid_alive(pid):
             time.sleep(1)
             deadline -= 1
@@ -368,7 +430,17 @@ def load_filled_df(P) -> pd.DataFrame:
         if col not in df.columns:
             df[col] = ""
     for col in ("regular price", "sale price"):
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        # The enricher writes prices Indian-formatted ('22,599') because a
+        # human reads this sheet. pd.to_numeric chokes on the comma and returns
+        # NaN, which rendered EVERY price as an empty cell in the review
+        # editor - measured on a real batch: 39 of 41 blanked, while 22 rows
+        # genuinely had a price. Strip the formatting before parsing.
+        df[col] = pd.to_numeric(
+            df[col].astype(str)
+                   .str.replace(",", "", regex=False)
+                   .str.replace("₹", "", regex=False)
+                   .str.strip(),
+            errors="coerce")
     return df
 
 
@@ -561,10 +633,15 @@ def step_build(P):
         return
 
     conf = confirmed_set(P)
-    scope = st.radio("Rows to include",
-                     [f"Confirmed rows only ({len(conf)})",
-                      "All FOUND rows (skip unverified, like build_csv.py)"],
-                     index=0 if conf else 1)
+    # the VALUE is a stable key; only the rendering carries the wording, so a
+    # label rewrite can never silently flip what built_scope records
+    scope = st.radio(
+        "Rows to include", ["confirmed", "all_found"],
+        format_func=lambda v: (f"Confirmed rows only ({len(conf)})"
+                               if v == "confirmed" else
+                               "All FOUND rows (skip unverified, like "
+                               "build_csv.py)"),
+        index=0 if conf else 1)
     month = st.text_input("WordPress uploads folder (YYYY/MM)",
                           value=f"{datetime.now():%Y/%m}")
     c1, c2 = st.columns(2)
@@ -584,7 +661,7 @@ def step_build(P):
 
     df = pd.read_excel(P["filled"])
     df = app.filter_active_inventory_rows(df)
-    if scope.startswith("Confirmed"):
+    if scope == "confirmed":
         df = df[df["sku"].astype(str).isin(conf)].copy()
     elif "status" in df.columns:
         keep = (df["status"].map(app.compact).str.upper()
@@ -617,7 +694,15 @@ def step_build(P):
     st.dataframe(result.head(50))
     st.download_button("⬇ Download CSV", P["csv"].read_bytes(),
                        file_name=P["csv"].name, mime="text/csv")
-    update_meta(P, validated=False)     # a new CSV must be re-validated
+    # Record WHAT went into the CSV. Step 5 used to intersect the confirmed
+    # SKUs (raw, as the enricher wrote them) with the CSV's SKUs (prefixed by
+    # app.prefixed_sku), and those two sets barely overlap - measured on a
+    # real batch, 2 of 14 - so a "publish confirmed rows" run silently sent a
+    # fraction of them. The CSV IS the chosen scope; built_skus lets Step 5
+    # verify the file on disk is still the one this build wrote.
+    update_meta(P, validated=False,     # a new CSV must be re-validated
+                built_scope=scope,
+                built_skus=[str(s) for s in result["sku"].tolist()])
     st.info("Continue to **Step 4 · Validate**.")
 
 
@@ -629,8 +714,16 @@ def step_validate(P):
         st.info("No CSV yet — run Step 3 first.")
         return
 
-    check_images = st.checkbox("Also verify image URLs respond", value=False,
-                               help="Slower: fetches every image header")
+    # This flag gates validate_export's LOCAL image inspection (Pillow reads
+    # each downloaded .webp header for size and shape). It never fetched a URL,
+    # and defaulting it off made the GUI's validation weaker than the one
+    # build_csv.py runs automatically.
+    check_images = st.checkbox(
+        "Inspect downloaded image files (size, shape, duplicate galleries)",
+        value=True,
+        help="Reads each .webp header from product_images_for_upload. This is "
+             "what catches thumbnails, share banners and two SKUs sharing one "
+             "gallery. Untick only if it is slow on a very large batch.")
     if st.button("🔍 Run validation", type="primary"):
         import validate_csv
         df = pd.read_csv(P["csv"], dtype=str).fillna("")
@@ -699,35 +792,65 @@ def step_publish(P):
                                                + ("OK" if code == 0 else "FAILED"))
         st.code(out[-3000:], language=None)
 
-    conf = confirmed_set(P)
     csv_df = pd.read_csv(P["csv"], dtype=str).fillna("")
     sku_col = next((c for c in csv_df.columns if c.strip().lower() == "sku"),
                    None)
     csv_skus = set(csv_df[sku_col].astype(str)) if sku_col else set()
-    publish_skus = sorted(conf & csv_skus) if conf else sorted(csv_skus)
-    if conf:
-        st.info(f"Scope: **{len(publish_skus)} confirmed** SKU(s) present in "
-                "the CSV (only confirmed rows are ever sent).")
+    # The CSV is the scope: Step 3 already applied the confirmed/all-FOUND
+    # filter when it built the file (re-filtering against the confirmed set
+    # cannot work - Step 2 confirms the enricher's RAW sku while the CSV
+    # carries app.prefixed_sku's form). But that trust holds only while the
+    # file on disk IS the one Step 3 wrote - so verify it against built_skus
+    # and refuse anything unrecorded or changed underneath.
+    built_scope = meta.get("built_scope")
+    built_skus = set(meta.get("built_skus") or [])
+    if not built_scope:
+        st.error("This CSV predates scope tracking — rebuild it in Step 3 so "
+                 "the GUI knows exactly which rows it holds, then validate "
+                 "and come back.")
+        return
+    if built_skus != csv_skus:
+        st.error(f"The CSV on disk ({len(csv_skus)} row(s)) no longer matches "
+                 f"what Step 3 built ({len(built_skus)} recorded) — it was "
+                 "rebuilt or edited outside this run. Rebuild in Step 3 and "
+                 "validate again.")
+        return
+    publish_skus = sorted(csv_skus)
+    if built_scope == "confirmed":
+        st.info(f"Scope: **{len(publish_skus)}** product(s) — the CSV was "
+                "built from your confirmed rows only.")
     else:
-        st.warning(f"No rows confirmed in Step 2 — scope falls back to all "
-                   f"{len(publish_skus)} CSV rows. Confirming first is safer.")
+        st.warning(f"Scope: all **{len(publish_skus)}** FOUND row(s) — this "
+                   "CSV was NOT limited to confirmed rows. Rebuild in Step 3 "
+                   "with 'Confirmed rows only' if that is what you want.")
     if not publish_skus:
         st.error("Nothing to publish.")
         return
     if len(publish_skus) > 100:
-        st.warning(f"{len(publish_skus)} products is a large batch — consider "
-                   "publishing in chunks.")
+        st.warning(f"{len(publish_skus)} products is a large batch — it will "
+                   "be sent in chunks of 150 SKUs per wc_publish call.")
 
-    sku_flags = []
-    if conf:                      # pin scope explicitly; never the CSV blind
-        for s in publish_skus:
-            sku_flags += ["--sku", s]
+    def run_publish_pinned(extra):
+        """Every invocation pins its scope with explicit --sku flags. Past
+        ~200 the flags would hit the Windows command-line limit, so the set
+        is CHUNKED across several wc_publish calls rather than ever falling
+        back to publishing the CSV blind."""
+        outs, code = [], 0
+        for i in range(0, len(publish_skus), 150):
+            flags = []
+            for s in publish_skus[i:i + 150]:
+                flags += ["--sku", s]
+            code, out = run_publish(P, flags + extra)
+            outs.append(out)
+            if code != 0:
+                break
+        return code, "\n".join(outs)
 
     dry_key = f"dryrun_{P['run'].name}"
     st.subheader("Ⅰ · Dry run (nothing is written)")
     if st.button("🧪 Dry run", type="primary"):
         with st.spinner("Dry run…"):
-            code, out = run_publish(P, sku_flags)
+            code, out = run_publish_pinned([])
         st.session_state[dry_key] = (code == 0)
         st.code(out[-8000:], language=None)
         (st.success if code == 0 else st.error)(
@@ -750,11 +873,11 @@ def step_publish(P):
     label = ("🚀 Commit — create/update as LIVE products" if go_live
              else "📝 Commit — create/update as DRAFTS")
     if st.button(label, type="primary", disabled=not armed):
-        extra = sku_flags + ["--commit"]
+        extra = ["--commit"]
         if go_live:
             extra += ["--status", "publish"]
         with st.spinner(f"Publishing {len(publish_skus)} product(s)…"):
-            code, out = run_publish(P, extra)
+            code, out = run_publish_pinned(extra)
         st.code(out[-8000:], language=None)
         if code == 0:
             st.success(f"Done — {len(publish_skus)} product(s) upserted as "

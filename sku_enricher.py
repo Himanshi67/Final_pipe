@@ -132,7 +132,10 @@ BLOCKED_DOMAINS = [                    # never use these results
 # came back 'rejected: brand not found in listing' - the single largest cause
 # of NOT FOUND on ERP-coded lists.
 CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW",
-                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW")
+                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW",
+                  # store-side prefixes from app.SKU_PREFIX_BY_PARENT, so a
+                  # published SKU pasted back in as input still parses
+                  "CF", "KA", "HA", "SA", "EC", "AP")
 
 # ---- strict-match filters: accessories & compatibility listings ----------
 # Listings whose titles contain the model code but are NOT the product
@@ -1010,8 +1013,15 @@ def ddg_search(query):
                      "title": it.get("title", "")} for it in res]
         except Exception as e:
             if attempt == 1:
-                log(f"      search hiccup ({type(e).__name__}) - waiting 30s...")
-                time.sleep(30)
+                # a rate-limit needs the full cool-down; any other hiccup
+                # (DNS blip, parse error) never benefits from 30 idle seconds.
+                # The ddgs/duckduckgo_search libraries surface throttling
+                # inconsistently - RatelimitException, or a generic exception
+                # whose MESSAGE says '202 Ratelimit' - so match both surfaces.
+                blob = f"{type(e).__name__} {e}".lower()
+                wait = 30 if "ratelimit" in blob or "rate limit" in blob else 10
+                log(f"      search hiccup ({type(e).__name__}) - waiting {wait}s...")
+                time.sleep(wait)
     return []
 
 
@@ -1164,6 +1174,14 @@ def image_dimensions(url):
                 dims = im.size
     except Exception:
         dims = None                      # unreadable -> unknown, never "small"
+    if len(_IMG_DIMS) >= 20000:
+        # ~10 MB of URL keys on a very large batch. Evict the OLDEST half
+        # rather than clearing: the gallery pipeline queries the same URLs
+        # back-to-back (photos pass, then banners pass, after a thread-pool
+        # prefetch), and a full clear mid-gallery would re-probe all of them
+        # over the network.
+        for k in list(_IMG_DIMS)[:10000]:
+            del _IMG_DIMS[k]
     _IMG_DIMS[url] = dims
     return dims
 
@@ -1762,6 +1780,18 @@ def parse_amazon(html, soup):
                     pass
             if el.get("src"):
                 imgs.append(el.get("src"))
+    # Nav-strip thumbnails advertise their size in the URL (._SS40_, ._UL80_);
+    # probing them over the network just to discard them wastes a request per
+    # thumb. But on a sparse fallback page the landingImage src may be the
+    # ONLY reference to the real photo, in a small rendition that
+    # RENDITION_RULES can upgrade to the original - so when filtering would
+    # empty the list, keep the tiny candidates and let the upgrade pipeline
+    # measure them.
+    def _tiny(u):
+        sizes = [int(t) for t in re.findall(r"_(?:S[SXYL]|U[SLXY])(\d+)_", u)]
+        return bool(sizes) and max(sizes) < 200
+    kept = [u for u in imgs if not _tiny(u)]
+    imgs = kept or imgs
     seen_ids, uniq = set(), []
     for u in imgs:
         m = re.search(r"/images/I/([^.]+)\.", u)
@@ -2194,9 +2224,21 @@ def expected_caps(sku, model, title=""):
         caps.add(float(m.group(1)))
     if NON_CAPACITY_RE.search(f"{title} {sku}"):
         return caps                            # digits here are inches or tons
-    dm = re.search(r"\d+", model or "")
+    dm = re.search(r"(\d+)([A-Za-z]*)(\d?)", model or "")
+    # A number carrying its own unit is that unit, not a load rating. Measured
+    # live: 'ICT-1200W-KISTO' became 12 kg, 'IC-CJ1360WPC' 13.6 kg and
+    # 'DI-ARDO-1000W' 10 kg, and assess() then rejected every real page for
+    # those cooktops and irons with "title lacks capacity/model info". Watts,
+    # volts, litres and hertz are all coded straight into these model numbers.
+    # The letters must be GLUED to the digits (a following separate word is
+    # not a unit) and TERMINAL (letters sandwiched between digits are a model
+    # series, not a unit: Samsung 'WA70H4200' and LG 'T70VBMB1Z' are 7 kg
+    # washers, and bailing on the H/V blinded the capacity guard for them).
+    if (dm and dm.group(2) and not dm.group(3)
+            and dm.group(2)[0].upper() in ("W", "V", "L", "H")):
+        return caps
     if dm:
-        g = float(dm.group(0))
+        g = float(dm.group(1))
         for v in (g, g / 10.0, g / 100.0):     # 650 -> 6.5, 701 -> 7, 90 -> 9
             if 4 <= v <= 20:
                 caps.add(v)

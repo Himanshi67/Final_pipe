@@ -1,5 +1,10 @@
 # Issues audit — 2026-07-28
 
+> **STATUS NOTE (2026-08-11):** superseded where it disagrees by
+> **docs/PRODUCTION_READINESS.md** (every item below re-verified against the
+> code on 2026-08-11; A-4/6/7/8/10/11 fixed, A-5 resolved by operator
+> decision, A-9 deliberately kept as-is).
+
 A deliberate hunt for defects and risks across `sku_enricher.py`, `app.py`,
 `validate_csv.py`, `build_csv.py`, `wc_publish.py`, `wc_seo.py`, and the repo
 itself. Everything below was **checked against the running code or the live
