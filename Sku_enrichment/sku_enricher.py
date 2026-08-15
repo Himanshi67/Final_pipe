@@ -2167,9 +2167,11 @@ def extract(url, html):
         t, m, s, i = t or t2, m or m2, s or s2, list(i) + list(i2)
     if not m:
         m = mrp_near_label(html, s) or mrp_from_strike(soup, s)
-    pm, ps = price_value(m), price_value(s)
-    if pm is not None and ps is not None and (pm <= ps or pm > ps * 6):
-        m = ""                       # MRP must exceed sale; >6x is a bundle/mismatch
+    # MRP sanity (<= sale, or many times it) is judged once, downstream, by
+    # bogus_mrp() - status_for() flags it there instead of this function
+    # silently discarding data a human might want to see: a real bundle SKU
+    # legitimately prices several times its components, and a number this
+    # function throws away never even reaches the "check" a flag would give it.
     specs = format_specs(extract_specs(soup)) if SPECS_ENABLED else ""
     return {"title": t, "regular price": m, "sale price": s,
             "url_link": url,
@@ -3666,6 +3668,16 @@ def main():
             else:
                 missed += 1
             log(f"    -> {st}")
+            # A running tally, not just the end-of-run total: KI-observed pain
+            # was finding out how many credits a batch spent only after it
+            # finished. Printed every 10 rows so it stays readable on a long run.
+            if RUN_STATS["serper_calls"] and done % 10 == 0:
+                log(f"    [{RUN_STATS['serper_calls']} serper.dev call(s) this "
+                    f"run so far - the free tier is 2,500/month]")
+            if RUN_STATS["serper_calls"] == 2000:
+                log("    WARNING: this run alone has used 2,000 serper.dev "
+                    "calls (80% of the 2,500/month free tier) - check your "
+                    "serper.dev dashboard before continuing.")
 
         out = safe_save(wb, out)
         if stopped:
