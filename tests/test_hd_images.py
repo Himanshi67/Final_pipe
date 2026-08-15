@@ -4,8 +4,10 @@ What "HD" means here, and where each rule lives:
 
   stage 1  sku_enricher.IMAGE_MIN_PX   reject a source image under this
   stage 2  app.MIN_IMAGE_EDGE          refuse to download one under this
-           app.MAX_IMAGE_EDGE          downscale past this, never upscale
            app.SQUARE_IMAGES           pad (never crop) onto a 1:1 canvas
+           app.CATALOG_EDGE            finish the square at exactly 1200x1200,
+                                       or 1000x1000 (= MIN_IMAGE_EDGE) when the
+                                       source square is smaller - never upscale
            app.WEBP_QUALITY            re-encode quality
   stage 3  validate_csv.GOOD_IMAGE_PX  flag anything softer than this
 
@@ -56,8 +58,9 @@ def test_thresholds_agree():
           E.IMAGE_MIN_PX, app.MIN_IMAGE_EDGE)
     check("the HD floor is what validate_csv calls good",
           app.MIN_IMAGE_EDGE, V.GOOD_IMAGE_PX)
-    check("masters are capped, not unbounded", app.MAX_IMAGE_EDGE, 2400)
-    check("cap is above the floor", app.MAX_IMAGE_EDGE > app.MIN_IMAGE_EDGE, True)
+    check("catalogue masters land on the 1200 grid size", app.CATALOG_EDGE, 1200)
+    check("the fallback rendition is the HD floor itself",
+          app.MIN_IMAGE_EDGE, 1000)
     check("catalogue tiles are square", app.SQUARE_IMAGES, True)
     check("webp quality is the high setting", app.WEBP_QUALITY, 95)
 
@@ -67,12 +70,13 @@ def test_download_rules():
     section("what actually lands in product_images_for_upload")
     sizes = {
         "under":  (999, 999),      # one pixel below the floor -> refused
-        "atfloor": (1000, 1000),   # exactly the floor -> kept
-        "wide":   (3000, 1200),    # oversized + wide -> downscaled, padded
-        "huge":   (4000, 4000),    # oversized square -> downscaled
+        "atfloor": (1000, 1000),   # exactly the floor -> kept at 1000x1000
+        "wide":   (3000, 1200),    # oversized + wide -> padded, 1200x1200
+        "huge":   (4000, 4000),    # oversized square -> 1200x1200
         "small":  (300, 300),      # plainly a thumbnail -> refused
+        "between": (1100, 1050),   # between the renditions -> 1000x1000
     }
-    order = ["under", "atfloor", "wide", "huge", "small"]
+    order = ["under", "atfloor", "wide", "huge", "small", "between"]
 
     class R:
         def __init__(self, data):
@@ -95,7 +99,7 @@ def test_download_rules():
         app.requests.get = fake_get
         urls = [f"https://cdn.example.com/i/{k}.png" for k in order]
         saved = app.download_urls_for_sku("AP-HD", urls)
-        check("sub-HD sources are refused", saved, [2, 3, 4])
+        check("sub-HD sources are refused", saved, [2, 3, 4, 6])
 
         root = tmp / app.IMAGE_ROOT
         got = {}
@@ -104,13 +108,15 @@ def test_download_rules():
                 got[order[i - 1]] = (im.size, im.format)
         check("the 1000px source is kept at 1000x1000",
               got["atfloor"][0], (1000, 1000))
-        check("a 3000x1200 master is downscaled to the 2400 cap and squared",
-              got["wide"][0], (2400, 2400))
-        check("a 4000x4000 master is downscaled to the cap",
-              got["huge"][0], (2400, 2400))
+        check("a 3000x1200 master is squared and finished at 1200x1200",
+              got["wide"][0], (1200, 1200))
+        check("a 4000x4000 master is downscaled to 1200x1200",
+              got["huge"][0], (1200, 1200))
+        check("an 1100px source drops to 1000x1000, never up to 1200",
+              got["between"][0], (1000, 1000))
         check("everything is WEBP", {v[1] for v in got.values()}, {"WEBP"})
-        check("everything is 1:1", {v[0][0] == v[0][1] for v in got.values()},
-              {True})
+        check("every master is one of the two catalogue renditions",
+              {v[0] for v in got.values()}, {(1000, 1000), (1200, 1200)})
 
         names = [f"AP-HD_{i}.webp" for i in saved]
         problems = V.image_dimension_problems(names, root=str(root))

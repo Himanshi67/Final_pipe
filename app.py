@@ -99,7 +99,15 @@ WEBP_QUALITY = 95
 WEBP_METHOD = 4
 # Long edge to keep. WooCommerce generates its own thumbnails, so the master
 # only has to be big enough for the zoom/lightbox; past this it is bandwidth.
+# Only governs the non-square path: squared catalogue masters are finished at
+# CATALOG_EDGE below, which supersedes this cap.
 MAX_IMAGE_EDGE = 2400
+# Main product images ship at ONE of two fixed square renditions - 1200x1200
+# when the source square is big enough, 1000x1000 otherwise - because the
+# catalogue grid only lines up when every tile is the same shape and scale.
+# The fallback IS MIN_IMAGE_EDGE by construction: anything that passed the
+# floor can always be finished at 1000x1000 without upscaling.
+CATALOG_EDGE = 1200
 # Below this a photo is a thumbnail, not a product image. Skipped outright -
 # one image fewer beats a blurry one on the storefront. Raised from 500 to an
 # HD floor: 500px filled a product tile but went soft the moment a customer
@@ -1396,9 +1404,10 @@ def download_urls_for_sku(sku, urls):
 
     Quality rules, all enforced here so the browser app and build_csv.py cannot
     diverge: ask the CDN for its largest rendition, refuse anything below
-    MIN_IMAGE_EDGE as unusable on a product page, never upscale, only downscale
-    past MAX_IMAGE_EDGE, and finish on a 1:1 canvas so every catalogue tile is
-    the same shape."""
+    MIN_IMAGE_EDGE as unusable on a product page, never upscale, and finish
+    every main product image on a fixed 1:1 canvas - 1200x1200 when the source
+    allows, 1000x1000 otherwise - so every catalogue tile is the same shape
+    AND the same scale."""
     root = os.path.join(os.getcwd(), IMAGE_ROOT)
     os.makedirs(root, exist_ok=True)
     rejected = []
@@ -1423,14 +1432,19 @@ def download_urls_for_sku(sku, urls):
             image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
         # downscale only - enlarging a small source invents detail and looks
         # worse than the original did
-        if max(image.size) > MAX_IMAGE_EDGE:
+        if SQUARE_IMAGES:
+            # pad first so the resize measures the finished square, then land
+            # on exactly one of the two catalogue renditions
+            image = pad_to_square(image)
+            side = image.size[0]
+            edge = CATALOG_EDGE if side >= CATALOG_EDGE else MIN_IMAGE_EDGE
+            if side != edge:
+                image = image.resize((edge, edge), Image.LANCZOS)
+        elif max(image.size) > MAX_IMAGE_EDGE:
             ratio = MAX_IMAGE_EDGE / max(image.size)
             image = image.resize((max(1, round(image.size[0] * ratio)),
                                   max(1, round(image.size[1] * ratio))),
                                  Image.LANCZOS)
-        # last, so the pad is measured against the final pixel size
-        if SQUARE_IMAGES:
-            image = pad_to_square(image)
         target = os.path.join(root, f'{sku}_{index}.webp')
         image.save(target, format='WEBP', quality=WEBP_QUALITY,
                    method=WEBP_METHOD)
