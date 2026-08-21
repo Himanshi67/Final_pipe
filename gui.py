@@ -19,6 +19,7 @@ Existing scripts are not modified; app.py remains usable on its own.
 
 import contextlib
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -34,7 +35,7 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-from gui_helpers import flag_value, sanity_issues
+from gui_helpers import filter_review_df, flag_value, sanity_issues
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -550,6 +551,22 @@ def step_review(P):
             st.dataframe(pd.DataFrame(probs), hide_index=True,
                          use_container_width=True)
 
+    fc1, fc2 = st.columns([2, 1])
+    query = fc1.text_input("🔍 Search SKU / title",
+                           key=f"flt_q_{P['run'].name}")
+    brand_opts = sorted(b for b in df["Brands"].astype(str).str.strip()
+                        .unique() if b)
+    brands = fc2.multiselect("Brand", brand_opts,
+                             key=f"flt_b_{P['run'].name}")
+    fdf = filter_review_df(df, query, brands)
+    if len(fdf) < len(df):
+        st.caption(f"Showing **{len(fdf)} of {len(df)}** rows. Save edits "
+                   "before changing the filter — unsaved edits in hidden "
+                   "rows are lost on rerender.")
+    # a new filter must reset the editors, else stale edit state maps onto
+    # different rows; hashing the filter into the key does that
+    fsig = hashlib.md5(f"{query}|{'|'.join(brands)}".encode()).hexdigest()[:6]
+
     st.caption("Edit title, prices, URLs and image URLs directly in the "
                "table; tick ✔ to confirm a row for the CSV. Then press "
                "**Save edits & confirmations**.")
@@ -561,18 +578,22 @@ def step_review(P):
                     f"All rows ({len(df)})"])
     parts = []
     with tabs[0]:
-        parts.append(review_editor(df[df["_bucket"] == "review"], "ed_review"))
+        parts.append(review_editor(fdf[fdf["_bucket"] == "review"],
+                                   f"ed_review_{fsig}"))
     with tabs[1]:
         if pending or int(n.get("failed", 0)):
             st.caption("Paste a product URL into **url_link** for each row "
                        "here, save, then press **Crawl all info**.")
-        parts.append(review_editor(df[df["_bucket"] == "failed"], "ed_failed"))
+        parts.append(review_editor(fdf[fdf["_bucket"] == "failed"],
+                                   f"ed_failed_{fsig}"))
     with tabs[2]:
-        parts.append(review_editor(df[df["_bucket"] == "pending"], "ed_pending"))
+        parts.append(review_editor(fdf[fdf["_bucket"] == "pending"],
+                                   f"ed_pending_{fsig}"))
     with tabs[3]:
-        parts.append(review_editor(df[df["_bucket"] == "found"], "ed_found"))
+        parts.append(review_editor(fdf[fdf["_bucket"] == "found"],
+                                   f"ed_found_{fsig}"))
     with tabs[4]:
-        parts.append(review_editor(df, "ed_all"))
+        parts.append(review_editor(fdf, f"ed_all_{fsig}"))
 
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
@@ -586,7 +607,7 @@ def step_review(P):
             st.error("The filled .xlsx is open in Excel — close it and save "
                      "again.")
             return
-        flags = {}
+        flags = {sku: True for sku in confirmed_set(P)}   # hidden rows keep ✔
         for part in ordered:
             for _, row in part.iterrows():
                 flags[str(row["sku"])] = bool(row["confirmed"])

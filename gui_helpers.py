@@ -48,3 +48,20 @@ def sanity_issues(df, min_price=0):
         if url and not _URL_RE.match(url):
             add("url_link is not an http(s) URL")
     return issues
+
+
+def filter_review_df(df, query="", brands=None):
+    """Search + brand filter for the review table. Case-insensitive
+    substring match of `query` against sku and title (regex-escaped), then
+    an exact Brands membership filter. Original index is preserved so
+    edits still map back by SKU."""
+    out = df
+    q = str(query or "").strip()
+    if q:
+        title = (out["title"] if "title" in out.columns
+                 else pd.Series("", index=out.index))
+        hay = (out["sku"].astype(str) + " " + title.astype(str)).str.lower()
+        out = out[hay.str.contains(re.escape(q.lower()), na=False)]
+    if brands:
+        out = out[out["Brands"].astype(str).isin(list(brands))]
+    return out

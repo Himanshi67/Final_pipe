@@ -57,3 +57,44 @@ def test_clean_row_no_issues():
 
 def test_nan_prices_are_not_issues():
     assert sanity_issues(_df([{}]), min_price=8000) == []
+
+
+from gui_helpers import filter_review_df
+
+
+def _rdf():
+    return pd.DataFrame([
+        {"sku": "WM-IFB-01", "title": "IFB 8kg Front Load", "Brands": "IFB"},
+        {"sku": "WM-LG-02", "title": "LG 6.5kg Top Load", "Brands": "LG"},
+        {"sku": "AC-LG-03", "title": "LG 1.5 Ton Split AC", "Brands": "LG"},
+    ])
+
+
+def test_filter_noop_returns_all_rows():
+    assert len(filter_review_df(_rdf())) == 3
+    assert len(filter_review_df(_rdf(), "", [])) == 3
+
+
+def test_filter_query_matches_sku_and_title_case_insensitive():
+    assert list(filter_review_df(_rdf(), "ifb")["sku"]) == ["WM-IFB-01"]
+    assert list(filter_review_df(_rdf(), "top load")["sku"]) == ["WM-LG-02"]
+
+
+def test_filter_query_is_regex_safe():
+    assert list(filter_review_df(_rdf(), "1.5 Ton")["sku"]) == ["AC-LG-03"]
+    assert len(filter_review_df(_rdf(), "1x5 Ton")) == 0   # '.' not a wildcard
+
+
+def test_filter_by_brand_and_combined():
+    assert len(filter_review_df(_rdf(), brands=["LG"])) == 2
+    assert list(filter_review_df(_rdf(), "AC", ["LG"])["sku"]) == ["AC-LG-03"]
+
+
+def test_filter_preserves_original_index():
+    out = filter_review_df(_rdf(), brands=["LG"])
+    assert list(out.index) == [1, 2]
+
+
+def test_filter_without_title_column():
+    df = pd.DataFrame([{"sku": "X1", "Brands": "LG"}])
+    assert len(filter_review_df(df, "x1")) == 1
