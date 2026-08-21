@@ -98,3 +98,45 @@ def test_filter_preserves_original_index():
 def test_filter_without_title_column():
     df = pd.DataFrame([{"sku": "X1", "Brands": "LG"}])
     assert len(filter_review_df(df, "x1")) == 1
+
+
+from gui_helpers import batch_summary
+
+
+def _result():
+    return pd.DataFrame([
+        {"sku": "A", "Images": "https://x/1.webp, https://x/2.webp",
+         "_spec_gaps": "", "Brands": "LG", "sale price": "22,599",
+         "categories": "Home Appliances > Washing Machines"},
+        {"sku": "B", "Images": "", "_spec_gaps": "Capacity, RPM",
+         "Brands": "", "sale price": "8,999",
+         "categories": "Home Appliances > Washing Machines"},
+        {"sku": "C", "Images": "https://x/3.webp", "_spec_gaps": "",
+         "Brands": "IFB", "sale price": "", "categories": ""},
+    ])
+
+
+def test_batch_summary_counts():
+    s = batch_summary(_result())
+    assert s["products"] == 3
+    assert s["zero_image"] == 1
+    assert s["avg_images"] == 1.0          # (2 + 0 + 1) / 3
+    assert s["spec_gap_rows"] == 1
+    assert s["missing_brand"] == 1
+
+
+def test_batch_summary_prices_parse_indian_format():
+    s = batch_summary(_result())
+    assert s["price_min"] == 8999
+    assert s["price_max"] == 22599
+
+
+def test_batch_summary_categories():
+    s = batch_summary(_result())
+    assert s["category_counts"] == {
+        "Home Appliances > Washing Machines": 2, "(none)": 1}
+
+
+def test_batch_summary_empty_frame():
+    s = batch_summary(_result().iloc[0:0])
+    assert s["products"] == 0 and s["price_min"] == 0 and s["avg_images"] == 0.0

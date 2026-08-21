@@ -65,3 +65,35 @@ def filter_review_df(df, query="", brands=None):
     if brands:
         out = out[out["Brands"].astype(str).isin(list(brands))]
     return out
+
+
+def _price_series(s):
+    """'22,599' / '₹22,599' → 22599.0; blanks → NaN. Same stripping the
+    review loader applies (gui.load_filled_df)."""
+    return pd.to_numeric(
+        s.astype(str).str.replace(",", "", regex=False)
+         .str.replace("₹", "", regex=False).str.strip(),
+        errors="coerce")
+
+
+def batch_summary(result):
+    """Aggregate stats over app.process_inventory() output (string cells).
+    Answers 'is this batch import-ready?' at a glance."""
+    imgs = result["Images"].astype(str).str.strip().map(
+        lambda v: len([u for u in v.split(",") if u.strip()]) if v else 0)
+    sale = _price_series(result["sale price"])
+    has_price = sale.notna().any()
+    return {
+        "products": len(result),
+        "zero_image": int((imgs == 0).sum()) if len(result) else 0,
+        "avg_images": round(float(imgs.mean()), 1) if len(result) else 0.0,
+        "spec_gap_rows": int((result["_spec_gaps"].astype(str)
+                              .str.strip() != "").sum()),
+        "missing_brand": int((result["Brands"].astype(str)
+                              .str.strip() == "").sum()),
+        "price_min": int(sale.min()) if has_price else 0,
+        "price_max": int(sale.max()) if has_price else 0,
+        "category_counts": result["categories"].astype(str).str.strip()
+                                 .replace("", "(none)")
+                                 .value_counts().to_dict(),
+    }

@@ -35,7 +35,8 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-from gui_helpers import filter_review_df, flag_value, sanity_issues
+from gui_helpers import (batch_summary, filter_review_df, flag_value,
+                         sanity_issues)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -741,6 +742,18 @@ def step_build(P):
     if with_images < len(result):
         st.warning(f"{len(result) - with_images} product(s) have NO images — "
                    "check image_url in Step 2.")
+
+    s = batch_summary(result)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Avg images/SKU", s["avg_images"])
+    k2.metric("Zero-image rows", s["zero_image"])
+    k3.metric("Rows w/ spec gaps", s["spec_gap_rows"])
+    k4.metric("Missing brand", s["missing_brand"])
+    k5.metric("Price range ₹", f"{s['price_min']:,}–{s['price_max']:,}")
+    if s["category_counts"]:
+        with st.expander("Products per category", expanded=True):
+            st.bar_chart(pd.Series(s["category_counts"], name="products"))
+
     with st.expander("Build log"):
         st.code(buf.getvalue() or "(no output)", language=None)
     st.dataframe(result.head(50))
