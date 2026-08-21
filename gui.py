@@ -752,10 +752,27 @@ def step_build(P):
     # real batch, 2 of 14 - so a "publish confirmed rows" run silently sent a
     # fraction of them. The CSV IS the chosen scope; built_skus lets Step 5
     # verify the file on disk is still the one this build wrote.
-    update_meta(P, validated=False,     # a new CSV must be re-validated
+    # validate the moment the file is written - step 4 stays as a re-check
+    # (e.g. with image inspection toggled) but problems surface here first
+    import validate_csv
+    vdf = pd.read_csv(P["csv"], dtype=str).fillna("")
+    vbuf = io.StringIO()
+    with st.spinner("Validating the new CSV…"):
+        with contextlib.redirect_stdout(vbuf):
+            v_issues = validate_csv.validate_export(
+                vdf, str(P["csv"]), check_images=True)
+    update_meta(P, validated=True, issue_count=len(v_issues),
                 built_scope=scope,
                 built_skus=[str(s) for s in result["sku"].tolist()])
-    st.info("Continue to **Step 4 · Validate**.")
+    st.session_state[f"val_out_{P['run'].name}"] = vbuf.getvalue()
+    if v_issues:
+        st.warning(f"Validation found **{len(v_issues)} issue(s)** — fix the "
+                   "rows in Step 2 and rebuild, or review details in Step 4.")
+        if P["issues"].exists():
+            st.dataframe(pd.read_csv(P["issues"], dtype=str).fillna(""),
+                         hide_index=True, use_container_width=True)
+    else:
+        st.success("Validation passed — continue to **Step 5 · Publish**.")
 
 
 # ------------------------------------------------------------------- step 4 --
