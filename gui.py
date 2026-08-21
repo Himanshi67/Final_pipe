@@ -447,7 +447,17 @@ def load_filled_df(P) -> pd.DataFrame:
     return df
 
 
-def review_editor(df: pd.DataFrame, key: str) -> pd.DataFrame:
+@st.cache_resource
+def category_options() -> list:
+    """Exact category strings from category_map.xlsx, via the same loader
+    app.py snaps against - so anything picked here is a legal snap target."""
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    import app
+    return sorted(set(app.CATEGORY_COMBOS.values()))
+
+
+def review_editor(df: pd.DataFrame, key: str,
+                  cat_options: list | None = None) -> pd.DataFrame:
     view = df.copy()
     view.insert(0, "confirmed", view.pop("confirmed"))
     view.insert(1, "state", view["status"].map(
@@ -472,6 +482,9 @@ def review_editor(df: pd.DataFrame, key: str) -> pd.DataFrame:
                                                            format="%.0f"),
             "sale price": st.column_config.NumberColumn("price ₹",
                                                         format="%.0f"),
+            **({"categories": st.column_config.SelectboxColumn(
+                    "categories", options=cat_options, required=False,
+                    width="medium")} if cat_options else {}),
         })
 
 
@@ -559,6 +572,12 @@ def step_review(P):
     brands = fc2.multiselect("Brand", brand_opts,
                              key=f"flt_b_{P['run'].name}")
     fdf = filter_review_df(df, query, brands)
+    # a SelectboxColumn renders a cell as blank if its current value is not
+    # in options - union in whatever the sheet already holds so nothing
+    # displays empty
+    cat_opts = category_options()
+    cat_opts = cat_opts + sorted(
+        set(df["categories"].astype(str).str.strip()) - set(cat_opts) - {""})
     if len(fdf) < len(df):
         st.caption(f"Showing **{len(fdf)} of {len(df)}** rows. Save edits "
                    "before changing the filter — unsaved edits in hidden "
@@ -579,21 +598,21 @@ def step_review(P):
     parts = []
     with tabs[0]:
         parts.append(review_editor(fdf[fdf["_bucket"] == "review"],
-                                   f"ed_review_{fsig}"))
+                                   f"ed_review_{fsig}", cat_opts))
     with tabs[1]:
         if pending or int(n.get("failed", 0)):
             st.caption("Paste a product URL into **url_link** for each row "
                        "here, save, then press **Crawl all info**.")
         parts.append(review_editor(fdf[fdf["_bucket"] == "failed"],
-                                   f"ed_failed_{fsig}"))
+                                   f"ed_failed_{fsig}", cat_opts))
     with tabs[2]:
         parts.append(review_editor(fdf[fdf["_bucket"] == "pending"],
-                                   f"ed_pending_{fsig}"))
+                                   f"ed_pending_{fsig}", cat_opts))
     with tabs[3]:
         parts.append(review_editor(fdf[fdf["_bucket"] == "found"],
-                                   f"ed_found_{fsig}"))
+                                   f"ed_found_{fsig}", cat_opts))
     with tabs[4]:
-        parts.append(review_editor(fdf, f"ed_all_{fsig}"))
+        parts.append(review_editor(fdf, f"ed_all_{fsig}", cat_opts))
 
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
