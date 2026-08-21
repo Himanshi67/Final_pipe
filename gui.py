@@ -34,6 +34,8 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
+from gui_helpers import flag_value, sanity_issues
+
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 RUNS_DIR = REPO_ROOT / "runs"
@@ -537,6 +539,16 @@ def step_review(P):
     m3.metric("🟡 Needs review", int(n.get("review", 0)))
     m4.metric("🔴 No link / failed", int(n.get("failed", 0)))
     m5.metric("✔ Confirmed", int(df["confirmed"].sum()))
+
+    probs = sanity_issues(
+        df, min_price=flag_value(load_meta(P).get("enricher_flags", []),
+                                 "--min-price"))
+    if probs:
+        st.warning(f"⚠ {len(probs)} data problem(s) in this sheet — fix them "
+                   "here before building the CSV.")
+        with st.expander("Show problems", expanded=len(probs) <= 10):
+            st.dataframe(pd.DataFrame(probs), hide_index=True,
+                         use_container_width=True)
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
                "table; tick ✔ to confirm a row for the CSV. Then press "
