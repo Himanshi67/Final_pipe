@@ -36,7 +36,8 @@ import pandas as pd
 import streamlit as st
 
 from gui_helpers import (batch_summary, filter_review_df, flag_value,
-                         sanity_issues)
+                         parse_image_urls, parse_specs_cell,
+                         raw_sku_for_csv_sku, sanity_issues)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -539,6 +540,140 @@ def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
     return changed
 
 
+def validator_flags(P, raw_sku: str) -> str:
+    """Reasons the last validation run flagged this review row for, if any.
+    The issues CSV carries the PREFIXED sku, so map back by suffix."""
+    if not P["issues"].exists():
+        return ""
+    try:
+        idf = pd.read_csv(P["issues"], dtype=str).fillna("")
+    except Exception:
+        return ""
+    for _, r in idf.iterrows():
+        if raw_sku_for_csv_sku(str(r.get("sku", "")), [raw_sku]) == raw_sku:
+            return str(r.get("reasons", ""))
+    return ""
+
+
+def card_review(P, df, cat_opts):
+    """One SKU per screen: gallery with keep/drop, editable fields, an
+    approve/skip queue. df is the (possibly filtered) review dataframe -
+    prices numeric, confirmed bool, _bucket set."""
+    run = P["run"].name
+    if df.empty:
+        st.info("No rows in the current filter.")
+        return
+    order = {"review": 0, "failed": 1, "pending": 2, "found": 3, "skipped": 4}
+    queue = df.sort_values(
+        by=["confirmed", "_bucket"],
+        key=lambda s: s.map(order) if s.name == "_bucket" else s,
+    ).reset_index(drop=True)
+
+    ikey = f"card_i_{run}"
+    i = min(st.session_state.get(ikey, 0), len(queue) - 1)
+    row = queue.iloc[i]
+    sku = str(row["sku"])
+
+    def goto(j):
+        st.session_state[ikey] = max(0, min(j, len(queue) - 1))
+        st.rerun()
+
+    st.progress((i + 1) / len(queue),
+                text=f"Card {i + 1} / {len(queue)} — "
+                     f"{int(queue['confirmed'].sum())} confirmed")
+    st.subheader(f"{BADGE[row['_bucket']]} {sku}")
+    st.caption(str(row["status"]))
+    src = str(row.get("url_link", "") or "").strip()
+    if src:
+        st.markdown(f"🔗 [Open source page]({src})")
+    flagged = validator_flags(P, sku)
+    if flagged:
+        st.warning(f"Validator flagged this SKU last run: {flagged}")
+
+    urls = parse_image_urls(row.get("image_url", ""))
+    dropped_now = set(parse_image_urls(row.get("dropped_images", "")))
+    keeps = {}
+    if urls:
+        cols = st.columns(min(4, len(urls)))
+        for j, u in enumerate(urls):
+            with cols[j % len(cols)]:
+                st.image(u, use_container_width=True)
+                keeps[u] = st.checkbox("keep", value=u not in dropped_now,
+                                       key=f"keep_{run}_{sku}_{j}")
+    else:
+        st.info("No images on this row.")
+
+    e1, e2, e3 = st.columns([2, 1, 1])
+    title = e1.text_input("Title", str(row.get("title", "")),
+                          key=f"ct_{run}_{sku}")
+    mrp_s = e2.text_input(
+        "MRP ₹", "" if pd.isna(row["regular price"])
+        else f"{row['regular price']:.0f}", key=f"cm_{run}_{sku}")
+    sale_s = e3.text_input(
+        "Sale ₹", "" if pd.isna(row["sale price"])
+        else f"{row['sale price']:.0f}", key=f"cs_{run}_{sku}")
+    url = st.text_input("Product URL", src, key=f"cu_{run}_{sku}")
+    cat_now = str(row.get("categories", "") or "").strip()
+    cat_list = [""] + list(cat_opts)
+    cat = st.selectbox("Category", cat_list,
+                       index=cat_list.index(cat_now) if cat_now in cat_list
+                       else 0, key=f"cc_{run}_{sku}")
+
+    pairs = parse_specs_cell(row.get("specs", ""))
+    if pairs:
+        with st.expander(f"Scraped specs ({len(pairs)})"):
+            st.table(pd.DataFrame(pairs, columns=["spec", "value"]))
+
+    def _num(s):
+        return pd.to_numeric(str(s).replace(",", "").replace("₹", "")
+                             .strip(), errors="coerce")
+
+    def save(confirm):
+        part = pd.DataFrame([{
+            "sku": sku,
+            "confirmed": bool(row["confirmed"]) if confirm is None
+            else bool(confirm),
+            "title": title.strip(),
+            "regular price": _num(mrp_s),
+            "sale price": _num(sale_s),
+            "url_link": url.strip(),
+            "image_url": str(row.get("image_url", "") or ""),
+            "categories": cat if cat else cat_now,
+            "Brands": str(row.get("Brands", "") or ""),
+            "dropped_images": ", ".join(
+                u for u in urls if not keeps.get(u, True)),
+        }])
+        try:
+            write_edits_back(P, df, [part])
+        except PermissionError:
+            st.error("The filled .xlsx is open in Excel — close it and "
+                     "retry.")
+            return False
+        if confirm is not None:
+            flags = {s: True for s in confirmed_set(P)}
+            flags[sku] = bool(confirm)
+            save_confirmed(P, flags)
+        return True
+
+    b1, b2, b3, b4 = st.columns(4)
+    # a 'failed' row has no verified product page - approving it could pull
+    # an unvetted row into a confirmed-scope build
+    can_approve = row["_bucket"] != "failed"
+    if b1.button("✅ Approve & next", type="primary", disabled=not can_approve,
+                 help=None if can_approve else "Paste a product URL and crawl "
+                 "it first — this row has no verified page.",
+                 key=f"ap_{run}_{sku}"):
+        if save(True):
+            goto(i + 1)
+    if b2.button("💾 Save & next", key=f"sv_{run}_{sku}"):
+        if save(None):
+            goto(i + 1)
+    if b3.button("→ Skip", key=f"sk_{run}_{sku}"):
+        goto(i + 1)
+    if b4.button("← Back", disabled=i == 0, key=f"bk_{run}_{sku}"):
+        goto(i - 1)
+
+
 def step_review(P):
     st.header("2 · Review & Confirm")
     if not P["filled"].exists():
@@ -594,6 +729,15 @@ def step_review(P):
     # a new filter must reset the editors, else stale edit state maps onto
     # different rows; hashing the filter into the key does that
     fsig = hashlib.md5(f"{query}|{'|'.join(brands)}".encode()).hexdigest()[:6]
+
+    mode = st.radio("View", ["Table", "Card review"], horizontal=True,
+                    key=f"mode_{P['run'].name}",
+                    help="Card review walks the rows one SKU at a time with "
+                         "the full image gallery. Bulk actions (confirm all, "
+                         "crawl, retries) live in the Table view.")
+    if mode == "Card review":
+        card_review(P, fdf, cat_opts)
+        return
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
                "table; tick ✔ to confirm a row for the CSV. Then press "
