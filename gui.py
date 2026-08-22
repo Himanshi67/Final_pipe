@@ -597,7 +597,7 @@ def card_review(P, df, cat_opts):
         cols = st.columns(min(4, len(urls)))
         for j, u in enumerate(urls):
             with cols[j % len(cols)]:
-                st.image(u, use_container_width=True)
+                st.image(u, width="stretch")
                 keeps[u] = st.checkbox("keep", value=u not in dropped_now,
                                        key=f"keep_{run}_{sku}_{j}")
     else:
@@ -706,7 +706,7 @@ def step_review(P):
                    "here before building the CSV.")
         with st.expander("Show problems", expanded=len(probs) <= 10):
             st.dataframe(pd.DataFrame(probs), hide_index=True,
-                         use_container_width=True)
+                         width="stretch")
 
     fc1, fc2 = st.columns([2, 1])
     query = fc1.text_input("🔍 Search SKU / title",
@@ -935,7 +935,7 @@ def step_build(P):
                    "rows in Step 2 and rebuild, or review details in Step 4.")
         if P["issues"].exists():
             st.dataframe(pd.read_csv(P["issues"], dtype=str).fillna(""),
-                         hide_index=True, use_container_width=True)
+                         hide_index=True, width="stretch")
             fix_in_review_controls(
                 P, pd.read_csv(P["issues"], dtype=str).fillna(""), "build")
     else:
