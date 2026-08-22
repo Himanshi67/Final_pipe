@@ -37,7 +37,8 @@ import streamlit as st
 
 from gui_helpers import (BADGE, batch_summary, classify, eta_text,
                          filter_review_df, flag_value, parse_enricher_log,
-                         parse_image_urls, parse_specs_cell,
+                         parse_image_urls, parse_publish_output,
+                         parse_specs_cell,
                          raw_sku_for_csv_sku, sanity_issues)
 
 REPO_ROOT = Path(__file__).parent
@@ -1101,7 +1102,16 @@ def step_publish(P):
         with st.spinner("Dry run…"):
             code, out = run_publish_pinned([])
         st.session_state[dry_key] = (code == 0)
-        st.code(out[-8000:], language=None)
+        rows, _ = parse_publish_output(out)
+        if rows:
+            creates = sum(r["action"] == "create" for r in rows)
+            c1, c2 = st.columns(2)
+            c1.metric("Would create", creates)
+            c2.metric("Would update", len(rows) - creates)
+            st.dataframe(pd.DataFrame(rows)[["action", "sku"]],
+                         hide_index=True, width="stretch")
+        with st.expander("Raw dry-run output"):
+            st.code(out[-8000:], language=None)
         (st.success if code == 0 else st.error)(
             "Dry run finished" if code == 0 else "Dry run FAILED — fix before "
             "committing")
@@ -1127,7 +1137,23 @@ def step_publish(P):
             extra += ["--status", "publish"]
         with st.spinner(f"Publishing {len(publish_skus)} product(s)…"):
             code, out = run_publish_pinned(extra)
-        st.code(out[-8000:], language=None)
+        rows, totals = parse_publish_output(out)
+        if rows:
+            rdf = pd.DataFrame(rows)[["action", "sku", "result", "link",
+                                      "error"]]
+            st.dataframe(rdf, hide_index=True, width="stretch",
+                         column_config={"link": st.column_config.LinkColumn(
+                             "store link")})
+        if totals:
+            t1, t2, t3 = st.columns(3)
+            t1.metric("Created", totals["created"])
+            t2.metric("Updated", totals["updated"])
+            t3.metric("Failed", totals["failed"])
+        failed = [r["sku"] for r in rows if r["result"] == "failed"]
+        st.session_state[f"pub_failed_{P['run'].name}"] = \
+            {"skus": failed, "extra": extra} if failed else None
+        with st.expander("Raw publish output"):
+            st.code(out[-8000:], language=None)
         if code == 0:
             st.success(f"Done — {len(publish_skus)} product(s) upserted as "
                        + ("LIVE products." if go_live else "drafts."))
@@ -1138,6 +1164,27 @@ def step_publish(P):
         else:
             st.error("Publish FAILED — see output above; full log in "
                      f"{P['publish_log'].name}")
+
+    pf = st.session_state.get(f"pub_failed_{P['run'].name}")
+    if pf and pf["skus"]:
+        st.subheader("Ⅲ · Retry failures")
+        st.caption(f"{len(pf['skus'])} SKU(s) failed on the last commit: "
+                   + ", ".join(pf["skus"][:10])
+                   + ("…" if len(pf["skus"]) > 10 else ""))
+        if st.button(f"🔁 Retry {len(pf['skus'])} failed SKU(s)"):
+            flags = []
+            for s in pf["skus"]:
+                flags += ["--sku", s]
+            with st.spinner("Retrying…"):
+                code, out = run_publish(P, flags + pf["extra"])
+            rows, _ = parse_publish_output(out)
+            still = [r["sku"] for r in rows if r["result"] == "failed"]
+            st.session_state[f"pub_failed_{P['run'].name}"] = \
+                {"skus": still, "extra": pf["extra"]} if still else None
+            st.code(out[-4000:], language=None)
+            (st.success if not still else st.error)(
+                "All retried SKUs published." if not still
+                else f"{len(still)} still failing — see output above.")
 
 
 # --------------------------------------------------------------------- main --
