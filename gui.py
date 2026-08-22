@@ -1268,9 +1268,13 @@ def pick_run() -> Path | None:
                   key=lambda d: d.stat().st_mtime, reverse=True)
     HOME, NEW = "🏠 All runs", "➕ New run…"
     options = [HOME, NEW] + [d.name for d in runs]
-    # land on the latest run as before; Home is one click away
+    # land on the latest run as before; Home is one click away. With NO
+    # runs yet the default must be NEW, not HOME - Home's empty state tells
+    # you to create a run in the sidebar, but the name box only renders for
+    # NEW, so defaulting to Home would leave a fresh install unable to make
+    # its first run (tests	est_gui_ui.py::test_create_run pins this).
     sel = st.sidebar.selectbox("Batch / run", options,
-                               index=2 if runs else 0)
+                               index=2 if runs else 1)
     if sel == HOME:
         return None
     if sel != NEW:
