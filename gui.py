@@ -272,11 +272,6 @@ def tail_text(path: Path, max_bytes=20000) -> str:
         return ""
 
 
-def rows_done(log_text: str) -> int:
-    hits = re.findall(r"^\[(\d+)\] Row \d+", log_text, flags=re.M)
-    return int(hits[-1]) if hits else 0
-
-
 def enricher_panel(P):
     """Live progress while the enricher subprocess runs. A fragment so only
     this panel re-renders every 2 s, not the whole page."""
@@ -284,15 +279,37 @@ def enricher_panel(P):
 
     @st.fragment(run_every=2.0)
     def _panel():
-        text = tail_text(P["log"])
-        done = rows_done(text)
-        total = load_meta(P).get("total_rows") or 0
+        # stats want the WHOLE log (a 20 KB tail would under-count the
+        # tallies); these files are small enough to re-read every 2 s
+        full = (P["log"].read_text(encoding="utf-8", errors="replace")
+                if P["log"].exists() else "")
+        stats = parse_enricher_log(full)
+        meta = load_meta(P)
+        total = meta.get("total_rows") or 0
+        done = stats["done"]
         running = enricher_running(P)
         if total:
             frac = min(done / total, 0.97 if running else 1.0)
             st.progress(frac, text=f"{done} / {total} SKUs processed this run")
-        lines = [ln for ln in text.splitlines() if ln.strip()][-25:]
-        st.code("\n".join(lines) or "waiting for first output…", language=None)
+        bits = []
+        if stats["buckets"]:
+            bits.append("  ".join(f"{BADGE[b]} {n}" for b, n in
+                                  sorted(stats["buckets"].items())))
+        if stats["serper_calls"]:
+            bits.append(f"{stats['serper_calls']} serper call(s) — free "
+                        "tier 2,500/mo")
+        replays = stats["cached_searches"] + stats["cached_pages"]
+        if replays:
+            bits.append(f"{replays} cache replay(s)")
+        eta = eta_text(done, total, meta.get("enricher_started"),
+                       time.time())
+        if running and eta:
+            bits.append(eta)
+        if bits:
+            st.caption("  ·  ".join(bits))
+        lines = [ln for ln in full.splitlines() if ln.strip()][-25:]
+        st.code("\n".join(lines) or "waiting for first output…",
+                language=None)
         if not running and st.session_state.get(run_key):
             st.session_state[run_key] = False
             update_meta(P, enricher_pid=None)
