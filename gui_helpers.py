@@ -207,3 +207,39 @@ def eta_text(done, total, started_epoch, now_epoch):
         return ""
     minutes = int(per * (total - done) // 60)
     return f"~{minutes} min left" if minutes >= 1 else "under a minute left"
+
+
+_PUB_ACTION_RE = re.compile(r"^  (CREATE|UPDATE) (\S+)$")
+_PUB_ID_RE = re.compile(r"^    -> id (\d+)\s+(\S+)")
+_PUB_FAIL_RE = re.compile(r"^    !! (.+)")
+_PUB_SUMMARY_RE = re.compile(
+    r"^Done: (\d+) created, (\d+) updated, (\d+) failed\.")
+
+
+def parse_publish_output(text):
+    """wc_publish.py stdout -> (rows, totals). Grammar pinned by
+    wc_publish.py's print calls; dry runs emit action lines but no
+    outcome, so result stays ''. Taxonomy side-effect lines ('~ would
+    create …') are deeper-indented and never match the action regex."""
+    rows, totals, current = [], {}, None
+    for ln in (text or "").splitlines():
+        m = _PUB_ACTION_RE.match(ln)
+        if m:
+            current = {"sku": m.group(2), "action": m.group(1).lower(),
+                       "result": "", "link": "", "error": ""}
+            rows.append(current)
+            continue
+        if current is not None:
+            m = _PUB_ID_RE.match(ln)
+            if m:
+                current["result"], current["link"] = "ok", m.group(2)
+                continue
+            m = _PUB_FAIL_RE.match(ln)
+            if m:
+                current["result"], current["error"] = "failed", m.group(1)
+                continue
+        m = _PUB_SUMMARY_RE.match(ln)
+        if m:
+            totals = {"created": int(m.group(1)), "updated": int(m.group(2)),
+                      "failed": int(m.group(3))}
+    return rows, totals

@@ -274,3 +274,50 @@ def test_eta_text():
     assert eta_text(40, 40, 1000.0, 1600.0) == ""     # finished
     assert eta_text(10, 0, 1000.0, 1600.0) == ""      # no total known
     assert eta_text(10, 40, None, 1600.0) == ""       # no start time
+
+
+from gui_helpers import parse_publish_output
+
+DRY_OUT = """DRY RUN: 2 product(s) from wordpress_ready.csv -> https://s.in  (images: url, status: draft for new, unchanged for existing)
+  CREATE WM-HW100
+    would send 14 fields, 3 image(s)
+    ~ would create brand: Haier
+  UPDATE AP-X200
+    would send 12 fields, 2 image(s)
+
+Dry run complete - nothing was written. Re-run with --commit to apply.
+"""
+
+COMMIT_OUT = """PUBLISHING: 2 product(s) from wordpress_ready.csv -> https://s.in  (images: url, status: draft for new, unchanged for existing)
+  CREATE WM-HW100
+    sending 14 fields, 3 image(s)
+    -> id 4211  https://shreejeeelectronics.in/product/haier-hw100
+  UPDATE AP-X200
+    sending 12 fields, 2 image(s)
+    !! HTTP 500 from media endpoint
+
+Done: 1 created, 0 updated, 1 failed.
+"""
+
+
+def test_parse_publish_dry_run():
+    rows, totals = parse_publish_output(DRY_OUT)
+    assert [(r["action"], r["sku"], r["result"]) for r in rows] == [
+        ("create", "WM-HW100", ""), ("update", "AP-X200", "")]
+    assert totals == {}
+
+
+def test_parse_publish_commit():
+    rows, totals = parse_publish_output(COMMIT_OUT)
+    assert rows[0]["result"] == "ok"
+    assert rows[0]["link"] == \
+        "https://shreejeeelectronics.in/product/haier-hw100"
+    assert rows[1]["result"] == "failed"
+    assert rows[1]["error"] == "HTTP 500 from media endpoint"
+    assert totals == {"created": 1, "updated": 0, "failed": 1}
+
+
+def test_parse_publish_ignores_taxonomy_and_noise():
+    rows, _ = parse_publish_output(DRY_OUT)
+    assert all(r["sku"] not in ("brand:", "Haier") for r in rows)
+    assert parse_publish_output("") == ([], {})
