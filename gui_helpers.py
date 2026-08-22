@@ -151,3 +151,59 @@ def raw_sku_for_csv_sku(csv_sku, raw_skus):
         if s and (c == s or c.endswith("-" + s)) and len(s) > best_len:
             best, best_len = raw, len(s)
     return best
+
+
+def classify(status) -> str:
+    s = str(status or "").strip()
+    u = s.upper()
+    # two-pass flow (--discover): a link is waiting to be looked at, and the
+    # row is deliberately NOT importable yet. These must not read as failures.
+    if u.startswith("NEEDS CRAWL"):
+        return "review" if "CHECK LINK" in u else "pending"
+    if u.startswith("NEEDS LINK"):
+        return "failed"      # nothing found - a human has to paste a URL
+    if u.startswith("FOUND"):
+        return "review" if " - " in s else "found"
+    if u.startswith(("CLOSE", "CHECK")):
+        return "review"
+    if u.startswith("SKIPPED"):
+        return "skipped"
+    return "failed"          # NOT FOUND / ERROR / blank (not processed)
+
+
+BADGE = {"found": "🟢", "review": "🟡", "failed": "🔴", "skipped": "⚪",
+         "pending": "🔵"}
+
+_ROW_RE = re.compile(r"^\[(\d+)\] Row \d+", re.M)
+_STATUS_RE = re.compile(r"^    -> (.+)$", re.M)
+_SERPER_RE = re.compile(r"^\s*\[(\d+) serper\.dev call\(s\) this run", re.M)
+
+
+def parse_enricher_log(text):
+    """Progress facts from the enricher's log. Grammar pinned by
+    sku_enricher.py's log() calls - see the plan header for line formats."""
+    done_hits = _ROW_RE.findall(text or "")
+    buckets = {}
+    for status in _STATUS_RE.findall(text or ""):
+        b = classify(status)
+        buckets[b] = buckets.get(b, 0) + 1
+    serper = _SERPER_RE.findall(text or "")
+    return {
+        "done": int(done_hits[-1]) if done_hits else 0,
+        "buckets": buckets,
+        "serper_calls": int(serper[-1]) if serper else 0,
+        "cached_searches": (text or "").count("(cached search)"),
+        "cached_pages": (text or "").count("(cached page"),
+    }
+
+
+def eta_text(done, total, started_epoch, now_epoch):
+    """Remaining-time estimate from this run's average pace; '' when it
+    cannot be estimated honestly."""
+    if not done or not total or not started_epoch or done >= total:
+        return ""
+    per = (now_epoch - started_epoch) / done
+    if per <= 0:
+        return ""
+    minutes = int(per * (total - done) // 60)
+    return f"~{minutes} min left" if minutes >= 1 else "under a minute left"

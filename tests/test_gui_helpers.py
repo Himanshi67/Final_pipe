@@ -216,3 +216,61 @@ def test_app_filter_dropped_urls():
                                    ) == ["https://a/2.jpg"]
     assert app.filter_dropped_urls(urls, "") == urls
     assert app.filter_dropped_urls(urls, None) == urls
+
+
+from gui_helpers import classify, BADGE, parse_enricher_log, eta_text
+
+SAMPLE_LOG = """
+[1] Row 2: WM-HW100
+      (cached search)
+      (cached page, 214 KB)
+    -> FOUND (croma.com)
+
+[2] Row 3: X200
+    -> FOUND (amazon.in) - no price shown
+
+[3] Row 4: Y300
+    [7 serper.dev call(s) this run so far - the free tier is 2,500/month]
+    -> NOT FOUND - nothing matched
+
+[4] Row 5: Z400
+    -> NEEDS CRAWL (flipkart.com)
+"""
+
+
+def test_classify_moved_intact():
+    assert classify("FOUND (croma.com)") == "found"
+    assert classify("FOUND (x) - no price shown") == "review"
+    assert classify("NEEDS CRAWL (x)") == "pending"
+    assert classify("NEEDS CRAWL - CHECK LINK (x)") == "review"
+    assert classify("NEEDS LINK - no url_link in this row") == "failed"
+    assert classify("CLOSE MATCH - CHECK (x)") == "review"
+    assert classify("SKIPPED - same unit as row 3") == "skipped"
+    assert classify("") == "failed"
+    assert set(BADGE) == {"found", "review", "failed", "skipped", "pending"}
+
+
+def test_parse_enricher_log_counts():
+    s = parse_enricher_log(SAMPLE_LOG)
+    assert s["done"] == 4
+    assert s["buckets"] == {"found": 1, "review": 1, "failed": 1,
+                            "pending": 1}
+    assert s["serper_calls"] == 7
+    assert s["cached_searches"] == 1
+    assert s["cached_pages"] == 1
+
+
+def test_parse_enricher_log_empty():
+    s = parse_enricher_log("")
+    assert s == {"done": 0, "buckets": {}, "serper_calls": 0,
+                 "cached_searches": 0, "cached_pages": 0}
+
+
+def test_eta_text():
+    # 10 of 40 done in 600 s -> 60 s/SKU -> 30 left -> 1800 s
+    assert eta_text(10, 40, 1000.0, 1600.0) == "~30 min left"
+    assert eta_text(39, 40, 1000.0, 1030.0) == "under a minute left"
+    assert eta_text(0, 40, 1000.0, 1600.0) == ""      # nothing done yet
+    assert eta_text(40, 40, 1000.0, 1600.0) == ""     # finished
+    assert eta_text(10, 0, 1000.0, 1600.0) == ""      # no total known
+    assert eta_text(10, 40, None, 1600.0) == ""       # no start time

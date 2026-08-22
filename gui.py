@@ -35,7 +35,8 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-from gui_helpers import (batch_summary, filter_review_df, flag_value,
+from gui_helpers import (BADGE, batch_summary, classify, eta_text,
+                         filter_review_df, flag_value, parse_enricher_log,
                          parse_image_urls, parse_specs_cell,
                          raw_sku_for_csv_sku, sanity_issues)
 
@@ -301,30 +302,6 @@ def enricher_panel(P):
     if st.button("⏹ Stop enrichment (progress is saved)", key=f"cancel_{P['run'].name}"):
         cancel_enricher(P)
         st.rerun()
-
-
-# ----------------------------------------------------------- status buckets --
-
-def classify(status) -> str:
-    s = str(status or "").strip()
-    u = s.upper()
-    # two-pass flow (--discover): a link is waiting to be looked at, and the
-    # row is deliberately NOT importable yet. These must not read as failures.
-    if u.startswith("NEEDS CRAWL"):
-        return "review" if "CHECK LINK" in u else "pending"
-    if u.startswith("NEEDS LINK"):
-        return "failed"      # nothing found - a human has to paste a URL
-    if u.startswith("FOUND"):
-        return "review" if " - " in s else "found"
-    if u.startswith(("CLOSE", "CHECK")):
-        return "review"
-    if u.startswith("SKIPPED"):
-        return "skipped"
-    return "failed"          # NOT FOUND / ERROR / blank (not processed)
-
-
-BADGE = {"found": "🟢", "review": "🟡", "failed": "🔴", "skipped": "⚪",
-         "pending": "🔵"}
 
 
 # ------------------------------------------------------------------- step 1 --
