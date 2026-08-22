@@ -97,3 +97,57 @@ def batch_summary(result):
                                  .replace("", "(none)")
                                  .value_counts().to_dict(),
     }
+
+
+# split only at commas that start a new URL - same rule as
+# app.split_image_list, so commas inside a URL survive
+_IMG_SPLIT_RE = re.compile(r",(?=\s*(?:https?://|//))")
+
+# mirror of app.prefixed_sku's sanitization (app.py:605-612)
+_SKU_SANITIZE = (
+    (re.compile(r"\s+"), "-"),
+    (re.compile(r'[\/:*?"<>|()\[\]{}]+'), "-"),
+    (re.compile(r"-{2,}"), "-"),
+)
+
+
+def parse_image_urls(cell):
+    """Comma-separated image URLs from a review-sheet cell -> list."""
+    text = str(cell or "").strip()
+    if not text:
+        return []
+    return [u.strip() for u in _IMG_SPLIT_RE.split(text) if u.strip()]
+
+
+def parse_specs_cell(cell):
+    """'Label: Value | Label: Value' (sku_enricher.format_specs) ->
+    [(label, value)]. format_specs strips ':' and '|' out of labels, so
+    splitting on ' | ' then the FIRST ':' is lossless."""
+    pairs = []
+    for part in str(cell or "").split(" | "):
+        if ":" in part:
+            label, value = part.split(":", 1)
+            if label.strip() and value.strip():
+                pairs.append((label.strip(), value.strip()))
+    return pairs
+
+
+def _sanitized_sku(raw):
+    s = str(raw or "").strip()
+    for rx, rep in _SKU_SANITIZE:
+        s = rx.sub(rep, s)
+    return s.strip("-")
+
+
+def raw_sku_for_csv_sku(csv_sku, raw_skus):
+    """Map a CSV/validation sku (app.prefixed_sku output) back to the raw
+    sku the review sheet holds. The prefixed form is sanitize(raw) with an
+    optional 'XX-' category prefix, so match sanitized suffixes; the
+    longest raw wins; None when nothing matches."""
+    c = str(csv_sku or "").strip()
+    best, best_len = None, -1
+    for raw in raw_skus:
+        s = _sanitized_sku(raw)
+        if s and (c == s or c.endswith("-" + s)) and len(s) > best_len:
+            best, best_len = raw, len(s)
+    return best

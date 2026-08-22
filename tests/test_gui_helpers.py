@@ -140,3 +140,42 @@ def test_batch_summary_categories():
 def test_batch_summary_empty_frame():
     s = batch_summary(_result().iloc[0:0])
     assert s["products"] == 0 and s["price_min"] == 0 and s["avg_images"] == 0.0
+
+
+from gui_helpers import (parse_image_urls, parse_specs_cell,
+                         raw_sku_for_csv_sku)
+
+
+def test_parse_image_urls_basic_and_blank():
+    cell = "https://a/1.jpg, https://a/2.jpg,https://a/3.jpg"
+    assert parse_image_urls(cell) == [
+        "https://a/1.jpg", "https://a/2.jpg", "https://a/3.jpg"]
+    assert parse_image_urls("") == []
+    assert parse_image_urls(None) == []
+
+
+def test_parse_image_urls_comma_inside_url_survives():
+    cell = "https://a/im,g/1.jpg, https://b/2.jpg"
+    assert parse_image_urls(cell) == ["https://a/im,g/1.jpg", "https://b/2.jpg"]
+
+
+def test_parse_specs_cell_pairs_and_colon_in_value():
+    cell = "Capacity: 8 kg | Ratio: 16:9 | Warranty: 2 years"
+    assert parse_specs_cell(cell) == [("Capacity", "8 kg"), ("Ratio", "16:9"),
+                                      ("Warranty", "2 years")]
+    assert parse_specs_cell("") == []
+    assert parse_specs_cell("no separator here") == []
+
+
+def test_raw_sku_untouched_and_prefixed():
+    assert raw_sku_for_csv_sku("WM-HW100", ["WM-HW100", "X200"]) == "WM-HW100"
+    assert raw_sku_for_csv_sku("AP-X200", ["WM-HW100", "X200"]) == "X200"
+
+
+def test_raw_sku_sanitized_spaces():
+    assert raw_sku_for_csv_sku("AP-AB-100", ["AB 100"]) == "AB 100"
+
+
+def test_raw_sku_longest_match_wins_and_none():
+    assert raw_sku_for_csv_sku("AP-AB-100", ["100", "AB 100"]) == "AB 100"
+    assert raw_sku_for_csv_sku("AP-ZZZ", ["AB 100"]) is None
