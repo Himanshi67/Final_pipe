@@ -936,11 +936,30 @@ def step_build(P):
         if P["issues"].exists():
             st.dataframe(pd.read_csv(P["issues"], dtype=str).fillna(""),
                          hide_index=True, use_container_width=True)
+            fix_in_review_controls(
+                P, pd.read_csv(P["issues"], dtype=str).fillna(""), "build")
     else:
         st.success("Validation passed — continue to **Step 5 · Publish**.")
 
 
 # ------------------------------------------------------------------- step 4 --
+
+def fix_in_review_controls(P, idf, key: str):
+    """Pick a flagged SKU and jump to Step 2 with the search prefilled.
+    The issues CSV holds prefixed SKUs; map back to the raw sheet sku so
+    the review filter actually matches."""
+    skus = [s for s in dict.fromkeys(idf["sku"].astype(str)) if s.strip()]
+    if not skus:
+        return
+    raw = load_filled_df(P)["sku"].astype(str).tolist()
+    c1, c2 = st.columns([2, 1])
+    pick = c1.selectbox("Flagged SKU", skus, key=f"fix_pick_{key}")
+    if c2.button("🔎 Fix in review", key=f"fix_btn_{key}"):
+        st.session_state[f"flt_q_{P['run'].name}"] = (
+            raw_sku_for_csv_sku(pick, raw) or pick)
+        st.session_state["jump_step"] = 1        # steps[1] = Review
+        st.rerun()
+
 
 def step_validate(P):
     st.header("4 · Validate")
@@ -982,6 +1001,8 @@ def step_validate(P):
             st.code(out, language=None)
     if issues and P["issues"].exists():
         st.dataframe(pd.read_csv(P["issues"], dtype=str).fillna(""))
+        fix_in_review_controls(
+            P, pd.read_csv(P["issues"], dtype=str).fillna(""), "val")
         st.warning(f"{issues} issue(s) — fix them in Step 2 and rebuild, or "
                    "tick 'proceed anyway' in Step 5.")
     if not issues:
@@ -1166,7 +1187,13 @@ def main():
              ("4 · Validate", P["csv"].exists(), step_validate),
              ("5 · Publish", P["csv"].exists(), step_publish)]
     labels = [f"{name}  {'' if ok else '🔒'}" for name, ok, _ in steps]
-    choice = st.sidebar.radio("Steps", labels)
+    # a step can request a jump (e.g. "fix this SKU in review") by setting
+    # jump_step before st.rerun(); labels are rebuilt every run, so resolve
+    # the index here, never store a label string
+    if "jump_step" in st.session_state:
+        st.session_state["step_radio"] = labels[
+            st.session_state.pop("jump_step")]
+    choice = st.sidebar.radio("Steps", labels, key="step_radio")
     idx = labels.index(choice)
 
     st.sidebar.divider()
