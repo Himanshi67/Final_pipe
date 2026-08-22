@@ -852,6 +852,39 @@ def step_build(P):
     seo_plugin = st.selectbox("SEO plugin", ["yoast", "rankmath", "both"],
                               disabled=not seo)
 
+    if seo:
+        with st.expander("👁 SEO preview — first 5 rows in scope",
+                         expanded=False):
+            os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+            import app as _app
+            pf = pd.read_excel(P["filled"], dtype=str).fillna("")
+            if scope == "confirmed":
+                pf = pf[pf["sku"].astype(str).isin(conf)]
+
+            def _p(v):
+                return str(v or "").replace(",", "").replace("₹", "").strip()
+
+            sample = []
+            for _, r in pf.head(5).iterrows():
+                sample.append({"sku": r.get("sku", ""),
+                               **_app.seo_fields(
+                                   str(r.get("sku", "")),
+                                   str(r.get("title", "")),
+                                   str(r.get("Brands", "")),
+                                   str(r.get("categories", "")),
+                                   parse_specs_cell(r.get("specs", "")),
+                                   _p(r.get("regular price", "")),
+                                   _p(r.get("sale price", "")),
+                                   plugin=seo_plugin)})
+            if sample:
+                st.dataframe(pd.DataFrame(sample), hide_index=True,
+                             width="stretch")
+                st.caption("These exact columns are appended to the CSV "
+                           "when you build with SEO on. Untick the checkbox "
+                           "to build without them.")
+            else:
+                st.info("No rows in scope to preview.")
+
     if not st.button("🛠 Build CSV", type="primary"):
         if P["csv"].exists():
             st.success(f"CSV already built: {P['csv'].name} — rebuild any "
