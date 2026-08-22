@@ -243,3 +243,52 @@ def parse_publish_output(text):
             totals = {"created": int(m.group(1)), "updated": int(m.group(2)),
                       "failed": int(m.group(3))}
     return rows, totals
+
+
+def run_stage(meta, files):
+    """Highest pipeline stage a run has reached, from its meta dict and
+    {'input','filled','csv'} existence flags."""
+    if meta.get("published"):
+        return "published"
+    if meta.get("validated"):
+        return "validated"
+    if files.get("csv"):
+        return "built"
+    if files.get("filled"):
+        return "enriched"
+    if files.get("input"):
+        return "uploaded"
+    return "created"
+
+
+def image_basenames_from_csv(csv_df):
+    """Basenames of every image URL the CSV references. The Images column
+    lists exactly the files the build downloaded, so these names are safe
+    to copy out of product_images_for_upload when archiving a run."""
+    names = []
+    if "Images" not in csv_df.columns:
+        return names
+    for cell in csv_df["Images"].astype(str):
+        for u in cell.split(","):
+            u = u.strip()
+            if u:
+                names.append(u.rsplit("/", 1)[-1])
+    return names
+
+
+def sheet_combos(df):
+    """'Parent > Sub' combos from a category-map dataframe - a light
+    mirror of app.load_category_map for DIFFING edits only (the build
+    still snaps via app.py). Col 0 parent, col 1 subcategories."""
+    combos = set()
+    for _, row in df.iterrows():
+        vals = row.tolist()
+        parent = str(vals[0] if vals else "").strip()
+        if not parent or parent.lower() == "parent category":
+            continue
+        for sub in re.split(r"[,;|\n]", str(vals[1] if len(vals) > 1
+                                            else "")):
+            sub = sub.strip()
+            if sub:
+                combos.add(f"{parent} > {sub}")
+    return combos

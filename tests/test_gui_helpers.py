@@ -321,3 +321,46 @@ def test_parse_publish_ignores_taxonomy_and_noise():
     rows, _ = parse_publish_output(DRY_OUT)
     assert all(r["sku"] not in ("brand:", "Haier") for r in rows)
     assert parse_publish_output("") == ([], {})
+
+
+from gui_helpers import image_basenames_from_csv, run_stage, sheet_combos
+
+
+def test_run_stage_ladder():
+    f0 = {"input": False, "filled": False, "csv": False}
+    assert run_stage({}, f0) == "created"
+    assert run_stage({}, {**f0, "input": True}) == "uploaded"
+    assert run_stage({}, {**f0, "input": True, "filled": True}) == "enriched"
+    assert run_stage({}, {"input": True, "filled": True, "csv": True}) \
+        == "built"
+    assert run_stage({"validated": True},
+                     {"input": True, "filled": True, "csv": True}) \
+        == "validated"
+    assert run_stage({"validated": True, "published": "2026-08-22T10:00:00"},
+                     {"input": True, "filled": True, "csv": True}) \
+        == "published"
+
+
+def test_image_basenames_from_csv():
+    df = pd.DataFrame([
+        {"Images": "https://s.in/up/2026/08/WM-HW100_1.webp, "
+                   "https://s.in/up/2026/08/WM-HW100_2.webp"},
+        {"Images": ""},
+        {"Images": "https://s.in/up/2026/08/AP-X200_1.webp"},
+    ])
+    assert image_basenames_from_csv(df) == [
+        "WM-HW100_1.webp", "WM-HW100_2.webp", "AP-X200_1.webp"]
+    assert image_basenames_from_csv(pd.DataFrame([{"sku": "x"}])) == []
+
+
+def test_sheet_combos_split_and_header_skip():
+    df = pd.DataFrame([
+        ["Parent Category", "Sub Categories"],
+        ["Home Appliances", "Washing Machines, Refrigerators"],
+        ["Kitchen", "Mixer Grinders; Kettles"],
+        ["", "orphan sub"],
+    ])
+    assert sheet_combos(df) == {
+        "Home Appliances > Washing Machines",
+        "Home Appliances > Refrigerators",
+        "Kitchen > Mixer Grinders", "Kitchen > Kettles"}
