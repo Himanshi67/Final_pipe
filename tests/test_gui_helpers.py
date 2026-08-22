@@ -179,3 +179,40 @@ def test_raw_sku_sanitized_spaces():
 def test_raw_sku_longest_match_wins_and_none():
     assert raw_sku_for_csv_sku("AP-AB-100", ["100", "AB 100"]) == "AB 100"
     assert raw_sku_for_csv_sku("AP-ZZZ", ["AB 100"]) is None
+
+
+import os
+
+
+def test_write_edits_back_creates_missing_column(tmp_path):
+    import openpyxl
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    import gui
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["sku", "title"])
+    ws.append(["S1", "Old"])
+    f = tmp_path / "input_filled.xlsx"
+    wb.save(f)
+    orig = pd.DataFrame([{"sku": "S1", "title": "Old", "dropped_images": ""}])
+    part = pd.DataFrame([{"sku": "S1", "title": "Old",
+                          "dropped_images": "https://x/1.jpg"}])
+    changed = gui.write_edits_back({"filled": f}, orig, [part])
+    assert changed == 1
+    ws2 = openpyxl.load_workbook(f).active
+    hdrs = [c.value for c in ws2[1]]
+    assert "dropped_images" in hdrs
+    assert ws2.cell(row=2, column=hdrs.index("dropped_images") + 1
+                    ).value == "https://x/1.jpg"
+
+
+def test_app_filter_dropped_urls():
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    import app
+    urls = ["https://a/1.jpg", "https://a/2.jpg", "https://a/3.jpg"]
+    assert app.filter_dropped_urls(urls, "https://a/2.jpg") == [
+        "https://a/1.jpg", "https://a/3.jpg"]
+    assert app.filter_dropped_urls(urls, " https://a/1.jpg , https://a/3.jpg"
+                                   ) == ["https://a/2.jpg"]
+    assert app.filter_dropped_urls(urls, "") == urls
+    assert app.filter_dropped_urls(urls, None) == urls

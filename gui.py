@@ -424,7 +424,7 @@ def step_enrich(P):
 # ------------------------------------------------------------------- step 2 --
 
 EDITABLE_COLS = ["title", "regular price", "sale price", "url_link",
-                 "image_url", "categories", "Brands"]
+                 "image_url", "categories", "Brands", "dropped_images"]
 
 
 def load_filled_df(P) -> pd.DataFrame:
@@ -519,6 +519,14 @@ def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
     sku_c = headers.get("sku")
     if not sku_c:
         raise RuntimeError("no 'sku' column in the filled sheet")
+    # the review GUI can introduce columns the enricher never wrote
+    # (dropped_images) - create the header on demand, else the
+    # `col in headers` guard below silently discards the edit
+    needed = {c for edit in edits.values() for c in edit}
+    for col in sorted(needed - set(headers)):
+        new_c = ws.max_column + 1
+        ws.cell(row=1, column=new_c, value=col)
+        headers[col] = new_c
     changed = 0
     for r in range(2, ws.max_row + 1):
         sku = str(ws.cell(row=r, column=sku_c).value or "").strip()

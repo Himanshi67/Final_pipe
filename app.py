@@ -1497,6 +1497,16 @@ def pad_to_square(image):
     return canvas
 
 
+def filter_dropped_urls(urls, dropped_cell):
+    """Remove reviewer-rejected image URLs (comma-separated cell written by
+    the GUI's card review) before download. Survivor order is preserved."""
+    dropped = {u.strip() for u in split_image_list(str(dropped_cell or ''))
+               if u.strip()}
+    if not dropped:
+        return urls
+    return [u for u in urls if u.strip() not in dropped]
+
+
 def download_urls_for_sku(sku, urls):
     """Download and convert images. Returns the list of indexes actually
     saved, so the exported Images column never references files that were
@@ -1728,7 +1738,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         tracker.text(f'Compiling and downloading SKU: {sku} ({idx}/{total})')
         progress.progress(idx / max(total, 1))
 
-        urls = split_image_urls(row)
+        urls = filter_dropped_urls(split_image_urls(row),
+                                   row.get('dropped_images'))
         saved_indexes = download_urls_for_sku(sku, urls)
 
         # BUGFIX: only map images that were really downloaded (previously a
