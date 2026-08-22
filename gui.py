@@ -41,7 +41,7 @@ from gui_helpers import (BADGE, batch_summary, classify, eta_text,
                          image_basenames_from_csv, parse_enricher_log,
                          parse_image_urls, parse_publish_output,
                          parse_specs_cell, raw_sku_for_csv_sku,
-                         run_stage, sanity_issues)
+                         run_stage, sanity_issues, sheet_combos)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -1252,10 +1252,63 @@ def pick_run() -> Path | None:
     return None
 
 
+def category_map_editor():
+    """Edit category_map.xlsx in place. app.py snaps categories to these
+    EXACT strings, so removals are loud: they are listed and must be
+    acknowledged before the save button arms. Every save backs up the
+    current file to backups\\ first."""
+    st.header("⚙ Category map — category_map.xlsx")
+    path = REPO_ROOT / "category_map.xlsx"
+    if not path.exists():
+        st.error("category_map.xlsx not found next to app.py.")
+        return
+    df = pd.read_excel(path, dtype=str).fillna("")
+    st.caption("Column 1: parent category. Column 2: subcategories "
+               "(comma-separated). Builds snap to `Parent > Sub` exactly "
+               "as written here.")
+    edited = st.data_editor(df, num_rows="dynamic",
+                            width="stretch", key="catmap_editor")
+    removed = sorted(sheet_combos(df) - sheet_combos(edited))
+    if removed:
+        st.warning("This edit REMOVES categories existing sheets may still "
+                   "use — their rows will fail category snapping on the "
+                   "next build:\n\n- " + "\n- ".join(removed))
+    ok = st.checkbox("I understand builds snap to these exact strings"
+                     + (" and accept the removals listed above"
+                        if removed else ""), key="catmap_ok")
+    if st.button("💾 Save category map", type="primary",
+                 disabled=not ok):
+        backup = (REPO_ROOT / "backups" /
+                  f"category_map_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+        backup.parent.mkdir(exist_ok=True)
+        shutil.copy2(path, backup)
+        try:
+            edited.to_excel(path, index=False)
+        except PermissionError:
+            st.error("category_map.xlsx is open in Excel — close it and "
+                     "save again.")
+            return
+        # app.CATEGORY_COMBOS is bound at import; reload so the NEXT build
+        # in this session snaps against the edited map, and clear the
+        # cached dropdown options so review picks it up too
+        import importlib
+        os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+        import app
+        importlib.reload(app)
+        category_options.clear()
+        st.success(f"Saved. Backup: backups\\{backup.name}. Review "
+                   "dropdowns and the next build now use the edited map.")
+
+
 def main():
     st.set_page_config(page_title="Shree Jee pipeline", page_icon="🛒",
                        layout="wide")
     st.sidebar.title("🛒 Shree Jee pipeline")
+    if st.sidebar.checkbox("⚙ Category map editor",
+                           help="Edit the taxonomy the builds snap to. "
+                                "Closes the wizard while open."):
+        category_map_editor()
+        return
 
     run_dir = pick_run()
     if run_dir is None:
