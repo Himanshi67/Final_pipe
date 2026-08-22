@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -36,10 +37,11 @@ import pandas as pd
 import streamlit as st
 
 from gui_helpers import (BADGE, batch_summary, classify, eta_text,
-                         filter_review_df, flag_value, parse_enricher_log,
+                         filter_review_df, flag_value,
+                         image_basenames_from_csv, parse_enricher_log,
                          parse_image_urls, parse_publish_output,
-                         parse_specs_cell,
-                         raw_sku_for_csv_sku, sanity_issues)
+                         parse_specs_cell, raw_sku_for_csv_sku,
+                         run_stage, sanity_issues)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -1189,14 +1191,56 @@ def step_publish(P):
 
 # --------------------------------------------------------------------- main --
 
+def archive_run(run_dir: Path, dest: Path) -> int:
+    """Copy a run's reviewable outputs into batches\\<name>\\ - filled sheet,
+    CSV, issues, report, plus exactly the images its CSV references - and
+    write a README. Returns the number of files copied. Copies only;
+    the run folder is left untouched."""
+    Pr = run_paths(run_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    copied = 0
+    for key in ("filled", "csv", "issues", "report"):
+        f = Pr[key]
+        if f.exists():
+            shutil.copy2(f, dest / f.name)
+            copied += 1
+    if Pr["csv"].exists():
+        img_dest = dest / "images"
+        img_dest.mkdir(exist_ok=True)
+        csv_df = pd.read_csv(Pr["csv"], dtype=str).fillna("")
+        for name in dict.fromkeys(image_basenames_from_csv(csv_df)):
+            src = REPO_ROOT / "product_images_for_upload" / name
+            if src.exists():
+                shutil.copy2(src, img_dest / name)
+                copied += 1
+    meta = load_json(Pr["meta"])
+    (dest / "README.md").write_text(
+        f"# Batch {run_dir.name}\n\n"
+        f"Archived {datetime.now():%Y-%m-%d %H:%M} from "
+        f"runs\\{run_dir.name}.\n\n"
+        f"- Source list: {meta.get('original_name', '?')}\n"
+        f"- Rows enriched: {meta.get('total_rows', '?')}\n"
+        f"- Built scope: {meta.get('built_scope', '?')} "
+        f"({len(meta.get('built_skus') or [])} SKUs)\n"
+        f"- Validation issues: {meta.get('issue_count', '?')}\n"
+        f"- Published: {meta.get('published', 'never')}"
+        + (" (LIVE)" if meta.get("published_live") else "") + "\n",
+        encoding="utf-8")
+    return copied
+
+
 def pick_run() -> Path | None:
     RUNS_DIR.mkdir(exist_ok=True)
     runs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()),
                   key=lambda d: d.stat().st_mtime, reverse=True)
-    options = ["➕ New run…"] + [d.name for d in runs]
+    HOME, NEW = "🏠 All runs", "➕ New run…"
+    options = [HOME, NEW] + [d.name for d in runs]
+    # land on the latest run as before; Home is one click away
     sel = st.sidebar.selectbox("Batch / run", options,
-                               index=1 if runs else 0)
-    if sel != "➕ New run…":
+                               index=2 if runs else 0)
+    if sel == HOME:
+        return None
+    if sel != NEW:
         return RUNS_DIR / sel
     name = st.sidebar.text_input("New run name",
                                  value=f"run_{datetime.now():%Y%m%d}")
@@ -1216,9 +1260,51 @@ def main():
     run_dir = pick_run()
     if run_dir is None:
         st.title("Shree Jee catalogue pipeline")
-        st.info("Create a run in the sidebar to begin — each run keeps its "
-                "input, enriched sheet, CSV and logs together under "
-                "`runs\\<name>\\`.")
+        run_dirs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()),
+                          key=lambda d: d.stat().st_mtime, reverse=True)
+        if not run_dirs:
+            st.info("Create a run in the sidebar to begin — each run keeps "
+                    "its input, enriched sheet, CSV and logs together under "
+                    "`runs\\<name>\\`.")
+            return
+        rows = []
+        for d in run_dirs:
+            Pd = run_paths(d)
+            m = load_json(Pd["meta"])
+            rows.append({
+                "run": d.name,
+                "stage": run_stage(m, {"input": Pd["input"].exists(),
+                                       "filled": Pd["filled"].exists(),
+                                       "csv": Pd["csv"].exists()}),
+                "rows": m.get("total_rows", ""),
+                "issues": m.get("issue_count", ""),
+                "published": m.get("published", ""),
+                "updated": datetime.fromtimestamp(
+                    d.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+            })
+        st.dataframe(pd.DataFrame(rows), hide_index=True,
+                     width="stretch")
+        st.caption("Pick a run in the sidebar to open it.")
+        with st.expander("🗂 Manage a run (archive / delete)"):
+            target = st.selectbox("Run", [r["run"] for r in rows],
+                                  key="mgr_target")
+            tdir = RUNS_DIR / target
+            c1, c2 = st.columns(2)
+            if c1.button("📦 Archive to batches\\", key="mgr_archive"):
+                dest = REPO_ROOT / "batches" / target
+                if dest.exists():
+                    st.error(f"batches\\{target} already exists — rename or "
+                             "remove it first; nothing was copied.")
+                else:
+                    n = archive_run(tdir, dest)
+                    st.success(f"Archived {n} file(s) to batches\\{target}. "
+                               "The run folder itself is untouched.")
+            sure = c2.checkbox(f"Yes, permanently delete runs\\{target}",
+                               key="mgr_sure")
+            if c2.button("🗑 Delete run", disabled=not sure,
+                         key="mgr_del"):
+                shutil.rmtree(tdir)
+                st.rerun()
         return
     P = run_paths(run_dir)
 
