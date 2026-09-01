@@ -27,6 +27,10 @@ script present the clearance cookie your own browser already earned:
     .venv\\Scripts\\python.exe wc_publish.py --check --cookie-file cookie.txt
 
 Keep that file out of the repo - it is a live session credential.
+
+Exit codes: 0 = every row went through, 2 = at least one row failed (dry run
+or commit), 3 = the run aborted because the edge served a challenge. gui.py
+gates the commit button on a 0, so a run that wrote nothing must not return it.
 """
 
 import argparse
@@ -66,6 +70,15 @@ TIMEOUT = 60
 # Bounded retry for transport failures only - see Store.call.
 NETWORK_RETRIES = 4
 RETRY_BACKOFF = 2.0        # seconds, doubled each attempt
+# Only verbs that can be re-sent without creating a second copy of anything.
+# POST is deliberately absent - see Store.call.
+RETRYABLE_METHODS = ("GET", "PUT", "DELETE")
+
+# Exit codes. gui.py and any headless caller read these, so a run that wrote
+# nothing must never look like a success.
+EXIT_OK = 0
+EXIT_ROW_FAILED = 2        # at least one row failed (dry run or commit)
+EXIT_BLOCKED = 3           # the edge challenge stopped the run outright
 
 # A store behind a CDN JavaScript challenge (KI-15) answers every server-to-
 # server request with an interstitial instead of the API. The clearance cookie a
@@ -182,6 +195,37 @@ def env_or_die(name):
     return value
 
 
+# WordPress stores and returns names HTML-escaped: a category created as
+# 'Cooling & Freezing' comes back as 'Cooling &amp; Freezing' (and an
+# apostrophe as '&#039;'). Comparing our raw name to that escaped value never
+# matched, so every '&' category and tag looked missing: the dry run printed
+# "~ would create" and --commit POSTed a duplicate, which WordPress refused
+# with term_exists - failing the whole product row. Compare unescaped, always.
+_ESCAPABLE_RE = re.compile(r"[&<>\"']")
+
+
+def unescaped(value):
+    """API text with HTML entities resolved and whitespace normalised."""
+    return compact(_html.unescape(str(value if value is not None else "")))
+
+
+def term_key(name):
+    """Comparison key for a taxonomy term name - unescaped, case-folded."""
+    return unescaped(name).casefold()
+
+
+def term_search_value(name):
+    """What to put in ?search= so the term is actually returned.
+
+    WP runs LIKE against the STORED (escaped) name, so searching the raw
+    'Cooling & Freezing' matches nothing. Search the longest fragment that
+    escaping cannot alter ('Cooling', 'Juicers, Mixers'), then filter the
+    results on term_key."""
+    text = unescaped(name)
+    parts = [p.strip() for p in _ESCAPABLE_RE.split(text) if p.strip()]
+    return max(parts, key=len) if parts else text
+
+
 class Store:
     def __init__(self, allow_writes=False):
         self.base = env_or_die("WC_URL").rstrip("/")
@@ -218,22 +262,36 @@ class Store:
         # Safe for the writes here as well as the reads: every PUT this
         # pipeline sends is an upsert keyed on id or SKU, so re-sending one
         # whose reply was lost re-applies identical values.
-        last = None
-        for attempt in range(NETWORK_RETRIES):
+        #
+        # POST is NOT retried, because it is the one verb where a lost reply
+        # is ambiguous: a create that took longer than TIMEOUT but landed
+        # would be re-sent and either duplicate or come back
+        # product_invalid_sku / term_exists, counted as a failure although the
+        # object exists. There is no need to guess - everything this script
+        # POSTs is looked up first (by_sku / _term), so simply re-running the
+        # same command re-checks existence and upserts. The run now exits
+        # non-zero (EXIT_ROW_FAILED) so that re-run is not skipped.
+        retries = NETWORK_RETRIES if method in RETRYABLE_METHODS else 1
+        for attempt in range(retries):
             try:
                 r = SESSION.request(method, url, auth=self.auth,
                                     timeout=TIMEOUT, **kw)
                 break
             except (requests.ConnectionError, requests.Timeout,
                     requests.exceptions.ChunkedEncodingError) as exc:
-                last = exc
-                if attempt == NETWORK_RETRIES - 1:
+                if attempt == retries - 1:
+                    if retries == 1:
+                        raise RuntimeError(
+                            f"{method} {path} -> network failed: {exc}. Not "
+                            f"retried - a repeated create can duplicate. It "
+                            f"may or may not have landed; re-run the same "
+                            f"command, which re-checks and upserts.")
                     raise RuntimeError(
                         f"{method} {path} -> network failed after "
-                        f"{NETWORK_RETRIES} attempts: {exc}")
+                        f"{retries} attempts: {exc}")
                 delay = RETRY_BACKOFF * (2 ** attempt)
                 print(f"    (network hiccup on {method} {path}, retrying in "
-                      f"{delay:.0f}s - attempt {attempt + 2}/{NETWORK_RETRIES})")
+                      f"{delay:.0f}s - attempt {attempt + 2}/{retries})")
                 time.sleep(delay)
         if looks_like_challenge(r):
             raise ChallengeError(f"{method} {path} -> {CHALLENGE_HELP}")
@@ -262,14 +320,14 @@ class Store:
 
     # -- taxonomy ---------------------------------------------------------
     def _term(self, endpoint, name, cache, parent=0):
-        key = (name.lower(), parent)
+        key = (term_key(name), parent)
         if key in cache:
             return cache[key]
-        params = {"search": name, "per_page": 100}
+        params = {"search": term_search_value(name), "per_page": 100}
         if endpoint == "products/categories":
             params["parent"] = parent
         for hit in self.call("GET", endpoint, params=params):
-            if hit["name"].strip().lower() == name.strip().lower():
+            if term_key(hit.get("name")) == key[0]:
                 cache[key] = hit["id"]
                 return hit["id"]
         label = "category" if endpoint.endswith("categories") else "tag"
@@ -459,6 +517,12 @@ def images_for(row, sku, title, mode, allow_writes=True):
     return payload, notes
 
 
+def uncsv(text):
+    """Inverse of app.escape_category_for_csv - see its docstring. Kept local so
+    wc_publish.py stays importable without pulling in app.py and Streamlit."""
+    return str(text or "").replace(chr(92) + ",", ",")
+
+
 def attributes_for(row):
     attrs, index = [], 1
     while f"Attribute {index} name" in row:
@@ -509,7 +573,12 @@ def build_payload(store, row, status, image_mode):
     image_payload, notes = images_for(row, sku, title, image_mode,
                                       store.allow_writes)
     # None on a dry run when the term does not exist yet - never send it
-    category = store.category_id(compact(row.get("categories")))
+    # app.escape_category_for_csv() writes a category whose own name contains a
+    # comma as "Juicers\, Mixers & Grinders" so the WooCommerce CSV IMPORTER does
+    # not split the cell. The REST API takes the name as data, not as a list, so
+    # the escape must come back off here or we would create a category literally
+    # named "Juicers\, Mixers & Grinders".
+    category = store.category_id(compact(uncsv(row.get("categories"))))
     categories = [{"id": category}] if category is not None else []
 
     payload = {
@@ -564,7 +633,7 @@ def describe(payload, existing):
         # Inverter Split AC &#8211; White'), so a raw != comparison reported
         # "changes: name" on essentially every update whether or not anything
         # had actually changed, which made the dry run's diff useless.
-        if compact(_html.unescape(str(existing.get("name", "")))) != payload["name"]:
+        if unescaped(existing.get("name", "")) != payload["name"]:
             changes.append("name")
         if old != payload["regular_price"]:
             changes.append(f"regular_price {old or '-'} -> {payload['regular_price'] or '-'}")
@@ -684,6 +753,7 @@ def main():
           f"status: {args.status or 'draft for new, unchanged for existing'})\n")
 
     created = updated = failed = 0
+    blocked = False
     for _, row in df.iterrows():
         sku = compact(row.get("sku"))
         if not sku:
@@ -728,21 +798,46 @@ def main():
             print(f"\nStopped at {sku}: the CDN is blocking this machine, so no "
                   f"row can succeed. Nothing further was attempted.")
             failed += 1
+            blocked = True
             break
         except Exception as exc:
             failed += 1
             print(f"    !! {exc}")
 
+    # The "Done:" grammar is parsed by gui_helpers.parse_publish_output
+    # (_PUB_SUMMARY_RE) - do not reword it. Extra lines after it are ignored
+    # by that parser.
     if args.commit:
         print(f"\nDone: {created} created, {updated} updated, {failed} failed.")
     else:
         print(f"\nDry run complete - nothing was written. "
               f"Re-run with --commit to apply.")
 
+    # A run in which nothing worked used to exit 0, so gui.py unlocked the
+    # commit gate after a dry run that accomplished nothing and then wrote
+    # published=... into the run meta. The exit code now tells the truth.
+    if blocked:
+        print(f"ABORTED: the edge challenge blocked this machine after "
+              f"{created + updated} row(s); the rest were never attempted. "
+              f"Exit code {EXIT_BLOCKED}.")
+        return EXIT_BLOCKED
+    if failed:
+        print(f"FAILED: {failed} row(s) did not go through"
+              f"{' (nothing was written)' if not args.commit else ''}. "
+              f"Exit code {EXIT_ROW_FAILED}.")
+        return EXIT_ROW_FAILED
+    return EXIT_OK
+
 
 if __name__ == "__main__":
     try:
-        main()
+        # main() returns 0 / EXIT_ROW_FAILED / EXIT_BLOCKED; None (--check,
+        # --delete-sku) is a clean exit.
+        sys.exit(main() or EXIT_OK)
+    except ChallengeError as exc:
+        # same meaning as the in-loop abort: no request can succeed
+        print(f"\n{exc}")
+        sys.exit(EXIT_BLOCKED)
     except RuntimeError as exc:
         # connectivity/challenge failures are the user's problem to fix, not a
         # bug to read a traceback about
