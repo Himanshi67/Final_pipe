@@ -1115,21 +1115,34 @@ def step_publish(P):
         st.warning(f"{len(publish_skus)} products is a large batch — it will "
                    "be sent in chunks of 150 SKUs per wc_publish call.")
 
+    # Mirrors wc_publish.EXIT_BLOCKED. Duplicated rather than imported so this
+    # module never has to import wc_publish (which reads store credentials at
+    # import time). If that constant moves, this must follow.
+    PUBLISH_EXIT_BLOCKED = 3
+
     def run_publish_pinned(extra):
         """Every invocation pins its scope with explicit --sku flags. Past
         ~200 the flags would hit the Windows command-line limit, so the set
         is CHUNKED across several wc_publish calls rather than ever falling
         back to publishing the CSV blind."""
-        outs, code = [], 0
+        outs, worst = [], 0
         for i in range(0, len(publish_skus), 150):
             flags = []
             for s in publish_skus[i:i + 150]:
                 flags += ["--sku", s]
             code, out = run_publish(P, flags + extra)
             outs.append(out)
-            if code != 0:
+            # Worst-of, never last-of: wc_publish exits 2 when ANY row failed, so
+            # returning the final chunk's code would let a clean chunk 2 mask a
+            # failed chunk 1 and unlock the commit gate after a bad dry run.
+            worst = max(worst, code)
+            # Only an edge challenge (EXIT_BLOCKED) makes the later chunks
+            # pointless - every one would be blocked the same way. A row-level
+            # failure must NOT stop them, or the retry panel never sees the SKUs
+            # that come after the first bad row.
+            if code == PUBLISH_EXIT_BLOCKED:
                 break
-        return code, "\n".join(outs)
+        return worst, "\n".join(outs)
 
     dry_key = f"dryrun_{P['run'].name}"
     st.subheader("Ⅰ · Dry run (nothing is written)")
@@ -1289,20 +1302,46 @@ def pick_run() -> Path | None:
     return None
 
 
+def save_first_sheet(path, edited):
+    """Write `edited` back into the FIRST worksheet of an existing workbook,
+    keeping that sheet's NAME and position and every OTHER sheet untouched.
+
+    `edited.to_excel(path)` would rewrite category_map.xlsx as a single-sheet
+    'Sheet1' workbook, silently destroying the 'Sub-Category Attributes' sheet
+    (which app.load_subcategory_attributes reads, and whose loss makes
+    `_spec_gaps` blank for every product in every later build) and 'Filters'.
+    """
+    wb = openpyxl.load_workbook(path)
+    name = wb.sheetnames[0]
+    index = 0
+    del wb[name]
+    ws = wb.create_sheet(name, index)
+    ws.append([str(c) for c in edited.columns])
+    for _, row in edited.iterrows():
+        ws.append(["" if pd.isna(v) else str(v) for v in row.tolist()])
+    wb.save(path)
+
+
 def category_map_editor():
     """Edit category_map.xlsx in place. app.py snaps categories to these
     EXACT strings, so removals are loud: they are listed and must be
     acknowledged before the save button arms. Every save backs up the
-    current file to backups\\ first."""
+    current file to backups\\ first.
+
+    Only the FIRST sheet is editable here; the other sheets of the workbook
+    ('Sub-Category Attributes', 'Filters') are preserved verbatim."""
     st.header("⚙ Category map — category_map.xlsx")
     path = REPO_ROOT / "category_map.xlsx"
     if not path.exists():
         st.error("category_map.xlsx not found next to app.py.")
         return
-    df = pd.read_excel(path, dtype=str).fillna("")
+    df = pd.read_excel(path, sheet_name=0, dtype=str).fillna("")
+    other = openpyxl.load_workbook(path, read_only=True).sheetnames[1:]
     st.caption("Column 1: parent category. Column 2: subcategories "
                "(comma-separated). Builds snap to `Parent > Sub` exactly "
-               "as written here.")
+               "as written here."
+               + (f" Other sheets in the workbook ({', '.join(other)}) are "
+                  "left untouched by a save." if other else ""))
     edited = st.data_editor(df, num_rows="dynamic",
                             width="stretch", key="catmap_editor")
     removed = sorted(sheet_combos(df) - sheet_combos(edited))
@@ -1320,7 +1359,7 @@ def category_map_editor():
         backup.parent.mkdir(exist_ok=True)
         shutil.copy2(path, backup)
         try:
-            edited.to_excel(path, index=False)
+            save_first_sheet(path, edited)
         except PermissionError:
             st.error("category_map.xlsx is open in Excel — close it and "
                      "save again.")

@@ -286,6 +286,25 @@ CATEGORY_COMMA_MERGES = (
 )
 
 
+def escape_category_for_csv(text):
+    """WooCommerce's CSV importer treats the Categories cell as a comma
+    separated LIST (parse_categories_field -> explode_values), so a category
+    whose own name contains a comma must escape it as '\\,'. Without this
+    'Kitchen Appliances > Juicers, Mixers & Grinders' imports as a bogus
+    'Kitchen Appliances > Juicers' plus a new top-level 'Mixers & Grinders'.
+
+    Only the CSV cell is escaped - the taxonomy file, the GUI dropdown, tags
+    and the SEO fields all keep the human-readable name.
+    """
+    return re.sub(r'(?<!\\),', r'\\,', str(text or ''))
+
+
+def unescape_category_from_csv(text):
+    """Inverse of escape_category_for_csv, for anything reading the CSV back
+    (validate_csv.py) and needing to compare against the taxonomy strings."""
+    return str(text or '').replace('\\,', ',')
+
+
 def _cat_norm(value):
     return re.sub(r'\s+', ' ', str(value or '').strip()).lower()
 
@@ -738,8 +757,11 @@ def load_subcategory_attributes():
     7.0kg)'). Only the first is usable as a value list; a hint just means the
     axis applies to this sub-category and the value must be read off the title.
     """
+    global SUBCATEGORY_ATTRIBUTES_WARNING
+    SUBCATEGORY_ATTRIBUTES_WARNING = ''
     base = os.path.dirname(os.path.abspath(__file__))
     out = {}
+    problems = []
     for name in CATEGORY_MAP_CANDIDATES:
         path = os.path.join(base, name)
         if not os.path.exists(path) or path.lower().endswith('.csv'):
@@ -747,7 +769,14 @@ def load_subcategory_attributes():
         try:
             table = pd.read_excel(path, sheet_name='Sub-Category Attributes',
                                   dtype=str).fillna('')
-        except Exception:
+        except Exception as exc:
+            # NEVER swallow this silently: with no axes, missing_spec_axes()
+            # returns [] for every product, so `_spec_gaps` is blank and
+            # validate_csv reports no missing_required_attribute - a build
+            # that looks perfect while checking nothing. The usual cause is
+            # the workbook having been rewritten as a single sheet; restore
+            # it from backups\category_map_<ts>.xlsx.
+            problems.append(f'{name}: {type(exc).__name__}: {exc}')
             continue
         for _, row in table.iterrows():
             sub = compact(row.get('Sub-Category'))
@@ -776,9 +805,21 @@ def load_subcategory_attributes():
             if parent_name:
                 out.setdefault(_cat_norm(parent_name), axes)
         break
+    if not out:
+        SUBCATEGORY_ATTRIBUTES_WARNING = (
+            "No 'Sub-Category Attributes' sheet could be read from the "
+            "taxonomy file, so NO required attribute axes are known: "
+            "`_spec_gaps` will be blank for every product and validate_csv "
+            "will report no missing_required_attribute. Restore "
+            "category_map.xlsx from backups\\category_map_<timestamp>.xlsx."
+            + (' (' + '; '.join(problems) + ')' if problems else ''))
+        _ui().warning(SUBCATEGORY_ATTRIBUTES_WARNING)
     return out
 
 
+# Set by load_subcategory_attributes(); non-empty means the taxonomy's
+# attribute sheet is missing/unreadable. Surfaced at import AND at build time.
+SUBCATEGORY_ATTRIBUTES_WARNING = ''
 SUBCATEGORY_ATTRIBUTES = load_subcategory_attributes()
 
 RESOLUTION_PATTERNS = (
@@ -1701,6 +1742,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
     unmapped_categories = set()
     gap_counts = {}
     ui = _ui()
+    if SUBCATEGORY_ATTRIBUTES_WARNING:
+        ui.warning(SUBCATEGORY_ATTRIBUTES_WARNING)
     progress = ui.progress(0)
     tracker = ui.empty()
 
@@ -1760,7 +1803,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             'short description': compact(short_desc),
             'description': compact(long_desc),
             'title': title,
-            'categories': category_hierarchy,
+            # the importer splits this cell on ',' unless escaped as '\,'
+            'categories': escape_category_for_csv(category_hierarchy),
             'Tags': build_tags(brand, parent_guess, sub_guess, title,
                                sale_price, category_family),
             'regular price': format_regular_price_output(regular_price),

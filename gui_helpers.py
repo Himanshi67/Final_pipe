@@ -93,7 +93,11 @@ def batch_summary(result):
                               .str.strip() == "").sum()),
         "price_min": int(sale.min()) if has_price else 0,
         "price_max": int(sale.max()) if has_price else 0,
+        # the CSV cell escapes a comma inside a category NAME as '\,' (the
+        # WooCommerce importer would otherwise split it); show the readable
+        # form in the summary
         "category_counts": result["categories"].astype(str).str.strip()
+                                 .str.replace("\\,", ",", regex=False)
                                  .replace("", "(none)")
                                  .value_counts().to_dict(),
     }

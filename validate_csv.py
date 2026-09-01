@@ -693,10 +693,17 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append('missing_description')
 
         cats = str(row.get(categories_col, '')).strip() if categories_col else ''
+        # app.escape_category_for_csv writes '\,' for a comma inside a category
+        # NAME ('Juicers\, Mixers & Grinders'), because the WooCommerce importer
+        # otherwise splits the cell into two categories. Compare unescaped so a
+        # correctly-escaped row is not reported as category_not_in_map.
+        cats_plain = cats.replace('\\,', ',')
         if not cats:
             reasons.append('missing_category')
-        elif valid_categories and cats not in valid_categories:
+        elif valid_categories and cats_plain not in valid_categories:
             reasons.append(f'category_not_in_map ({cats})')
+        elif ',' in cats_plain and cats_plain == cats:
+            reasons.append(f'unescaped_comma_in_category ({cats})')
 
         reasons.extend(attribute_name_problems(row, attr_name_cols))
 
