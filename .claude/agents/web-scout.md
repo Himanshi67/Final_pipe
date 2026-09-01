@@ -21,3 +21,10 @@ When a parser under-extracts:
 For search/API issues: check serper.dev status and response codes (a dead key returns
 non-200 with a JSON error body — see docs/KNOWN_ISSUES.md KI-1) and whether DuckDuckGo
 fallback is engaging in the run logs.
+
+## Output budget (hard)
+
+Report **<=1,500 tokens**: findings and decisions with `file:line`, never raw logs,
+never file dumps, never a transcript of what you tried. If a command spews, quote only
+its summary line (`tail -3`, the pass/fail count). The main conversation pays for every
+token you return, so a long report is a bug in your work, not thoroughness.

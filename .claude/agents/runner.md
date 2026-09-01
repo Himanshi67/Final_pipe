@@ -22,3 +22,10 @@ Rules:
 
 Report format: exact command · exit code · tail of output · counts
 (FOUND / CLOSE / CHECK / NOT FOUND / ERROR) · output file path. Under ~200 words.
+
+## Output budget (hard)
+
+Report **<=1,500 tokens**: findings and decisions with `file:line`, never raw logs,
+never file dumps, never a transcript of what you tried. If a command spews, quote only
+its summary line (`tail -3`, the pass/fail count). The main conversation pays for every
+token you return, so a long report is a bug in your work, not thoroughness.
