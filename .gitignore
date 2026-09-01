@@ -118,3 +118,5 @@ graphify-out/
 # If this repo ever becomes private, delete these two lines and commit them.
 docs/NEXT_STEPS.md
 docs/PRODUCT_PLAN.md
+# Session handovers summarising the same open-defect material.
+docs/handover-audit-productization.md
