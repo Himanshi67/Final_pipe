@@ -1,0 +1,4 @@
+# Deliberate code mirrors (see CLAUDE.md / the sync-copies skill): root scripts are
+# the source of truth, so indexing the mirrors would double every symbol in the graph.
+Sku_enrichment/
+_push_export/

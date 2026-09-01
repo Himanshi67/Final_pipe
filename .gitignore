@@ -101,3 +101,11 @@ Code_Unrelated/
 # archived at docs/archive/scraper2-source.zip (0.27 MB) and the working copy
 # was merged in and removed - this is just the download.
 /scraper (2).zip
+
+graphify-out/
+
+# Per-machine Claude Code settings. Only settings.json (shared: agents, skills,
+# project permissions) is tracked; the .local one holds this machine's own
+# allowlist. Previously this was ignored only by a global gitignore on one
+# machine, so a fresh clone elsewhere would have committed it.
+.claude/settings.local.json
