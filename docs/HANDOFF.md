@@ -1,5 +1,12 @@
 # Handover — Final_pipe, state at 2026-07-28
 
+> **SUPERSEDED (2026-09-01).** Written 2026-07-28, before the 2026-08-22 GUI refit and
+> the 2026-09-01 audit. Its repo-layout, remote, branch and script-count statements are
+> no longer true, and it names `SubCategory_Attributes_Master.xlsx` as the attribute
+> source (no script reads that file). Kept for its narrative of how the pipeline was
+> proven end to end. For current state read `CLAUDE.md`, then `docs/NEXT_STEPS.md`
+> (open defects) and `docs/PRODUCT_PLAN.md` (where this is going).
+
 Read this, then `CLAUDE.md`. Load `KNOWN_ISSUES.md` / `ISSUES_AUDIT.md` only
 when diagnosing something.
 

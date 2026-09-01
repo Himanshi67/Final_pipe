@@ -23,7 +23,9 @@ separate, opt-in tool that can use one for prose only; see the bottom.)
 Full documentation: **docs/PIPELINE_GUIDE.md** (every flag, every column, where data
 goes). Visual overview: **docs/data_flow.svg**. Pre-diagnosed bugs with line anchors:
 **docs/KNOWN_ISSUES.md**. What else could be automated: **docs/AUTOMATION_OPPORTUNITIES.md**.
-State for a fresh session: **docs/HANDOFF.md**.
+Hardening backlog (48 verified findings): **docs/NEXT_STEPS.md**. How this is being
+productized: **docs/PRODUCT_PLAN.md**. Older narrative state: **docs/HANDOFF.md**
+(written 2026-07-28 - predates the GUI refit; trust CLAUDE.md and this file first).
 
 ## One-time setup
 
@@ -121,7 +123,7 @@ And again at download time in `app.py`:
 | Ask the CDN for its largest rendition | — | belt and braces: an older `_filled.xlsx` captured before the enricher learned this still gets full resolution, with no re-scrape and no credits |
 | `WEBP_QUALITY` | 95 | WooCommerce re-encodes its own thumbnails from this master, so softness compounds |
 | `MAX_IMAGE_EDGE` | 2400, **downscale only** | never upscale — enlarging invents detail and looks worse than the original |
-| `MIN_IMAGE_EDGE` | 500, skipped + named | one image fewer beats a blurry one on the page |
+| `MIN_IMAGE_EDGE` | 1000, skipped + named | one image fewer beats a blurry one on the page |
 | `GOOD_IMAGE_PX` | 1000, QA flag | usable but soft; reported by `validate_csv.py`, never silently shipped |
 
 The rewrite runs at **download** time as well as scrape time, so an existing

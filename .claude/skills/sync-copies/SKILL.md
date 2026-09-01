@@ -6,8 +6,9 @@ description: Sync sku_enricher.py (and shared docs) from root to Sku_enrichment/
 # Sync the duplicate copies
 
 Root files are the source of truth. `_push_export\` is an UNTRACKED NESTED git repo
-(own remote: SKU_Scripts.git). The outer repo is a local git repo with no remote
-configured — `git remote -v` before assuming a push target.
+(own remote: SKU_Scripts.git). The outer repo ALSO has a public GitHub remote
+(origin: Final_pipe.git) - anything committed here can become public, so re-read
+docs/NEXT_STEPS.md's security item before adding docs. Confirm with `git remote -v` — `git remote -v` before assuming a push target.
 
 `_push_export\` keeps a FLAT layout: docs that live in `docs\` at root land at the
 ROOT of `_push_export\`, not in a `docs\` subfolder there. Do not restructure it.

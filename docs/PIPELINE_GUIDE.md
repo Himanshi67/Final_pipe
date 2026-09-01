@@ -315,7 +315,8 @@ sheet *before* reviewing by hand — it tells you which rows deserve attention.
 ```
 
 Stage-1 checks: verified-but-no-price, verified-but-thin-gallery, MRP at/below
-the price or more than 4x it, a panel-class price ceiling (a HD Ready TV priced
+the price or implausibly far above it (`MRP_RATIO_LIMIT` 4x, tightened to 3x by
+`mrp_ratio_limit()` for TV/LED titles), a panel-class price ceiling (a HD Ready TV priced
 like a 4K one), titles not in English or missing the SKU's brand, unlisted-store
 sources, and **cross-row duplicates** — two SKUs sharing a source URL, a first
 image, a whole gallery, ANY single image, or a title, which is the classic
@@ -437,6 +438,31 @@ gitignored; it is a live session credential.
 > from WordPress, hpanel.hostinger.com) > Websites > Dashboard > CDN > Manage >
 > Security. Stopgap if that panel is out of reach: `--cookie-file` above.
 
+### wc_seo.py - back-fill SEO meta on products ALREADY LIVE
+
+`build_csv.py --seo` covers products this pipeline is about to publish; this covers
+the ones already on the storefront. Dry run unless `--commit`.
+
+    .venv\Scripts\python.exe wc_seo.py --report            :: what would change
+    .venv\Scripts\python.exe wc_seo.py --sku TV-... --commit
+
+Flags: `--commit` `--sku` `--limit` `--plugin` `--overwrite` `--slugs` `--report`
+`--no-checkpoint` `--checkpoint-label` `--cookie-file` `--cookie` `--user-agent`.
+It snapshots via wc_checkpoint.py first unless `--no-checkpoint`; `--slugs` rewrites
+permalinks, which breaks existing links - do not use it on an indexed store.
+
+### wc_checkpoint.py - snapshot the store, and put it back
+
+Takes a restorable copy of the products before a risky bulk change.
+
+    .venv\Scripts\python.exe wc_checkpoint.py create --label before-seo
+    .venv\Scripts\python.exe wc_checkpoint.py list
+    .venv\Scripts\python.exe wc_checkpoint.py restore --label before-seo --commit
+
+Positional `action` + `name`; flags `--label` `--commit` `--fields` `--sku` `--limit`
+`--cookie-file` `--cookie` `--user-agent`. Snapshots land in `checkpoints\` (anchored
+on the script's own folder). Restore is a dry run unless `--commit`.
+
 ## 4. Features at a glance
 
 Verified-only product data (model-code matching, accessory rejection, capacity
@@ -475,7 +501,10 @@ Generated at runtime: `<name>_filled.xlsx`, `product_images_for_upload\`,
 Final_pipe\
   *.py  *.md  requirements.txt      the pipeline and its docs (in git)
   category_map.xlsx                 taxonomy - CONFIG, kept in git on purpose
-  SubCategory_Attributes_Master.xlsx   attribute/filter source (in git)
+  SubCategory_Attributes_Master.xlsx   REFERENCE COPY ONLY - no script reads it.
+                                    The attributes app.py actually enforces live in
+                                    the 'Sub-Category Attributes' SHEET of
+                                    category_map.xlsx (app.load_subcategory_attributes)
   <name>.xlsx  <name>_filled.xlsx   the batch you are working on
   product_images_for_upload\        images for the CURRENT batch
   batches\<name>-<YYYY-MM>\         finished batches, archived (NOT in git)
@@ -497,7 +526,7 @@ Two working rules that follow from this:
 ## 6. First-time setup
 
 ```
-cd C:\Users\CGTPL.DESKTOP-BELNN45\Desktop\Him\scraper\final_pipe
+cd <path\to>\Final_pipe          :: e.g. D:\...\Catalogue\Final_pipe
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt

@@ -168,7 +168,7 @@ retried; a 404 means the same thing every time.
 scratchpad**, which is temporary and will be lost:
 
 ```
-C:\Users\DHRUVS~1\AppData\Local\Temp\claude\d--OneDrive---Comfort-Grid-...\scratchpad\
+<session scratchpad, since superseded - these now live in tests\>
   test_enricher_new.py   61   cache, spec tables, merge, batch report
   test_app_new.py        67   scraped specs, spec-gap gate, SEO pass
   test_wc_seo.py         36   plan/fetch/safety defaults

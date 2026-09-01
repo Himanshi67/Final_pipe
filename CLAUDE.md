@@ -9,19 +9,23 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
              → validate_csv.py → validation_issues.csv
              → WooCommerce import (manual) | wc_publish.py (REST API)
 
-- `sku_enricher.py` (~2,700 lines, plain functions) — per SKU: brand/model split →
+- `sku_enricher.py` (~3,800 lines, plain functions) — per SKU: brand/model split →
   serper.dev search (DuckDuckGo fallback) → fetch pages (curl_cffi, browser
   impersonation) → site parsers (amazon/flipkart/croma/reliance/ifb/generic JSON-LD,
   dispatched in `extract()`) → spec-table scrape → strict `assess()` verdict →
   `hunt_donors`/`merge_sources` to complete the row → write row → checkpoint-save.
   Interruption-safe; re-running resumes. Pages and searches are cached in `.cache\`,
   so a re-run does no network I/O. Writes `<output>_report.md` at the end.
-- `gui.py` (~800 lines, Streamlit) — the 5-step wizard over the whole pipeline
+- `gui.py` (~1,430 lines, Streamlit) — the 5-step wizard over the whole pipeline
   (upload+enrich → review → build CSV → validate → publish), state in `runs\<name>\`.
-  It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so it
-  adds no pipeline logic of its own. Step 1 offers the two-pass flow; step 2's
-  review table is where `NEEDS LINK` rows get a URL pasted in.
-- `app.py` (~1,300 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
+  It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so the
+  pipeline stages stay in those scripts - but since the 2026-08-22 refit it DOES own
+  operator-facing logic: a run manager (create/archive/delete `runs\<name>\`), a card
+  review mode, image keep/drop, an in-app category-map editor with backups, an SEO
+  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~294 lines).
+  Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
+  a URL pasted in.
+- `app.py` (~1,950 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
   to exact strings in `category_map.xlsx`; images saved as `SKU_n.webp`; scraped
   specs become WooCommerce attributes; `_spec_gaps` records attributes the
   sub-category requires but nothing filled; optional SEO meta columns (off by default).
@@ -40,7 +44,11 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   `- only N image(s)` (verified but incomplete) · `FOUND … - price from <site>`
   (merged from another source) · `FOUND … - VERIFY: <why>` (pass 2 crawled the
   link a human supplied and the page does not match the SKU) · `CLOSE MATCH -
-  CHECK` · `CHECK MANUALLY` · `NOT FOUND` · `ERROR: …`
+  CHECK (site)` · `CHECK MANUALLY (site)` · `SKIPPED - same unit as row N` ·
+  `NOT FOUND` + a reason suffix (`- no usable search results` / `- N page(s) checked,
+  none matched` / `- all sources blocked (…)` / `- N source(s) blocked`) · `ERROR: …`
+  (incl. `ERROR: no product data in the page`). Bare and `(site)`-suffixed forms BOTH
+  occur — match with `startswith`, never `==`.
 - Two-pass statuses (`--discover` only): `NEEDS CRAWL (site)` · `NEEDS CRAWL -
   CHECK LINK (site)` · `NEEDS LINK - <why>`. **None of them start with FOUND**,
   which is deliberate: `app.py` and `gui.py` both gate the import on
@@ -55,9 +63,11 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   directions, and a block costs far more than the minutes saved.
 
 ## Repo layout
-    *.py                  the 7 pipeline scripts — MUST stay at root (see below)
+    *.py                  the 9 pipeline scripts — MUST stay at root (see below)
     category_map.xlsx     taxonomy; app.py loads it from NEXT TO app.py
-    SubCategory_Attributes_Master.xlsx
+    SubCategory_Attributes_Master.xlsx   reference copy ONLY - no script reads it;
+                          the enforced attributes live in category_map.xlsx's
+                          'Sub-Category Attributes' sheet (load_subcategory_attributes)
     category_seo.xlsx     curated per-category tags + SEO keywords (hand-written;
                           rebuild with tools\build_category_seo.py)
     tools\                generators for the config sheets, not pipeline stages
@@ -139,6 +149,10 @@ subagent over 20 tool calls in the main context.
   BEFORE diagnosing any enricher misbehavior; most failure modes are already there.
 - `docs/PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
 - `docs/claude_prompt.md` — legacy manual prompt for humans; never load as instructions.
+- `docs/NEXT_STEPS.md` — the hardening backlog (48 verified findings, P0/P1/P2) from the
+  2026-09-01 audit. Check it before starting any fix; P0 gates the productization work.
+- `docs/PRODUCT_PLAN.md` — how this pipeline is being sold as a managed service, with the
+  per-client-config roadmap. Read before adding a feature, so it lands on the right phase.
 
 ## Session hygiene
 `/clear` between unrelated tasks · `/context` to audit window usage · long batches run
