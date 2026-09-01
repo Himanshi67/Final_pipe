@@ -109,3 +109,12 @@ graphify-out/
 # allowlist. Previously this was ignored only by a global gitignore on one
 # machine, so a fresh clone elsewhere would have committed it.
 .claude/settings.local.json
+
+# Planning docs that stay OFF the public remote (origin is a public GitHub repo).
+# They live on disk and CLAUDE.md points at them, but they are never committed:
+#   NEXT_STEPS.md  - the open-defect list for a live storefront's pipeline
+#   PRODUCT_PLAN.md - pricing, revenue projections, client names, and notes on
+#                     what outside work the owner's employer permits
+# If this repo ever becomes private, delete these two lines and commit them.
+docs/NEXT_STEPS.md
+docs/PRODUCT_PLAN.md

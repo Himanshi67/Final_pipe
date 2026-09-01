@@ -149,10 +149,13 @@ subagent over 20 tool calls in the main context.
   BEFORE diagnosing any enricher misbehavior; most failure modes are already there.
 - `docs/PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
 - `docs/claude_prompt.md` — legacy manual prompt for humans; never load as instructions.
-- `docs/NEXT_STEPS.md` — the hardening backlog (48 verified findings, P0/P1/P2) from the
-  2026-09-01 audit. Check it before starting any fix; P0 gates the productization work.
-- `docs/PRODUCT_PLAN.md` — how this pipeline is being sold as a managed service, with the
-  per-client-config roadmap. Read before adding a feature, so it lands on the right phase.
+- `docs/NEXT_STEPS.md` — **LOCAL ONLY, gitignored** (not on the public remote). The
+  hardening backlog (48 verified findings, P0/P1/P2) from the 2026-09-01 audit. Check it
+  before starting any fix. All 7 P0s are closed; the P1/P2 list is still open.
+- `docs/PRODUCT_PLAN.md` — **LOCAL ONLY, gitignored** (pricing, revenue and client names;
+  must not reach the public remote). How this pipeline is being sold as a managed service,
+  with the per-client-config roadmap. Read before adding a feature, so it lands on the
+  right phase.
 
 ## Session hygiene
 `/clear` between unrelated tasks · `/context` to audit window usage · long batches run
