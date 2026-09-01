@@ -832,6 +832,19 @@ def is_blocked(url):
     return False
 
 
+def url_without_query(url):
+    """The URL with ?query and #fragment removed.
+
+    A search-result URL a human pastes ('.../dp/<other asin>/ref=sr_1_3
+    ?keywords=<the model>') carries the model code in its query string while
+    the path points at a different product, so only scheme/host/path may ever
+    be used to verify a model code."""
+    try:
+        return urlsplit(str(url or ""))._replace(query="", fragment="").geturl()
+    except Exception:
+        return str(url or "")
+
+
 def canonical_url(url):
     d = domain_of(url)
     if "amazon." in d:
@@ -2325,7 +2338,11 @@ def assess(rec, sku, model, brand, min_price, max_price):
     """
     title = re.sub(r"\s+", " ", rec["title"]).strip()
     t_low = " " + title.lower() + " "
-    title_n, url_n = norm(title), norm(rec["url_link"])
+    # Only the SCHEME/HOST/PATH may vouch for a model code. A pasted search
+    # result carries the model in '?keywords=<model>' while the /dp/ id points
+    # at a DIFFERENT product; trusting the query string made that a 'strong'
+    # match and skipped every unverified-match guard below.
+    title_n, url_n = norm(title), norm(url_without_query(rec["url_link"]))
     brand_n, model_n = norm(brand), norm(model)
 
     # -- hard rejects: accessory / compatibility listings ------------------
@@ -2992,6 +3009,30 @@ def discovery_status(rec):
     return f"NEEDS CRAWL - CHECK LINK ({dom})"
 
 
+RETRY_NOTE_RE = re.compile(r"\s+-\s+retry:.*$", re.S)
+
+
+def retry_status(prev_status, new_status):
+    """Status to write when a RETRY came back with no listing at all.
+
+    A retry (--retry-incomplete / --retry-missing) may only ever IMPROVE a
+    row. A rec carrying nothing but a status - `NOT FOUND - all sources
+    blocked ...` after a transient 403, or `ERROR: ...` - used to overwrite
+    the status of a row that was already FOUND, leaving its verified
+    url_link/title/gallery in place under a status app.py and gui.py refuse
+    to import: the row silently stops being importable and is counted as
+    missed. Keep the verified status and record the failed retry after it.
+    """
+    prev = re.sub(r"\s+", " ", str(prev_status or "")).strip()
+    new = re.sub(r"\s+", " ", str(new_status or "")).strip()
+    if not prev.startswith(("FOUND", "CLOSE", "CHECK")):
+        return new                       # nothing worth protecting
+    if not new or new.startswith(("FOUND", "CLOSE", "CHECK")):
+        return new or prev               # the retry did no worse - let it win
+    prev = RETRY_NOTE_RE.sub("", prev)   # never stack retry notes
+    return f"{prev} - retry: {new}"[:250]
+
+
 def crawl_url(url, sku="", min_images=MIN_IMAGES):
     """PASS 2: extract everything from ONE known URL. Runs no searches.
 
@@ -2999,6 +3040,11 @@ def crawl_url(url, sku="", min_images=MIN_IMAGES):
     donor-hunting here, because hunting donors means searching, and the whole
     point of this pass is that it spends no search credits. A page that turns
     out to have no price says so rather than borrowing one from elsewhere."""
+    # The sheet link comes straight from a browser address bar, so it can drag
+    # a search-result tail ('/ref=sr_1_3?keywords=<model>') behind a DIFFERENT
+    # product id. Canonicalise it the way lookup_sku's run_tier does before
+    # fetching, so the fetch, the cache key and assess() see the same clean URL.
+    url = canonical_url(url)
     _net_before = NET_CALLS
     html, why = fetch(url)
     if not html:
@@ -3232,14 +3278,45 @@ def ensure_writable(path):
                      f"program). Close it and run again.")
 
 
+def atomic_save(wb, path):
+    """Write the workbook to `path` without ever truncating what is there.
+
+    openpyxl rebuilds the .xlsx zip in place, so Ctrl+C (or a crash, or the
+    machine sleeping) mid-save leaves a half-written archive where the ONLY
+    copy of the batch used to be, and the next run dies in load_workbook with
+    BadZipFile. Save to a sibling .tmp and os.replace() it instead - the same
+    pattern cache_put uses - so the destination is either the previous file or
+    the complete new one, never half of either.
+
+    PermissionError still surfaces exactly as before: when Excel holds the
+    output open it is the replace() that is refused, so safe_save's wait-and-
+    retry loop (KI-4) keeps working unchanged.
+    """
+    tmp = path.with_name(path.stem + ".saving.tmp.xlsx")
+    try:
+        wb.save(tmp)
+        try:
+            os.replace(tmp, path)
+        except KeyboardInterrupt:
+            os.replace(tmp, path)   # the rename IS the save - finish it first
+            raise
+    except BaseException:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def safe_save(wb, out):
     """Save the workbook. If Excel has the file open (Windows locks it), wait
     for the user to close it instead of crashing and losing progress.
     Returns the path actually written (a _recovery file as last resort)."""
     for attempt in range(30):                     # up to ~5 minutes
         try:
-            wb.save(out)
-            return out
+            return atomic_save(wb, out)
         except PermissionError:
             log(f"  !! Cannot save '{out.name}' - it is open in Excel. "
                 f"Please close it; retrying in 10s ({attempt + 1}/30)...")
@@ -3247,8 +3324,7 @@ def safe_save(wb, out):
     alt = out.with_name(out.stem + "_recovery.xlsx")
     log(f"  !! Still locked - saving progress to '{alt.name}' instead. "
         f"(Rename it back to '{out.name}' before the next run to resume.)")
-    wb.save(alt)
-    return alt
+    return atomic_save(wb, alt)
 
 # ------------------------------ batch report ------------------------------
 # Everything below used to exist only as terminal scrollback: what the run
@@ -3715,14 +3791,23 @@ def main():
             # ERROR rec carries only a status, so a failed retry still cannot
             # wipe a good row.
             relisted = bool(rec.get("url_link"))
+            # ... and a retry may only IMPROVE a row: when a re-run of an
+            # already-FOUND row comes back with nothing but a NOT FOUND /
+            # ERROR status, the verified status stays and the failed retry is
+            # noted after it (the rec has no other cells to write anyway).
+            keep_status = ""
+            if (args.retry_incomplete or args.retry_missing) and not relisted:
+                keep_status = retry_status(has_status, rec.get("status", ""))
             flag_gallery_collision(rec, str(sku).strip(), r, seen_galleries)
             for key, col in cols.items():
-                if rec.get(key):
+                if key == "status" and keep_status:
+                    ws.cell(row=r, column=col, value=safe_cell(keep_status))
+                elif rec.get(key):
                     ws.cell(row=r, column=col, value=safe_cell(rec[key]))
                 elif relisted and key in ("regular price", "sale price",
                                           "image_url", "specs"):
                     ws.cell(row=r, column=col, value=None)
-            st = rec.get("status", "")
+            st = keep_status or rec.get("status", "")
             if args.discover:
                 # in pass 1 "found" means there is a link to review, which is
                 # the only thing pass 1 was asked for
