@@ -176,5 +176,12 @@ def main():
     return 1 if (wrong or unmapped or surprises) else 0
 
 
+def test_taxonomy_coverage():
+    """The script's own verdict, enforced under pytest too: every case routes
+    to its declared combo and no NEW sub-category is unreachable."""
+    assert main() == 0, ("detect_category coverage regressed - see the MISS / "
+                         "unreachable lines printed above")
+
+
 if __name__ == "__main__":
     sys.exit(main())

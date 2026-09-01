@@ -15,6 +15,11 @@ sys.path.insert(0, ROOT)
 
 import sku_enricher as E                                      # noqa: E402
 
+# A script prints every failure and reports the tally at the end; under
+# pytest a check that only prints is a test that always passes, so check()
+# raises instead. Both modes see the same FAIL lines.
+UNDER_PYTEST = "pytest" in sys.modules
+
 PASS = FAIL = 0
 
 
@@ -26,6 +31,8 @@ def check(label, got, want):
     else:
         FAIL += 1
         print(f"  FAIL {label}: got {got!r}, want {want!r}")
+        if UNDER_PYTEST:
+            raise AssertionError(f"{label}: got {got!r}, want {want!r}")
 
 
 def test_discovery_status():

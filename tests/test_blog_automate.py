@@ -17,6 +17,11 @@ import blog_brief as B                                        # noqa: E402
 import blog_render as R                                       # noqa: E402
 import blog_verify as V                                       # noqa: E402
 
+# A script prints every failure and reports the tally at the end; under
+# pytest a check that only prints is a test that always passes, so check()
+# raises instead. Both modes see the same FAIL lines.
+UNDER_PYTEST = "pytest" in sys.modules
+
 PASS = FAIL = 0
 
 
@@ -28,6 +33,8 @@ def check(label, got, want):
     else:
         FAIL += 1
         print(f"  FAIL {label}: got {got!r}, want {want!r}")
+        if UNDER_PYTEST:
+            raise AssertionError(f"{label}: got {got!r}, want {want!r}")
 
 
 def check_true(label, got):

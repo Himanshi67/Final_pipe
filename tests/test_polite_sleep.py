@@ -13,6 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import sku_enricher as E                                    # noqa: E402
 
+# A script prints every failure and reports the tally at the end; under
+# pytest a check that only prints is a test that always passes, so check()
+# raises instead. Both modes see the same FAIL lines.
+UNDER_PYTEST = "pytest" in sys.modules
+
 PASS = FAIL = 0
 
 
@@ -24,6 +29,8 @@ def check(label, got, want):
     else:
         FAIL += 1
         print(f"  FAIL {label}: got {got!r}, want {want!r}")
+        if UNDER_PYTEST:
+            raise AssertionError(f"{label}: got {got!r}, want {want!r}")
 
 
 class Recorder:
@@ -139,14 +146,50 @@ def t_default_is_backward_compatible(rec):
     check("polite_sleep with no `since` always sleeps", len(rec.naps), 1)
 
 
-for name, fn in [("cache hit", t_cache_hit),
-                 ("cache miss", t_cache_miss),
-                 ("failed fetch", t_failed_fetch_still_waits),
-                 ("search", t_search),
-                 ("mixed SKU", t_mixed_sku),
-                 ("default", t_default_is_backward_compatible)]:
-    print(f"\n{name}:")
-    with_patched(fn)
+CASES = [("cache hit", t_cache_hit),
+         ("cache miss", t_cache_miss),
+         ("failed fetch", t_failed_fetch_still_waits),
+         ("search", t_search),
+         ("mixed SKU", t_mixed_sku),
+         ("default", t_default_is_backward_compatible)]
 
-print(f"\n{PASS} passed, {FAIL} failed")
-sys.exit(1 if FAIL else 0)
+
+# -- pytest entry points -----------------------------------------------------
+# One test per case. with_patched() always restores the module globals it
+# swapped, so these are safe to collect alongside the other suites.
+def test_cache_hit():
+    with_patched(t_cache_hit)
+
+
+def test_cache_miss():
+    with_patched(t_cache_miss)
+
+
+def test_failed_fetch_still_waits():
+    with_patched(t_failed_fetch_still_waits)
+
+
+def test_search():
+    with_patched(t_search)
+
+
+def test_mixed_sku():
+    with_patched(t_mixed_sku)
+
+
+def test_default_is_backward_compatible():
+    with_patched(t_default_is_backward_compatible)
+
+
+def main():
+    for name, fn in CASES:
+        print(f"\n{name}:")
+        with_patched(fn)
+    print(f"\n{PASS} passed, {FAIL} failed")
+    return 1 if FAIL else 0
+
+
+# NEVER run this at import time: pytest imports the module during collection
+# and a module-level sys.exit aborts the whole session with INTERNALERROR.
+if __name__ == "__main__":
+    sys.exit(main())
