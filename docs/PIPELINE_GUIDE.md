@@ -81,7 +81,10 @@ AND 3+ images — otherwise more sources are tried and the row is flagged.
 **Statuses:** `FOUND (site)` = safe to use · `... - no price shown` /
 `... - only N image(s)` = verified but incomplete, finish by hand ·
 `... - unlisted store, verify` = the only match was on a site outside the known
-retailer list, so give it a glance · `CLOSE MATCH - CHECK` = variant code,
+retailer list, so give it a glance · `... - gallery below Npx floor, verify` =
+every photo is under the HD floor · `... - gallery matches row N (SKU), verify`
+= another row already claimed this exact photo set, so one of the two is the
+wrong product · `CLOSE MATCH - CHECK` = variant code,
 confirm · `CHECK MANUALLY` = brand-level match only · `NOT FOUND - ...` =
 nothing verifiable, and the reason is now spelled out (`all sources blocked`,
 `N page(s) checked, none matched`, `no usable search results`).
@@ -152,8 +155,11 @@ the canonical ones in the output copy (your original file keeps its names).
 :: re-attempt NOT FOUND rows     --retry-missing
 :: re-attempt FOUND rows missing price/images   --retry-incomplete
 :: headless browser for blocked / JS-priced pages  --js-fallback [--js-budget 25]
+:: keep that browser's cookies between runs         --js-profile DIR
 :: test ONE page, touch no spreadsheet             --probe "<product url>"
 :: image requirement (default 3) --min-images 3
+:: image size floor (px, longest edge, measured)  --min-image-px 1000
+:: don't measure images at all (faster, sloppier)  --no-image-check
 :: price sanity band             --min-price 8000 --max-price 60000
 :: wrong column picked?          --sku-col "Model No"    --sheet "Sheet2"
 
@@ -167,6 +173,7 @@ the canonical ones in the output copy (your original file keeps its names).
 :: ignore it for this run         --no-cache
 :: fetch fresh but keep the copy  --refresh-cache     (use when prices moved)
 :: age at which entries stop counting (0 = never)      --cache-ttl 14
+:: keep the cache somewhere else  --cache-dir PATH
 ```
 **Re-running an old batch is now free.** With the cache warm, `--force` replays
 the stored pages through the CURRENT parsers instead of re-downloading and
@@ -429,6 +436,8 @@ prints both routes out (it does not dump raw HTML at you):
 
 | Flag | Meaning |
 |---|---|
+| `--limit N` | At most N products — for smoke tests |
+| `--images auto\|upload\|url\|skip` | `auto` (default) uploads the local `.webp` when `WP_APP_*` is set, else trusts the Images column |
 | `--cookie-file PATH` | file holding your browser's `Cookie` header — preferred, keeps it out of shell history |
 | `--cookie VALUE` | the cookie value inline |
 | `--user-agent UA` | must match the browser that earned the cookie, or the clearance will not be honoured |
@@ -461,11 +470,16 @@ Takes a restorable copy of the products before a risky bulk change.
 
     .venv\Scripts\python.exe wc_checkpoint.py create --label before-seo
     .venv\Scripts\python.exe wc_checkpoint.py list
-    .venv\Scripts\python.exe wc_checkpoint.py restore --label before-seo --commit
+    .venv\Scripts\python.exe wc_checkpoint.py restore 20260901-1204-before-seo --commit
 
 Positional `action` + `name`; flags `--label` `--commit` `--fields` `--sku` `--limit`
 `--cookie-file` `--cookie` `--user-agent`. Snapshots land in `checkpoints\` (anchored
 on the script's own folder). Restore is a dry run unless `--commit`.
+
+`--label` is **create-only** — it names a NEW snapshot `<timestamp>-<label>`. `restore`
+ignores it and restores its positional `name`, which defaults to `latest` (the
+last file by sort), so `restore --label before-seo --commit` would quietly put the
+NEWEST snapshot back, not the labelled one. Run `list` and pass the file name.
 
 ## 4. Features at a glance
 
@@ -483,18 +497,20 @@ QA gate matching the site's real failure modes · reusable Claude prompt
 |---|---|
 | `sku_enricher.py` | Step 1 — fill SKU list from marketplaces |
 | `gui.py` | Recommended — 5-step wizard driving the whole pipeline (browser) |
-| `app.py` | Step 2 — WooCommerce CSV + WebP images (browser, standalone) |
-| `build_csv.py` | Step 2 headless — same formatter, no browser |
-| `validate_csv.py` | Step 3 — QA before import |
-| `wc_publish.py` | Step 4 — publish to WooCommerce over the REST API |
-| `AUTOMATION_OPPORTUNITIES.md` | What else could be automated, ranked |
-| `KNOWN_ISSUES.md` | Diagnosed bugs with line anchors and acceptance tests |
+| `app.py` | Step 3 — WooCommerce CSV + WebP images (browser, standalone; step 2 is the human review of `_filled.xlsx`) |
+| `build_csv.py` | Step 3 headless — same formatter, no browser |
+| `validate_csv.py` | Step 4 — QA before import |
+| `wc_publish.py` | Step 5 — publish to WooCommerce over the REST API |
+| `wc_seo.py` | SEO meta back-fill on products ALREADY live (§3) |
+| `wc_checkpoint.py` | Snapshot / restore live product meta (§3) |
+| `docs\AUTOMATION_OPPORTUNITIES.md` | What else could be automated, ranked |
+| `docs\KNOWN_ISSUES.md` | Diagnosed bugs with line anchors and acceptance tests |
 | `category_map.xlsx` | Category taxonomy — output categories use these exact strings |
-| `requirements.txt` | All dependencies for the three scripts |
+| `requirements.txt` | All dependencies for every root script |
 | `README.md` | Quickstart commands |
-| `PIPELINE_GUIDE.md` | This document |
-| `data_flow.svg` | Visual pipeline diagram (open in a browser) |
-| `claude_prompt.md` | Manual-lookup prompt for flagged rows |
+| `docs\PIPELINE_GUIDE.md` | This document |
+| `docs\data_flow.svg` | Visual pipeline diagram (open in a browser) |
+| `docs\claude_prompt.md` | Manual-lookup prompt for flagged rows |
 
 Generated at runtime: `<name>_filled.xlsx`, `product_images_for_upload\`,
 `wordpress_ready_clean_repaired.csv`, `validation_issues.csv`.
@@ -530,7 +546,8 @@ Two working rules that follow from this:
 ## 6. First-time setup
 
 ```
-cd <path\to>\Final_pipe          :: e.g. D:\...\Catalogue\Final_pipe
+cd D:\Dhruv-Personal\Catalogue\Final_pipe   :: or wherever you cloned it -
+                                            :: every command below runs from the repo root
 python -m venv .venv
 .venv\Scripts\python.exe -m pip install --upgrade pip
 .venv\Scripts\python.exe -m pip install -r requirements.txt

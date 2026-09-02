@@ -422,13 +422,15 @@ def test_sheet_combos_split_and_header_skip():
     df = pd.DataFrame([
         ["Parent Category", "Sub Categories"],
         ["Home Appliances", "Washing Machines, Refrigerators"],
+        # P2-29: ';' is NOT a separator to app.load_category_map, so this
+        # cell holds one sub-category whose name contains a semicolon
         ["Kitchen", "Mixer Grinders; Kettles"],
         ["", "orphan sub"],
     ])
     assert sheet_combos(df) == {
         "Home Appliances > Washing Machines",
         "Home Appliances > Refrigerators",
-        "Kitchen > Mixer Grinders", "Kitchen > Kettles"}
+        "Kitchen > Mixer Grinders; Kettles"}
 
 
 from gui_helpers import (card_queue_index, found_status,
@@ -620,3 +622,177 @@ def test_card_index_stays_put_when_the_card_is_unconfirmed():
 def test_card_index_rests_on_a_confirmed_card_once_nothing_is_left():
     assert card_queue_index([True, True, True], 1) == 1
     assert card_queue_index([True, True, True], 9) == 2
+
+
+# --------------------------------------------------------- P2-27 / P2-34 --
+
+from gui_helpers import (CATEGORY_COMMA_MERGES, eligible_rows,  # noqa: E402
+                         split_subcategories)
+
+# verbatim sku_enricher.py end-of-run line (log(f"serper.dev calls this run:
+# {RUN_STATS['serper_calls']} " f"(~1 credit each).")) - a 3-SKU smoke run
+# never prints the bracketed tally at all, so this is the ONLY evidence.
+SHORT_RUN_LOG = """[1] Row 2: WM-A
+    -> FOUND (croma.com)
+[2] Row 3: WM-B
+    -> FOUND (amazon.in)
+[3] Row 4: WM-C
+    -> NOT FOUND - no usable search results
+Done. 3 rows written.
+serper.dev calls this run: 13 (~1 credit each).
+"""
+
+
+def test_serper_total_read_from_the_end_of_run_line():
+    assert parse_enricher_log(SHORT_RUN_LOG)["serper_calls"] == 13
+
+
+def test_serper_final_line_beats_a_stale_bracketed_tally():
+    log = ("    [20 serper.dev call(s) this run so far - the free tier is "
+           "2,500/month]\n"
+           "serper.dev calls this run: 31 (~1 credit each).\n")
+    assert parse_enricher_log(log)["serper_calls"] == 31
+
+
+def test_serper_tally_still_wins_while_the_run_is_mid_flight():
+    # killed before the summary line: the tally is all there is
+    log = "    [7 serper.dev call(s) this run so far - blah]\n"
+    assert parse_enricher_log(log)["serper_calls"] == 7
+
+
+def test_publish_totals_accumulate_across_chunks():
+    # gui.run_publish_pinned chunks at 150 SKUs and joins the outputs, so a
+    # 300-SKU commit ends with two 'Done:' lines (P2-34)
+    out = ("  CREATE AP-1\n    -> id 11  https://x/1\n"
+           "Done: 148 created, 0 updated, 2 failed.\n"
+           "  CREATE AP-2\n    -> id 12  https://x/2\n"
+           "Done: 150 created, 1 updated, 0 failed.\n")
+    rows, totals = parse_publish_output(out)
+    assert totals == {"created": 298, "updated": 1, "failed": 2}
+    assert [r["sku"] for r in rows] == ["AP-1", "AP-2"]
+
+
+def test_publish_totals_single_chunk_unchanged():
+    _, totals = parse_publish_output("Done: 5 created, 2 updated, 1 failed.\n")
+    assert totals == {"created": 5, "updated": 2, "failed": 1}
+
+
+# ------------------------------------------------------------------ P2-29 --
+
+def test_split_subcategories_merges_the_comma_named_category():
+    cell = ("Mixer Grinders, Juicers, Mixers & Grinders, Kettles, "
+            "Induction Cooktops")
+    assert split_subcategories(cell) == [
+        "Mixer Grinders", "Juicers, Mixers & Grinders", "Kettles",
+        "Induction Cooktops"]
+
+
+def test_sheet_combos_keeps_the_juicers_row_whole():
+    df = pd.DataFrame([
+        ["Kitchen Appliances",
+         "Mixer Grinders, Juicers, Mixers & Grinders, Kettles"],
+    ])
+    combos = sheet_combos(df)
+    assert "Kitchen Appliances > Juicers, Mixers & Grinders" in combos
+    assert "Kitchen Appliances > Juicers" not in combos
+    assert "Kitchen Appliances > Mixers & Grinders" not in combos
+    assert len(combos) == 3
+
+
+def test_category_split_does_not_drift_from_app():
+    """Same deal as the SKU_CODES guard: gui_helpers copies app's splitter
+    (importing app boots Streamlit), so import app HERE and pin the two."""
+    import app                                   # noqa: E402  (lazy on purpose)
+    import gui_helpers
+    assert (tuple(gui_helpers.CATEGORY_COMMA_MERGES)
+            == tuple(app.CATEGORY_COMMA_MERGES))
+    samples = [
+        "Mixer Grinders, Juicers, Mixers & Grinders, Kettles",
+        "Washing Machines, Refrigerators",
+        "Mixer Grinders; Kettles",
+        "Juicers, Mixers & Grinders",
+        "",
+    ]
+    for cell in samples:
+        assert (gui_helpers.split_subcategories(cell)
+                == app._split_subcategories(cell)), cell
+
+
+# ------------------------------------------------------------------ P2-26 --
+
+def test_raw_sku_with_a_backslash_maps_back():
+    # 'WA70A4022FS\TL' style raws: app.prefixed_sku's whitelist turns the
+    # backslash into '-', and _SKU_SANITIZE must do the same
+    assert raw_sku_for_csv_sku("WM-A-B", ["A\\B"]) == "A\\B"
+
+
+# ------------------------------------------------------------------ P2-28 --
+
+ELIGIBLE_ROWS = [
+    # sku, url_link, status, sale price, image_url
+    ("S1", "", "", "", ""),                                    # untouched
+    ("S2", "https://x/2", "FOUND (amazon.in)", "1999", "https://i/2.jpg"),
+    ("S3", "https://x/3", "FOUND (croma.com) - no price shown", "",
+     "https://i/3.jpg"),                                       # incomplete
+    ("S4", "https://x/4", "FOUND (flipkart)", "2999", ""),      # no image
+    ("S5", "", "NOT FOUND - no usable search results", "", ""),  # failed
+    ("S6", "", "ERROR: all sources blocked (amazon.in)", "", ""),  # blocked
+    ("S7", "", "NEEDS LINK - nothing matched", "", ""),
+    ("S8", "https://x/8", "NEEDS CRAWL (amazon.in)", "", "https://i/8.jpg"),
+]
+
+
+def _eligible_df():
+    return pd.DataFrame(
+        [dict(zip(["sku", "url_link", "status", "sale price", "image_url"],
+                  r)) for r in ELIGIBLE_ROWS])
+
+
+def test_eligible_plain_run_takes_fresh_and_blocked_rows_only():
+    # S1 (untouched) + S6 (blocked, transient) - S5/S7 were tried and failed
+    assert eligible_rows(_eligible_df(), []) == 2
+
+
+def test_eligible_crawl_urls_counts_linked_non_found_rows():
+    # S8 only: S2/S3/S4 already start with FOUND, the rest have no link
+    assert eligible_rows(_eligible_df(), ["--crawl-urls"]) == 1
+
+
+def test_eligible_retry_incomplete_counts_half_filled_rows():
+    # every linked row that is short of something - S3 (' - ' suffix, no
+    # price), S4 (no image_url), S8 (linked but never crawled) - plus the
+    # rows a PLAIN run would have taken anyway (S1 untouched, S6 blocked).
+    # S2 is complete and stays skipped.
+    assert eligible_rows(_eligible_df(), ["--retry-incomplete"]) == 5
+
+
+def test_eligible_retry_missing_counts_failed_unlinked_rows():
+    # S1, S5, S6, S7 - every unlinked row, tried or not
+    assert eligible_rows(_eligible_df(), ["--retry-missing"]) == 4
+
+
+def test_eligible_discover_counts_unlinked_untried_rows():
+    # S1 only: pass 1 skips anything with a link OR any status at all - the
+    # blocked-row exemption lives in the plain branch, not this one
+    assert eligible_rows(_eligible_df(), ["--discover"]) == 1
+
+
+def test_eligible_force_and_limit():
+    df = _eligible_df()
+    # --force ignores every skip rule (bar crawl-urls' missing link)
+    assert eligible_rows(df, ["--force"]) == len(ELIGIBLE_ROWS)
+    assert eligible_rows(df, ["--force", "--crawl-urls"]) == 4
+    # --limit caps it the way the enricher's `done >= args.limit` break does
+    assert eligible_rows(df, ["--force", "--limit", "3"]) == 3
+    assert eligible_rows(df, ["--limit", "9"]) == 2
+
+
+def test_eligible_tolerates_a_sheet_read_as_strings():
+    # pd.read_excel(..., dtype=str) gives NaN for every blank cell
+    df = pd.DataFrame([{"sku": "S1", "url_link": float("nan"),
+                        "status": float("nan"), "sale price": float("nan"),
+                        "image_url": float("nan")},
+                       {"sku": float("nan"), "url_link": float("nan"),
+                        "status": float("nan"), "sale price": float("nan"),
+                        "image_url": float("nan")}])
+    assert eligible_rows(df, []) == 1

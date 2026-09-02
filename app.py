@@ -1912,7 +1912,9 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         media_base = MEDIA_BASE
 
     processed_rows = []
-    seen_skus = set()
+    seen_skus = set()            # upper-cased keys (P2-30)
+    seen_skus_exact = set()      # as written, to spot case-ONLY collisions
+    case_only_duplicates = set()
     skipped_duplicates = 0
     unmapped_categories = set()
     gap_counts = {}
@@ -1934,11 +1936,19 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         category_family = ctx['category_family']
         sku = ctx['sku']
 
-        # BUGFIX: identical SKUs used to produce duplicate WooCommerce rows
-        if sku in seen_skus:
+        # BUGFIX: identical SKUs used to produce duplicate WooCommerce rows.
+        # P2-30: compare case-INSENSITIVELY. WooCommerce's SKU uniqueness query
+        # and NTFS both fold case, so 'ha-x1' and 'HA-X1' are one product and
+        # one '<sku>_1.webp' file. The stored SKU keeps its original case - a
+        # live WM-/WH- key whose case changed would duplicate on upsert.
+        sku_key = sku.upper()
+        if sku_key in seen_skus:
             skipped_duplicates += 1
+            if sku not in seen_skus_exact:
+                case_only_duplicates.add(sku)
             continue
-        seen_skus.add(sku)
+        seen_skus.add(sku_key)
+        seen_skus_exact.add(sku)
 
         sale_price = ctx['sale price']
         regular_price = ctx['regular price']
@@ -1998,6 +2008,10 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
     if skipped_duplicates:
         ui.warning(f'Skipped {skipped_duplicates} duplicate SKU row(s) after normalization.')
+    if case_only_duplicates:
+        ui.warning('Some SKUs differed only by letter case and were treated as '
+                   'the same product (WooCommerce and Windows both ignore case): '
+                   + ', '.join(sorted(case_only_duplicates)))
     if unmapped_categories:
         ui.warning('Categories NOT found in the category map (left as detected - '
                    'add them to category_map.xlsx or fix the product data): '

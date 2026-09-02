@@ -65,18 +65,21 @@ fresh SKU, product created, verified, deleted, store left as found.
 
 ## Repo
 
-- Outer git root is the **parent `Catalogue` folder**, not `Final_pipe`.
-- Branch **`main`**, fully pushed to `github.com/atavisticrystal6888/Pipe`
-  (**public**). `clean-snapshot` is a stale leftover, safe to delete.
+- Git root is `Final_pipe` itself (branch **`main`**, remote origin =
+  `https://github.com/atavisticrystal6888/Final_pipe.git`, **public**).
 - `_push_export\` is a separate nested repo with its own remote. **Never
   `git add` it from the outer repo** — it records a gitlink no clone can
   resolve. It is gitignored now; commit inside it instead.
-- `sku_enricher.py` exists in 4 copies; root is the source of truth, mirrored
+- `sku_enricher.py` exists in 4 copies on disk (root, `Sku_enrichment\`,
+  `_push_export\`, `_push_export\Sku_enrichment\` — the last three are the
+  sync-copies skill's mirror targets); root is the source of truth, mirrored
   via the sync-copies skill and hash-verified.
 - Gitignored on purpose and **only on disk**: `.cache\`, `batches\`, `backups\`,
   `product_images_for_upload\`, `Code_Unrelated\_tools\` (92 MB Node), all
   `*.xlsx` **except** `category_map.xlsx` and `SubCategory_Attributes_Master.xlsx`,
-  which are configuration and are committed deliberately.
+  which are configuration and are committed deliberately. (The Master workbook is a
+  REFERENCE COPY read by no script — the enforced attributes live in the
+  'Sub-Category Attributes' sheet of `category_map.xlsx`, `app.load_subcategory_attributes`.)
 
 ## Security incident — mostly closed, one step left
 
@@ -131,7 +134,7 @@ two SKU pairs shared a gallery:
 - Each CDN is upgraded to its original rendition, **verified by measurement**:
   Amazon `._SL1500_.` → 2392px, `._AC_SX466_.` → 2390px (5×). Tata CLiQ wins
   nothing and is correctly left alone.
-- `MIN_IMAGE_EDGE` 500 (skip), `MAX_IMAGE_EDGE` 2400 (downscale only),
+- `MIN_IMAGE_EDGE` 1000 (skip — raised from 500, an HD floor), `MAX_IMAGE_EDGE` 2400 (downscale only),
   `WEBP_QUALITY` 95.
 
 **Audit** (`ISSUES_AUDIT.md`) — 17 findings, 6 fixed. Highlights:

@@ -1624,6 +1624,11 @@ def render_fetch(url):
     page = None
     try:
         page = _PW["ctx"].new_page()
+        # a browser navigation is a live round-trip like any fetch(): count it
+        # so polite_sleep(since=...) still owes the host its delay, even when
+        # the plain HTML for this URL came from the cache (P2-33).
+        global NET_CALLS
+        NET_CALLS += 1
         page.goto(url, wait_until="domcontentloaded", timeout=PW_NAV_TIMEOUT_MS)
         page.wait_for_timeout(PW_SETTLE_MS)
         html = page.content()
@@ -3904,7 +3909,11 @@ def main():
             f"{missed} need one pasted in.")
         log("Next: open the sheet, check the photos and links, and fill "
             "url_link on every row marked NEEDS LINK. Then run:")
-        log(f'  .venv\\Scripts\\python.exe sku_enricher.py "{out.name}" --crawl-urls')
+        # KI-5: name the ORIGINAL list, not '<stem>_filled.xlsx' - the guard in
+        # main() refuses enricher output as an input path. Pass 2 still reads
+        # and updates the filled sheet; it just gets there from the list name.
+        log(f'  .venv\\Scripts\\python.exe sku_enricher.py "{src.name}" --crawl-urls')
+        log(f"  (that reads and updates '{out.name}' in place)")
         log("Nothing is final yet - NEEDS CRAWL rows are not importable, "
             "and app.py will not pick them up.")
     elif args.crawl_urls:

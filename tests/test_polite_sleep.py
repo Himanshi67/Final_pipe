@@ -140,7 +140,53 @@ def t_mixed_sku(rec):
     check("mixed delay is within 3.0-7.0s", 3.0 <= rec.naps[0] <= 7.0, True)
 
 
-# -- 6. no snapshot at all == the old unconditional behaviour ---------------
+# -- 6. a headless RENDER is a live round-trip, even on a cached page --------
+# P2-33: --js-fallback renders croma pages whose plain HTML pass 1 already
+# cached. fetch() makes no network call, so if render_fetch does not count its
+# navigation the whole SKU is treated as cache-only and hits the host at
+# browser speed with no delay at all.
+class _FakePage:
+    def __init__(self, html):
+        self.html = html
+
+    def goto(self, *a, **k):
+        pass
+
+    def wait_for_timeout(self, *a, **k):
+        pass
+
+    def content(self):
+        return self.html
+
+    def close(self):
+        pass
+
+
+def t_render_on_cache_hit(rec):
+    saved = (E.PW_ENABLED, dict(E._PW))
+    try:
+        E.cache_get = lambda kind, key: PAGE
+        E.PW_ENABLED = True
+        E._PW.update({"state": "on", "used": 0, "sku_used": 0,
+                      "ctx": type("Ctx", (), {
+                          "new_page": lambda self: _FakePage(PAGE)})()})
+        before = E.NET_CALLS
+        html, _ = E.fetch("https://www.croma.com/p/9")       # cache hit
+        check("plain fetch was a cache hit", E.NET_CALLS, before)
+        rendered = E.render_fetch("https://www.croma.com/p/9")
+        E.polite_sleep(1.5, 3.0, since=before)
+        check("render returns the page", bool(rendered), True)
+        check("render counts one network call", E.NET_CALLS, before + 1)
+        check("render on a cached page still sleeps", len(rec.naps), 1)
+        check("render delay is within 1.5-3.0s",
+              1.5 <= rec.naps[0] <= 3.0, True)
+    finally:
+        E.PW_ENABLED = saved[0]
+        E._PW.clear()
+        E._PW.update(saved[1])
+
+
+# -- 7. no snapshot at all == the old unconditional behaviour ---------------
 def t_default_is_backward_compatible(rec):
     E.polite_sleep(0.1, 0.2)
     check("polite_sleep with no `since` always sleeps", len(rec.naps), 1)
@@ -151,6 +197,7 @@ CASES = [("cache hit", t_cache_hit),
          ("failed fetch", t_failed_fetch_still_waits),
          ("search", t_search),
          ("mixed SKU", t_mixed_sku),
+         ("render on cache hit", t_render_on_cache_hit),
          ("default", t_default_is_backward_compatible)]
 
 
@@ -175,6 +222,10 @@ def test_search():
 
 def test_mixed_sku():
     with_patched(t_mixed_sku)
+
+
+def test_render_on_cache_hit():
+    with_patched(t_render_on_cache_hit)
 
 
 def test_default_is_backward_compatible():

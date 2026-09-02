@@ -37,7 +37,7 @@ import pandas as pd
 import streamlit as st
 
 from gui_helpers import (BADGE, batch_summary, card_queue_index, classify,
-                         eta_text,
+                         eligible_rows, eta_text,
                          filter_review_df, flag_value, found_status,
                          image_basenames_from_csv, merge_confirm_flags,
                          parse_enricher_log,
@@ -229,9 +229,34 @@ def enricher_running(P) -> bool:
     return pid_alive(meta.get("enricher_pid"), meta.get("enricher_started"))
 
 
+def eligible_total(P, extra_flags: list, fallback: int) -> int:
+    """Rows THIS invocation will really process, for the progress bar and ETA.
+
+    P2-28: a --retry-incomplete / --retry-missing / --crawl-urls / resumed
+    run touches a handful of rows, but the panel was handed the whole
+    sheet's row count, so '3 / 40' and '~37 min left' described a run that
+    ended at 5/40. gui_helpers.eligible_rows mirrors the enricher's own skip
+    rules. Falls back to the full count whenever the sheet cannot be read
+    (not enriched yet, open in Excel, missing columns)."""
+    if not P["filled"].exists():
+        return fallback
+    try:
+        df = pd.read_excel(P["filled"], dtype=str)
+        n = eligible_rows(df, extra_flags)
+    except Exception:
+        return fallback
+    return n or fallback
+
+
 def start_enricher(P, extra_flags: list, total: int):
     """Launch sku_enricher.py detached, stdout -> enricher.log (a file, never a
     pipe: a full pipe buffer would deadlock the child)."""
+    # Two different numbers, two different keys. `total_rows` means "rows in
+    # the sheet" everywhere else (Home dashboard, archive README, the fallback
+    # this file hands the NEXT retry) and must keep meaning that;
+    # `enricher_total` is how many rows THIS launch will actually touch and is
+    # the only value the progress bar and the ETA may divide by.
+    eligible = eligible_total(P, extra_flags, total)
     cmd = [str(VENV_PY), "sku_enricher.py", str(P["input"])] + extra_flags
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     with open(P["log"], "w", encoding="utf-8") as log_f:
@@ -243,7 +268,8 @@ def start_enricher(P, extra_flags: list, total: int):
     st.session_state[f"running_{P['run'].name}"] = True
     update_meta(P, enricher_pid=proc.pid, enricher_started=time.time(),
                 enricher_flags=extra_flags,
-                total_rows=total, enricher_cmd=" ".join(cmd))
+                total_rows=total, enricher_total=eligible,
+                enricher_cmd=" ".join(cmd))
 
 
 def cancel_enricher(P):
@@ -301,7 +327,9 @@ def enricher_panel(P):
                 if P["log"].exists() else "")
         stats = parse_enricher_log(full)
         meta = load_meta(P)
-        total = meta.get("total_rows") or 0
+        # eligible count for THIS launch (P2-28); total_rows is the whole
+        # sheet and is only the fallback for meta written before this key
+        total = meta.get("enricher_total") or meta.get("total_rows") or 0
         done = stats["done"]
         running = enricher_running(P)
         if total:
@@ -395,6 +423,7 @@ def step_enrich(P):
             # made the Home dashboard's 'rows' column report a file that is
             # no longer there
             fresh.pop("total_rows", None)
+            fresh.pop("enricher_total", None)
             save_json(P["meta"], fresh)
             st.rerun()
 
@@ -1477,6 +1506,22 @@ def save_first_sheet(path, edited):
     wb.save(path)
 
 
+def backup_and_save_category_map(path, edited):
+    """Back the taxonomy up, then write the edited first sheet back.
+
+    The two steps belong together and are the whole of the editor's save
+    path, so they live in one plain function tests\\test_gui_runmgr.py can
+    call without a Streamlit session. Returns the backup path; the backup
+    is taken BEFORE the write, so a botched edit is always one file copy
+    away from being undone."""
+    backup = (REPO_ROOT / "backups" /
+              f"category_map_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
+    backup.parent.mkdir(exist_ok=True)
+    shutil.copy2(path, backup)
+    save_first_sheet(path, edited)
+    return backup
+
+
 def category_map_editor():
     """Edit category_map.xlsx in place. app.py snaps categories to these
     EXACT strings, so removals are loud: they are listed and must be
@@ -1509,12 +1554,8 @@ def category_map_editor():
                         if removed else ""), key="catmap_ok")
     if st.button("💾 Save category map", type="primary",
                  disabled=not ok):
-        backup = (REPO_ROOT / "backups" /
-                  f"category_map_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
-        backup.parent.mkdir(exist_ok=True)
-        shutil.copy2(path, backup)
         try:
-            save_first_sheet(path, edited)
+            backup = backup_and_save_category_map(path, edited)
         except PermissionError:
             st.error("category_map.xlsx is open in Excel — close it and "
                      "save again.")
@@ -1574,21 +1615,54 @@ def main():
                                   key="mgr_target")
             tdir = RUNS_DIR / target
             c1, c2 = st.columns(2)
-            if c1.button("📦 Archive to batches\\", key="mgr_archive"):
+            # P2-25: both actions are unsafe while the enricher owns the
+            # folder - rmtree hits enricher.log, which the child holds open
+            # for write, and Windows raises a sharing violation mid-delete;
+            # archive would copy a sheet still being rewritten.
+            busy = enricher_running(run_paths(tdir))
+            if busy:
+                st.caption(f"Enrichment is running in runs\\{target} — stop "
+                           "the enricher first (open the run, then Cancel).")
+            if c1.button("📦 Archive to batches\\", key="mgr_archive",
+                         disabled=busy):
                 dest = REPO_ROOT / "batches" / target
                 if dest.exists():
                     st.error(f"batches\\{target} already exists — rename or "
                              "remove it first; nothing was copied.")
                 else:
-                    n = archive_run(tdir, dest)
-                    st.success(f"Archived {n} file(s) to batches\\{target}. "
-                               "The run folder itself is untouched.")
+                    try:
+                        n = archive_run(tdir, dest)
+                    except OSError as e:
+                        # a sheet open in Excel, an image deleted under us, a
+                        # full disk: a friendly message, never a red traceback
+                        st.error(f"Could not finish archiving runs\\{target}: "
+                                 f"{e.__class__.__name__} — {e}. "
+                                 f"batches\\{target} may be partly written; "
+                                 "remove it and retry.")
+                    else:
+                        st.success(f"Archived {n} file(s) to batches\\{target}."
+                                   " The run folder itself is untouched.")
+            # key MUST carry the target: a static key keeps the tick alive
+            # when the selectbox moves to another run, so the next run could
+            # be deleted with one click and no confirmation (P2-25)
             sure = c2.checkbox(f"Yes, permanently delete runs\\{target}",
-                               key="mgr_sure")
-            if c2.button("🗑 Delete run", disabled=not sure,
+                               key=f"mgr_sure_{target}")
+            if c2.button("🗑 Delete run", disabled=not sure or busy,
                          key="mgr_del"):
-                shutil.rmtree(tdir)
-                st.rerun()
+                try:
+                    shutil.rmtree(tdir)
+                except OSError as e:
+                    # OSError, not PermissionError: the folder can also be
+                    # gone already (Explorer, a second browser tab) or fail
+                    # with a bare OSError - all of them must stay a message
+                    st.error(f"Could not delete runs\\{target} "
+                             f"({e.__class__.__name__}): a file in it is in "
+                             "use (open in Excel or still being written), or "
+                             "the folder changed underneath — refresh and "
+                             "retry. Some files may already have been "
+                             "removed.")
+                else:
+                    st.rerun()
         return
     P = run_paths(run_dir)
 

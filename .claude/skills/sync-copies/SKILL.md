@@ -8,7 +8,7 @@ description: Sync sku_enricher.py (and shared docs) from root to Sku_enrichment/
 Root files are the source of truth. `_push_export\` is an UNTRACKED NESTED git repo
 (own remote: SKU_Scripts.git). The outer repo ALSO has a public GitHub remote
 (origin: Final_pipe.git) - anything committed here can become public, so re-read
-docs/NEXT_STEPS.md's security item before adding docs. Confirm with `git remote -v` — `git remote -v` before assuming a push target.
+docs/NEXT_STEPS.md's security item before adding docs. Confirm with `git remote -v` before assuming a push target.
 
 `_push_export\` keeps a FLAT layout: docs that live in `docs\` at root land at the
 ROOT of `_push_export\`, not in a `docs\` subfolder there. Do not restructure it.
@@ -19,7 +19,7 @@ ROOT of `_push_export\`, not in a `docs\` subfolder there. Do not restructure it
 | `sku_enricher.py` | `Sku_enrichment\`, `_push_export\`, `_push_export\Sku_enrichment\` |
 | `README.md`, `requirements.txt`, `app.py`, `validate_csv.py`, `build_csv.py`, `wc_publish.py` | `_push_export\` (only those that exist there — check first) |
 | `docs\PIPELINE_GUIDE.md`, `docs\claude_prompt.md`, `docs\data_flow.svg`, `docs\HANDOFF.md`, `docs\AUTOMATION_OPPORTUNITIES.md` | `_push_export\` **root** (flatten — drop the `docs\` prefix) |
-| `category_map.xlsx`, `SubCategory_Attributes_Master.xlsx` | `_push_export\` — app.py is unrunnable without the taxonomy. Both repos un-ignore these two despite ignoring `*.xlsx`. |
+| `category_map.xlsx`, `SubCategory_Attributes_Master.xlsx` | `_push_export\` — app.py is unrunnable without the taxonomy. Both repos un-ignore these two despite ignoring `*.xlsx`. The Master workbook is a REFERENCE COPY no script reads; the enforced attributes are the `Sub-Category Attributes` sheet inside `category_map.xlsx` (`app.load_subcategory_attributes`). |
 | `Sku_enrichment\README.md`, `Sku_enrichment\requirements.txt` | `_push_export\Sku_enrichment\` |
 
 **INTENTIONALLY DIVERGENT — never overwrite from root:**

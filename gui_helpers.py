@@ -246,6 +246,12 @@ BADGE = {"found": "🟢", "review": "🟡", "failed": "🔴", "skipped": "⚪",
 _ROW_RE = re.compile(r"^\[(\d+)\] Row \d+", re.M)
 _STATUS_RE = re.compile(r"^    -> (.+)$", re.M)
 _SERPER_RE = re.compile(r"^\s*\[(\d+) serper\.dev call\(s\) this run", re.M)
+# P2-27: the running tally above is printed only every 10 rows
+# (sku_enricher.py `if RUN_STATS["serper_calls"] and done % 10 == 0`), so a
+# short run has NO bracketed line at all and a 25-row run's last one is stale.
+# The end-of-run summary uses a different grammar and has to be matched too.
+_SERPER_FINAL_RE = re.compile(
+    r"^serper\.dev calls this run: (\d+)", re.M)
 
 
 def parse_enricher_log(text):
@@ -257,13 +263,99 @@ def parse_enricher_log(text):
         b = classify(status)
         buckets[b] = buckets.get(b, 0) + 1
     serper = _SERPER_RE.findall(text or "")
+    serper_final = _SERPER_FINAL_RE.findall(text or "")
     return {
         "done": int(done_hits[-1]) if done_hits else 0,
         "buckets": buckets,
-        "serper_calls": int(serper[-1]) if serper else 0,
+        # the summary line is authoritative when present, but a run killed
+        # mid-flight has only the tally - take whichever is higher
+        "serper_calls": max(int(serper[-1]) if serper else 0,
+                            int(serper_final[-1]) if serper_final else 0),
         "cached_searches": (text or "").count("(cached search)"),
         "cached_pages": (text or "").count("(cached page"),
     }
+
+
+def _cell_text(value) -> str:
+    """A sheet cell as text. pd.read_excel(dtype=str) leaves a blank cell as
+    NaN, and `str(nan or "")` is the string 'nan' - which read as a url_link
+    and made every blank row look linked."""
+    if value is None or value != value:
+        return ""
+    return str(value).strip()
+
+
+def _cell_filled(value) -> bool:
+    """openpyxl truthiness of a sheet cell: None, NaN, '' and 0 are empty
+    (the enricher tests `not ws.cell(...).value`)."""
+    if value is None or value != value:
+        return False
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)):
+        return value != 0
+    return bool(str(value).strip())
+
+
+def eligible_rows(df, flags) -> int:
+    """How many rows this invocation will actually process - the ETA total.
+
+    P2-28: every start_enricher call used to pass the FULL sheet row count,
+    so a --retry-incomplete run over 5 of 40 rows showed '3 / 40' and
+    '~37 min left' and then stopped at 5/40. This mirrors sku_enricher.py's
+    per-row skip rules (the `for r in range(2, ws.max_row + 1)` loop, whose
+    `continue`s all fire BEFORE `done += 1`), one branch per flag:
+
+      --crawl-urls       a link is required; a FOUND row is already crawled
+      --discover         only rows with no link and nothing tried yet
+      --retry-incomplete a linked row whose FOUND carries a ' - ' suffix, or
+                         that has no sale price / no image_url
+      --retry-missing    rows with no link that were tried and failed
+      plain              untouched rows only
+
+    A row whose status mentions 'blocked' is transient and stays eligible;
+    --force takes every row (bar a crawl-urls row with no link); --limit
+    caps the count exactly as the enricher's `if args.limit and done >=
+    args.limit: break` does. `df` is the filled sheet as strings."""
+    flags = list(flags or [])
+    force = "--force" in flags
+    crawl = "--crawl-urls" in flags
+    discover = "--discover" in flags
+    retry_incomplete = "--retry-incomplete" in flags
+    retry_missing = "--retry-missing" in flags
+
+    def cell(row, name):
+        return row[name] if name in row.index else None
+
+    n = 0
+    for _, row in df.iterrows():
+        if not _cell_filled(cell(row, "sku")):
+            continue
+        url = _cell_text(cell(row, "url_link"))
+        status = _cell_text(cell(row, "status"))
+        if crawl:
+            if not url:
+                continue                  # gets a NEEDS LINK stamp, not a crawl
+            if not force and status.startswith("FOUND"):
+                continue
+        elif discover:
+            if not force and url:
+                continue
+            if not force and status and not retry_missing:
+                continue
+        elif not force:
+            if url:
+                incomplete = ((status.startswith("FOUND") and " - " in status)
+                              or not _cell_filled(cell(row, "sale price"))
+                              or not _cell_filled(cell(row, "image_url")))
+                if not (retry_incomplete and incomplete):
+                    continue
+            elif status and not retry_missing:
+                if "blocked" not in status.lower():
+                    continue
+        n += 1
+    limit = flag_value(flags, "--limit")
+    return min(n, limit) if limit else n
 
 
 def eta_text(done, total, started_epoch, now_epoch):
@@ -289,7 +381,12 @@ def parse_publish_output(text):
     """wc_publish.py stdout -> (rows, totals). Grammar pinned by
     wc_publish.py's print calls; dry runs emit action lines but no
     outcome, so result stays ''. Taxonomy side-effect lines ('~ would
-    create …') are deeper-indented and never match the action regex."""
+    create …') are deeper-indented and never match the action regex.
+
+    P2-34: a >150-SKU publish is chunked by gui.run_publish_pinned and the
+    chunk outputs are concatenated, so there is one 'Done:' line PER chunk.
+    The totals are SUMMED, not overwritten - keeping only the last chunk's
+    line hid every failure the earlier chunks reported."""
     rows, totals, current = [], {}, None
     for ln in (text or "").splitlines():
         m = _PUB_ACTION_RE.match(ln)
@@ -309,8 +406,8 @@ def parse_publish_output(text):
                 continue
         m = _PUB_SUMMARY_RE.match(ln)
         if m:
-            totals = {"created": int(m.group(1)), "updated": int(m.group(2)),
-                      "failed": int(m.group(3))}
+            for i, key in enumerate(("created", "updated", "failed"), 1):
+                totals[key] = totals.get(key, 0) + int(m.group(i))
     return rows, totals
 
 
@@ -345,6 +442,38 @@ def image_basenames_from_csv(csv_df):
     return names
 
 
+# mirror of app.CATEGORY_COMMA_MERGES / app._split_subcategories, copied for
+# the same reason SKU_CODES is (importing app boots Streamlit and reads the
+# taxonomy workbook). tests/test_gui_helpers.py pins the copy against app.
+CATEGORY_COMMA_MERGES = (
+    (("Juicers", "Mixers & Grinders"), "Juicers, Mixers & Grinders"),
+)
+
+
+def split_subcategories(raw):
+    """Sub-categories out of one category-map cell, EXACTLY as
+    app._split_subcategories does it: split on ',' only, then re-join the
+    taxonomy names that carry a comma of their own.
+
+    P2-29: also splitting on ';' and '|', and never merging, made the map
+    editor's removal warning name combos that do not exist - deleting
+    'Juicers, Mixers & Grinders' was reported as removing 'Juicers' plus
+    'Mixers & Grinders', neither of which any sheet can be grepped for."""
+    parts = [p.strip() for p in str(raw or "").split(",") if p.strip()]
+    merged, i = [], 0
+    while i < len(parts):
+        for (first, second), combined in CATEGORY_COMMA_MERGES:
+            if (parts[i] == first and i + 1 < len(parts)
+                    and parts[i + 1] == second):
+                merged.append(combined)
+                i += 2
+                break
+        else:
+            merged.append(parts[i])
+            i += 1
+    return merged
+
+
 def sheet_combos(df):
     """'Parent > Sub' combos from a category-map dataframe - a light
     mirror of app.load_category_map for DIFFING edits only (the build
@@ -355,11 +484,8 @@ def sheet_combos(df):
         parent = str(vals[0] if vals else "").strip()
         if not parent or parent.lower() == "parent category":
             continue
-        for sub in re.split(r"[,;|\n]", str(vals[1] if len(vals) > 1
-                                            else "")):
-            sub = sub.strip()
-            if sub:
-                combos.add(f"{parent} > {sub}")
+        for sub in split_subcategories(vals[1] if len(vals) > 1 else ""):
+            combos.add(f"{parent} > {sub}")
     return combos
 
 

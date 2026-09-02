@@ -69,7 +69,11 @@ def test_discovery_is_not_importable():
         E.discovery_status({"status": "NOT FOUND"}),
     ]
     for status in statuses:
-        # app.py:1729 and gui.py:541 both gate the import on exactly this
+        # app.main()'s 'Import only verified rows' filter
+        # (status_upper.str.startswith('FOUND')) and
+        # gui_helpers.found_status() both gate the import on exactly this.
+        # Anchor by symbol, not line number - the old app.py:1729 /
+        # gui.py:541 anchors had drifted onto unrelated code.
         check(f"{status[:34]!r} is not importable",
               status.upper().startswith("FOUND"), False)
         check(f"{status[:34]!r} is not blank", bool(status.strip()), True)
@@ -178,9 +182,24 @@ def test_gui_gate_refuses_discovery():
               skipped, ["S1"])
 
 
+def test_discover_hint_names_the_original_list():
+    """P2-32: the 'Next:' banner printed at the end of --discover must name the
+    ORIGINAL list, not '<stem>_filled.xlsx' - main()'s KI-5 guard exits on any
+    input path containing '_filled', so the old banner handed the operator a
+    command that could not run. The banner is inline in main(), not a callable,
+    so this is a SOURCE-LEVEL assertion."""
+    print("the --discover 'Next' banner is a runnable command")
+    src = open(os.path.join(ROOT, "sku_enricher.py"), encoding="utf-8").read()
+    check("the banner names the input list, not the output sheet",
+          'sku_enricher.py "{src.name}" --crawl-urls' in src, True)
+    check("no banner tells the user to feed _filled.xlsx back in",
+          'sku_enricher.py "{out.name}" --crawl-urls' in src, False)
+
+
 def main():
     for test in (test_discovery_status, test_discovery_is_not_importable,
                  test_gui_buckets, test_gui_gate_refuses_discovery,
+                 test_discover_hint_names_the_original_list,
                  test_query_tiers, test_flags_are_exclusive):
         test()
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -128,7 +128,7 @@ And again at download time in `app.py`:
 | Ask the CDN for its largest rendition | — | belt and braces: an older `_filled.xlsx` captured before the enricher learned this still gets full resolution, with no re-scrape and no credits |
 | `WEBP_QUALITY` | 95 | WooCommerce re-encodes its own thumbnails from this master, so softness compounds |
 | `MAX_IMAGE_EDGE` | 2400, **downscale only** | never upscale — enlarging invents detail and looks worse than the original |
-| `MIN_IMAGE_EDGE` | 1000, skipped + named | one image fewer beats a blurry one on the page |
+| `MIN_IMAGE_EDGE` | 1000, skipped + named | raised from 500: a 500 px master goes soft in the zoom/lightbox; one image fewer beats a blurry one |
 | `GOOD_IMAGE_PX` | 1000, QA flag | usable but soft; reported by `validate_csv.py`, never silently shipped |
 
 The rewrite runs at **download** time as well as scrape time, so an existing
@@ -147,8 +147,12 @@ resize params, and a broken URL costs the image entirely.
 | `FOUND ... - no price shown` / `- only N image(s)` | verified but incomplete; retry with `--retry-incomplete` |
 | `FOUND ... - unlisted store, verify` | matched on a domain we do not recognise — eyeball it |
 | `FOUND ... - MRP <reason>, check` | the MRP failed a sanity test (at/below price, or >4× it) |
+| `FOUND ... - gallery below Npx floor, verify` | every photo is smaller than the HD floor; the build may drop them |
+| `FOUND ... - gallery matches row N (SKU), verify` | another row already claimed this exact photo set — one of the two is the wrong product |
 | `CLOSE MATCH - CHECK` / `CHECK MANUALLY` | your review list |
+| `NOT FOUND - no usable search results` | search returned nothing worth fetching |
 | `NOT FOUND - all sources blocked (...)` | the sites blocked us; retried automatically next run |
+| `NOT FOUND - N source(s) blocked, ...` | some sites blocked us and the rest did not match; retried next run |
 | `NOT FOUND - N page(s) checked, none matched` | genuinely not found; needs manual research |
 | `ERROR: ...` | something broke on that row; the rest of the batch continued |
 
@@ -223,7 +227,10 @@ blocked the run. `--no-report` turns it off.
   git — that folder is the only copy.
 - `category_map.xlsx` and `SubCategory_Attributes_Master.xlsx` **are** in git,
   unlike every other `.xlsx`. They are configuration: without the taxonomy,
-  app.py cannot map a single category.
+  app.py cannot map a single category. `SubCategory_Attributes_Master.xlsx` is a
+  REFERENCE COPY that no script reads — the attributes actually enforced live in
+  the `Sub-Category Attributes` sheet of `category_map.xlsx`
+  (`app.load_subcategory_attributes`), so edit them there.
 
 ## Known blocker — the store is behind a browser challenge
 

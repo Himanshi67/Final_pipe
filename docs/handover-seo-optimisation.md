@@ -162,13 +162,15 @@ retried; a 404 means the same thing every time.
 
 ---
 
-## 7. Tests — ⚠️ ACTION NEEDED
+## 7. Tests — ACTION NEEDED (still open, re-checked 2026-09-02)
 
-**287 assertions across 6 suites, all passing.** They live in the **session
-scratchpad**, which is temporary and will be lost:
+**287 assertions across 6 suites, all passing at the time — but ACTION NEEDED:
+those six files were never moved into the repo and are gone.** They were written
+in that session's scratchpad (since cleared), so the assertions below survive
+only as this list:
 
 ```
-<session scratchpad, since superseded - these now live in tests\>
+LOST (session scratchpad, never committed - none of these exist in tests\)
   test_enricher_new.py   61   cache, spec tables, merge, batch report
   test_app_new.py        67   scraped specs, spec-gap gate, SEO pass
   test_wc_seo.py         36   plan/fetch/safety defaults
@@ -180,9 +182,13 @@ scratchpad**, which is temporary and will be lost:
 Plus benchmarks: `ab_commit.py` (old vs new parser), `bench_parse.py`,
 `ab_opt.py`, `ab_images.py`, `make_pre_seo_checkpoint.py`.
 
-`HANDOFF.md` says tests deliberately live outside the repo. **That convention
-now costs 287 assertions per session.** Worth deciding whether to move them
-into `Final_pipe/tests/`.
+The repo's own suite (`git ls-files tests`) covers different ground —
+`test_bugfixes.py`, `test_two_pass.py`, `test_polite_sleep.py`,
+`test_category_coverage.py`, `test_hd_images.py`, `test_crawl_findings.py`,
+`test_break_handler.py`, `test_blog_automate.py`, plus the untracked
+`test_gui_*.py` — so `wc_seo.py` and the SEO pass described here have **no
+committed coverage**. Write what you need before changing them; the benchmark
+scripts above are gone too.
 
 ---
 
@@ -210,7 +216,8 @@ into `Final_pipe/tests/`.
 
 1. **Purge LiteSpeed cache** so the SEO meta is actually served.
 2. **Decide Yoast vs Rank Math** and disable the other.
-3. **Preserve the test suites** before the scratchpad disappears (§7).
+3. **Rewrite the six lost test suites** — the scratchpad they lived in is gone
+   and none of them reached `tests\` (§7).
 4. `blog_automate --llm` unproven against the real API (needs a key).
 5. `AUTOMATION_OPPORTUNITIES.md` items 5, 11, 12 remain unbuilt
    (auto-completeness loop, Serper credit tracking, unattended scheduling).

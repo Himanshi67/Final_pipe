@@ -13,6 +13,7 @@ assert the wizard's structure: boot, run creation, step gating, and that each
 step renders against seeded artifacts without raising.
 """
 
+import json
 import sys
 import tempfile
 import traceback
@@ -319,6 +320,199 @@ def test_preview_drops_the_rows_the_build_drops():
 
     # the window is still 5 rows of what the build writes
     assert len(gui.preview_build_rows(pf, app, limit=1)) == 1
+
+
+# ------------------------------------------------------------------ P2-25 --
+
+def home(runs_dir):
+    """The '🏠 All runs' page, where the run manager lives (the sidebar
+    lands on the newest run, so it has to be selected)."""
+    at = boot(runs_dir)
+    at.sidebar.selectbox[0].set_value("🏠 All runs").run(timeout=60)
+    return at
+
+
+def manage_buttons(at):
+    return {"archive": next(b for b in at.button
+                            if "Archive" in str(b.label)),
+            "delete": next(b for b in at.button
+                           if "Delete run" in str(b.label))}
+
+
+def test_manage_buttons_are_dead_while_the_enricher_owns_the_run(tmp):
+    """P2-25: Archive and Delete must both be disabled, with a caption
+    saying so, while that run's enricher is alive - rmtree would hit
+    enricher.log, which the child holds open for write."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "busy")
+    (run / "run_meta.json").write_text(
+        json.dumps({"enricher_pid": 4242, "enricher_started": 1.0,
+                    "total_rows": 3}), encoding="utf-8")
+    real = gui.pid_alive
+    gui.pid_alive = lambda pid, started=None: bool(pid)   # no real syscall
+    try:
+        at = home(runs)
+    finally:
+        gui.pid_alive = real
+    assert_no_exception(at)
+    btns = manage_buttons(at)
+    assert btns["archive"].disabled, "Archive stayed clickable mid-run"
+    assert btns["delete"].disabled, "Delete stayed clickable mid-run"
+    assert any("stop the enricher first" in str(c.value)
+               for c in at.caption), [str(c.value) for c in at.caption]
+
+
+def test_manage_buttons_are_live_when_no_enricher_owns_the_run(tmp):
+    """P2-25 control: with no live PID only the delete confirmation gates
+    Delete, Archive is clickable, and the warning caption is absent."""
+    runs = tmp / "runs"
+    seeded_run(runs, "idle")
+    at = home(runs)
+    assert_no_exception(at)
+    btns = manage_buttons(at)
+    assert not btns["archive"].disabled
+    assert btns["delete"].disabled, "delete needs the confirmation checkbox"
+    assert not any("stop the enricher first" in str(c.value)
+                   for c in at.caption)
+
+
+# --------------------------------------------- P2-25 (second half) --
+
+
+def mgr_select(at):
+    """The run manager's own 'Run' selectbox (the sidebar has one too)."""
+    return next(s for s in at.selectbox if str(s.label) == "Run")
+
+
+def delete_tick(at):
+    return next(c for c in at.checkbox if "permanently delete" in str(c.label))
+
+
+def test_delete_confirmation_does_not_carry_to_another_run(tmp):
+    """P2-25 (missed on the first pass): the confirmation checkbox used a
+    static key while its label named the selected run, so ticking it for one
+    run left it ticked when the selectbox moved to another - and the next
+    run was one unconfirmed click from deletion."""
+    runs = tmp / "runs"
+    seeded_run(runs, "aaa")
+    seeded_run(runs, "bbb")
+    at = home(runs)
+    assert_no_exception(at)
+    first = str(mgr_select(at).value)
+    other = "aaa" if first == "bbb" else "bbb"
+
+    delete_tick(at).set_value(True).run(timeout=60)
+    assert not manage_buttons(at)["delete"].disabled,         "confirming the selected run should arm Delete"
+
+    mgr_select(at).set_value(other).run(timeout=60)
+    assert_no_exception(at)
+    tick = delete_tick(at)
+    assert ("runs\\" + other) in str(tick.label)
+    assert tick.value is False,         "the confirmation carried over to a run that was never confirmed"
+    assert manage_buttons(at)["delete"].disabled,         "Delete was armed on a run the operator never confirmed"
+    assert (runs / "aaa").exists() and (runs / "bbb").exists()
+
+
+def test_delete_reports_any_os_error_instead_of_a_traceback(tmp):
+    """P2-25: the guard caught PermissionError only. A folder removed in
+    Explorer (FileNotFoundError) or a bare OSError from a second browser tab
+    between render and click still put a red traceback on the page."""
+    import shutil as sh
+    for exc in (PermissionError(13, "in use"),
+                FileNotFoundError(2, "no such directory"),
+                OSError(39, "directory not empty")):
+        runs = tmp / f"runs_{exc.__class__.__name__}"
+        seeded_run(runs, "doomed")
+        at = home(runs)
+        delete_tick(at).set_value(True).run(timeout=60)
+
+        def boom(*a, **k):
+            raise exc
+        real = sh.rmtree
+        sh.rmtree = boom
+        try:
+            manage_buttons(at)["delete"].click().run(timeout=60)
+        finally:
+            sh.rmtree = real
+        assert_no_exception(at)
+        assert any("Could not delete" in str(e.value) for e in at.error),             f"{exc.__class__.__name__} produced no friendly error"
+
+
+def test_archive_reports_a_copy_failure_instead_of_a_traceback(tmp):
+    """The archive_run copy loop was unguarded: a sheet locked in Excel or an
+    image deleted under the copy raised straight through st.button."""
+    import gui
+    runs = tmp / "runs"
+    seeded_run(runs, "arch")
+
+    def boom(run_dir, dest):
+        raise OSError(13, "Permission denied")
+
+    real_root, real_arch = gui.REPO_ROOT, gui.archive_run
+    gui.REPO_ROOT = tmp / "repo"   # never the real batches folder
+    gui.archive_run = boom
+    try:
+        at = home(runs)
+        manage_buttons(at)["archive"].click().run(timeout=60)
+    finally:
+        gui.REPO_ROOT, gui.archive_run = real_root, real_arch
+    assert_no_exception(at)
+    assert any("Could not finish archiving" in str(e.value)
+               for e in at.error), [str(e.value) for e in at.error]
+
+
+# ------------------------------------------------------------------ P2-28 --
+
+
+def launch_enricher(run_dir_str, flags):
+    """AppTest entry: gui.start_enricher with Popen stubbed (no subprocess)."""
+    import subprocess
+    from pathlib import Path as _P
+    import gui
+
+    class _Proc:
+        pid = 9999
+
+    real = subprocess.Popen
+    subprocess.Popen = lambda *a, **k: _Proc()
+    try:
+        gui.start_enricher(gui.run_paths(_P(run_dir_str)), list(flags), 40)
+    finally:
+        subprocess.Popen = real
+
+
+def test_retry_launch_keeps_total_rows_as_the_sheet_count(tmp):
+    """P2-28 regression guard: the ETA denominator must live in its own key.
+    `total_rows` means 'rows in the sheet' to the Home dashboard, to
+    archive_run's README and to the fallback step 2 hands the NEXT retry, so
+    a retry launch may not overwrite it with the eligible count."""
+    import openpyxl
+
+    run = tmp / "runs" / "r"
+    run.mkdir(parents=True)
+    (run / "input.xlsx").write_bytes(b"")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(FILLED_HEADERS)
+    for i in range(40):                       # 5 of 40 rows are incomplete
+        incomplete = i < 5
+        ws.append([f"SKU-{i}", "Some Washer", 25000,
+                   "" if incomplete else 22599,
+                   "https://example.com/x",
+                   "" if incomplete else "https://example.com/x1.jpg",
+                   "", "FOUND (amazon)" + (" - no price shown" if incomplete
+                                           else ""), "", "Samsung"])
+    wb.save(run / "input_filled.xlsx")
+
+    at = AppTest.from_function(launch_enricher,
+                               args=(str(run), ["--retry-incomplete"]))
+    at.run(timeout=60)
+    assert not at.exception, [e.value for e in at.exception]
+
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["total_rows"] == 40,         f"total_rows must stay the sheet count, got {meta['total_rows']}"
+    assert meta["enricher_total"] == 5,         f"enricher_total must be the eligible count, got {meta}"
 
 
 # ------------------------------------------------------------------ main --

@@ -1092,6 +1092,41 @@ def test_31_stabilizer_free_family():
               ("Small Appliances", "Voltage Stabilizers & Regulators"))
 
 
+def test_32_sku_dedupe_ignores_case():
+    """P2-30: WooCommerce's SKU uniqueness check and NTFS both fold case, so
+    'ha-x1' and 'HA-X1' are one product and one '<sku>_1.webp'. Two rows that
+    differ only by case used to produce two CSV rows whose image files
+    collided on disk.
+
+    NB: the pair must not begin with a SKU_PREFIXES code. prefixed_sku matches
+    those case-SENSITIVELY, so 'ha-x1'/'HA-X1' come out of it as 'AC-ha-x1'
+    and 'AC-X1' - different products by then, and different filenames, so they
+    never reach the dedupe as a case-only pair. That is a separate defect in
+    prefixed_sku; this test pins the dedupe."""
+    section("#32 SKUs that differ only by letter case are one product")
+    df = pd.DataFrame([
+        {"sku": "zx-x1", "title": "Haier 1.5 Ton Split AC ZX-X1",
+         "categories": "", "Brands": "", "regular price": "30000",
+         "sale price": "27000", "url_link": "", "image_url": ""},
+        {"sku": "ZX-X1", "title": "Haier 1.5 Ton Split AC ZX-X1",
+         "categories": "", "Brands": "", "regular price": "30000",
+         "sale price": "27000", "url_link": "", "image_url": ""},
+    ])
+    tmp = Path(tempfile.mkdtemp())
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)                       # no image_url -> no network at all
+        out = app.process_inventory(df, media_base="https://shop.invalid/u")
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
+    check("the case-only duplicate is dropped", len(out), 1)
+    # the FIRST row wins and keeps its own case: re-casing a live WM-/WH- key
+    # would duplicate the product on the next upsert instead of updating it
+    check("the surviving SKU is not re-cased",
+          str(out.iloc[0]["sku"]).endswith("zx-x1"), True)
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -1122,6 +1157,7 @@ def main():
     test_29_attribute_axes_lookup()
     test_30_many_row_parent_lends_no_axes()
     test_31_stabilizer_free_family()
+    test_32_sku_dedupe_ignores_case()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

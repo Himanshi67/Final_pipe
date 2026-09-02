@@ -9,23 +9,23 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
              → validate_csv.py → validation_issues.csv
              → WooCommerce import (manual) | wc_publish.py (REST API)
 
-- `sku_enricher.py` (~3,900 lines, plain functions) — per SKU: brand/model split →
+- `sku_enricher.py` (~3,930 lines, plain functions) — per SKU: brand/model split →
   serper.dev search (DuckDuckGo fallback) → fetch pages (curl_cffi, browser
   impersonation) → site parsers (amazon/flipkart/croma/reliance/ifb/generic JSON-LD,
   dispatched in `extract()`) → spec-table scrape → strict `assess()` verdict →
   `hunt_donors`/`merge_sources` to complete the row → write row → checkpoint-save.
   Interruption-safe; re-running resumes. Pages and searches are cached in `.cache\`,
   so a re-run does no network I/O. Writes `<output>_report.md` at the end.
-- `gui.py` (~1,620 lines, Streamlit) — the 5-step wizard over the whole pipeline
+- `gui.py` (~1,700 lines, Streamlit) — the 5-step wizard over the whole pipeline
   (upload+enrich → review → build CSV → validate → publish), state in `runs\<name>\`.
   It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so the
   pipeline stages stay in those scripts - but since the 2026-08-22 refit it DOES own
   operator-facing logic: a run manager (create/archive/delete `runs\<name>\`), a card
   review mode, image keep/drop, an in-app category-map editor with backups, an SEO
-  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~480 lines).
+  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~600 lines).
   Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
   a URL pasted in.
-- `app.py` (~2,150 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
+- `app.py` (~2,170 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
   to exact strings in `category_map.xlsx`; images saved as `SKU_n.webp`; scraped
   specs become WooCommerce attributes; `_spec_gaps` records attributes the
   sub-category requires but nothing filled; optional SEO meta columns (off by default).
@@ -34,6 +34,15 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   imported and run automatically by `build_csv.py` and the app after generation.
 - `wc_publish.py` — upserts products over the WooCommerce REST API (keyed on SKU).
   Dry-run unless `--commit`; creates drafts unless `--status publish`.
+- `gui_helpers.py` — pure helpers for `gui.py` (enricher-log/publish-output parsing,
+  status classification, batch summary, run_stage, ETA text); imports no Streamlit.
+- `wc_seo.py` — back-fills SEO meta on products ALREADY LIVE, recomputed from each
+  product's own API data with app.py's functions. Dry-run unless `--commit`, fills only
+  EMPTY meta unless `--overwrite`, never touches slugs unless `--slugs`; snapshots via
+  wc_checkpoint.py first unless `--no-checkpoint`.
+- `wc_checkpoint.py create|list|diff|restore` — gzipped JSON snapshot of every live
+  product (incl. all meta_data) under `checkpoints\`; restore writes only with `--commit`
+  and does NOT cover media files, orders, or products created after the snapshot.
 
 ## Environment
 - Windows 11 + PowerShell. Python is ALWAYS `.venv\Scripts\python.exe` — never bare
@@ -47,7 +56,12 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   CHECK (site)` · `CHECK MANUALLY (site)` · `SKIPPED - same unit as row N` ·
   `NOT FOUND` + a reason suffix (`- no usable search results` / `- N page(s) checked,
   none matched` / `- all sources blocked (…)` / `- N source(s) blocked`) · `ERROR: …`
-  (incl. `ERROR: no product data in the page`). Bare and `(site)`-suffixed forms BOTH
+  (incl. `ERROR: no product data in the page`). More FOUND suffixes that still import by
+  default and are asking to be looked at: `- unlisted store, verify` · `- MRP <why>, check`
+  (MRP ≤ price, or > 4x it) · `- gallery below Npx floor, verify` ·
+  `- gallery matches row N (SKU), verify` (two rows share one photo set — one of them
+  is the wrong product). (`FOUND (incomplete)` is NOT a status cell: it is only a
+  bucket label in the end-of-run report.) Bare and `(site)`-suffixed forms BOTH
   occur — match with `startswith`, never `==`.
 - Two-pass statuses (`--discover` only): `NEEDS CRAWL (site)` · `NEEDS CRAWL -
   CHECK LINK (site)` · `NEEDS LINK - <why>`. **None of them start with FOUND**,
