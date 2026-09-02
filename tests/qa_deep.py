@@ -12,7 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(r"d:\Dhruv-Personal\Catalogue\Final_pipe")
+ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv/Scripts/python.exe")
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
@@ -43,6 +43,21 @@ def check(label, cond, detail=""):
 
 def S(n):
     print(f"\n{n}")
+
+
+# Fixtures are built inline rather than copied out of inputs\ - that folder is
+# gitignored, so a fresh checkout has no LED.xlsx to copy from. A bare 'sku'
+# header plus one row per SKU is exactly what the enricher accepts.
+FIXTURE_SKUS = ["SAMSUNG-UA32H4500FUXXL", "LG-32LM563BPTC"]
+
+
+def make_sku_sheet(path, skus):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["sku"])
+    for sku in skus:
+        ws.append([sku])
+    wb.save(path)
 
 
 def run(args, cwd=WORK, env=None, timeout=600):
@@ -140,13 +155,8 @@ def t_hostile_rows():
 # ------------------------------------------------------ enricher flags
 def t_enricher_flags():
     S("MANUAL: enricher flag combinations (warm cache, no credits)")
-    src = openpyxl.load_workbook(ROOT / "inputs/LED.xlsx").active
     for name in ("F1.xlsx", "F2.xlsx", "F3.xlsx"):
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        for r in range(1, 3):
-            ws.append([c.value for c in src[r]])
-        wb.save(WORK / name)
+        make_sku_sheet(WORK / name, FIXTURE_SKUS)
 
     rc, out = run([str(ROOT / "sku_enricher.py"), "F1.xlsx",
                    "--no-image-check", "--no-specs", "--merge-budget", "0"])

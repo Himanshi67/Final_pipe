@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-ROOT = Path(r"d:\Dhruv-Personal\Catalogue\Final_pipe")
+ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv/Scripts/python.exe")
 WORK = Path(tempfile.mkdtemp(prefix="qa_cli_"))
 PASS, ISSUES = 0, []

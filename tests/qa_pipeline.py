@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-ROOT = Path(r"d:\Dhruv-Personal\Catalogue\Final_pipe")
+ROOT = Path(__file__).resolve().parent.parent
 PY = str(ROOT / ".venv/Scripts/python.exe")
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
@@ -63,10 +63,25 @@ def sheet_headers(path):
     return [str(c.value or "") for c in ws[1]]
 
 
+# Fixtures are built inline rather than copied out of inputs\ - that folder is
+# gitignored, so a fresh checkout has no LED.xlsx to copy from. A bare 'sku'
+# header plus one row per SKU is exactly what the enricher accepts.
+FIXTURE_SKUS = ["SAMSUNG-UA32H4500FUXXL", "LG-32LM563BPTC", "HAIER-LE32A9G"]
+
+
+def make_sku_sheet(path, skus):
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["sku"])
+    for sku in skus:
+        ws.append([sku])
+    wb.save(path)
+
+
 # ====================== 1. stage 1 -> stage 2 contract ======================
 def t_stage1_contract():
     S("PIPELINE: stage 1 output satisfies stage 2's declared input contract")
-    shutil.copy(ROOT / "inputs/LED.xlsx", WORK / "P.xlsx")
+    make_sku_sheet(WORK / "P.xlsx", FIXTURE_SKUS)
     rc, out = run([str(ROOT / "sku_enricher.py"), "P.xlsx", "--limit", "3"])
     check("enricher run completes", rc == 0 and "Done. Processed" in out,
           f"rc={rc} {out[-500:]}")
@@ -104,12 +119,7 @@ def t_resume(_filled):
     """A fixed-size input, so 'skipped' cannot be confused with 'moved on to
     the next fresh row' - which is what --limit legitimately does."""
     S("PIPELINE: resume, --retry-incomplete, and the KI-4 recovery file")
-    src = openpyxl.load_workbook(ROOT / "inputs/LED.xlsx").active
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    for r in range(1, 3):                       # header + 2 SKUs, nothing more
-        ws.append([c.value for c in src[r]])
-    wb.save(WORK / "R.xlsx")
+    make_sku_sheet(WORK / "R.xlsx", FIXTURE_SKUS[:2])   # 2 SKUs, nothing more
 
     rc, out = run([str(ROOT / "sku_enricher.py"), "R.xlsx"])
     check("first run processes both rows", "Processed 1 SKUs" in out

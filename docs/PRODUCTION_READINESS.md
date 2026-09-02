@@ -6,20 +6,48 @@ This file supersedes the STATUS columns in ISSUES_AUDIT.md / KNOWN_ISSUES.md
 where they disagree — those docs were last audited 2026-07-28 and several
 "open" items have since been fixed.
 
-## Test baseline (all green, 2026-08-11)
+## Test baseline — the gate (collected 2026-09-02; last full run: 140 passed, 0 failed, 0 skipped)
 
-| Suite | Result |
-|---|---|
-| tests\test_bugfixes.py | 98 passed |
-| tests\test_polite_sleep.py | 19 passed |
-| tests\test_category_coverage.py | 42/42 routed, 0 wrong |
-| tests\test_hd_images.py | 21 passed |
-| tests\test_crawl_findings.py | 36 passed |
-| tests\test_gui_ui.py (NEW — Streamlit AppTest, headless) | 10 passed |
+The whole suite is one command, and it makes no network call and touches no
+live store: `.venv\Scripts\python.exe -m pytest tests -q --no-header -p
+no:cacheprovider` (the `gate` skill runs it after a `py_compile` of the nine
+pipeline scripts). `pytest` 9.x IS a dependency now and lives in `.venv`;
+`tests\conftest.py` supplies what the runner needs — the repo root on
+`sys.path`, `STREAMLIT_SERVER_HEADLESS=true`, a `tmp` fixture for the GUI
+suite's signature, and a `collect_ignore` for the three `qa_*.py` operator
+scripts. 122 tests collect across nine files:
+
+| Suite | Tests collected | Standalone script too |
+|---|---|---|
+| tests\test_blog_automate.py | 14 | yes |
+| tests\test_break_handler.py (needs an attached console, else skips) | 2 | yes |
+| tests\test_bugfixes.py | 29 | yes |
+| tests\test_category_coverage.py | 1 | yes |
+| tests\test_crawl_findings.py | 4 | yes |
+| tests\test_gui_helpers.py | 60 | **no — pytest only** |
+| tests\test_gui_ui.py (Streamlit AppTest, headless) | 15 | yes |
+| tests\test_hd_images.py | 3 | yes |
+| tests\test_polite_sleep.py | 6 | yes |
+| tests\test_two_pass.py | 6 | yes |
+| **total** | **140** | |
+
+"Tests collected" counts pytest test *functions*. Every suite except
+test_gui_helpers.py still carries an `if __name__ == "__main__"` runner
+(`.venv\Scripts\python.exe tests\test_bugfixes.py`), and that mode reports a
+finer-grained tally — one line per assertion — which is why this file used to
+record e.g. "98 passed" against the 23 functions pytest sees in
+test_bugfixes.py. Both modes exercise the same code; the pytest run is the gate.
 
 The GUI suite covers: boot, run creation, step gating/locks, per-step render
 against seeded artifacts, status bucketing, Indian-format price parsing.
-`pytest` is deliberately NOT a dependency — every suite is a standalone script.
+
+Outside the gate: `tests\qa_pipeline.py`, `tests\qa_cli.py` and
+`tests\qa_deep.py` are operator runbooks rather than unit tests — they shell
+out to the real scripts and want a live network and Serper credits, so they are
+run deliberately, never as part of the gate; `conftest.py` keeps pytest from
+collecting them. They no longer need a hardcoded absolute repo path or the
+gitignored `inputs\LED.xlsx` — each resolves its own root and builds an inline
+SKU fixture.
 
 ## End-to-end smoke (2026-08-11, scratch data, no writes)
 

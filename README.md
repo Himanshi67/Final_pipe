@@ -22,9 +22,14 @@ separate, opt-in tool that can use one for prose only; see the bottom.)
 
 Full documentation: **docs/PIPELINE_GUIDE.md** (every flag, every column, where data
 goes). Visual overview: **docs/data_flow.svg**. Pre-diagnosed bugs with line anchors:
-**docs/KNOWN_ISSUES.md**. What else could be automated: **docs/AUTOMATION_OPPORTUNITIES.md**.
-Hardening backlog (48 verified findings): **docs/NEXT_STEPS.md**. How this is being
-productized: **docs/PRODUCT_PLAN.md**. Older narrative state: **docs/HANDOFF.md**
+**docs/KNOWN_ISSUES.md**. Release checklist and the test baseline:
+**docs/PRODUCTION_READINESS.md**. Getting past the store's CDN setting:
+**docs/HOSTINGER_ACCESS.md**. What else could be automated: **docs/AUTOMATION_OPPORTUNITIES.md**.
+The 2026-08-22 GUI refit was designed up front in
+**docs/superpowers/specs/2026-08-22-ui-refit.md**, with its plans alongside it.
+Hardening backlog (48 verified findings): **docs/NEXT_STEPS.md** (local only - not in
+the repository). How this is being productized: **docs/PRODUCT_PLAN.md** (local only -
+not in the repository). Older narrative state: **docs/HANDOFF.md**
 (written 2026-07-28 - predates the GUI refit; trust CLAUDE.md and this file first).
 
 ## One-time setup
