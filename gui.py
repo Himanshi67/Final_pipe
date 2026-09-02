@@ -37,9 +37,10 @@ import pandas as pd
 import streamlit as st
 
 from gui_helpers import (BADGE, batch_summary, card_queue_index, classify,
-                         eligible_rows, eta_text,
+                         csv_signature, eligible_rows, eta_text,
                          filter_review_df, flag_value, found_status,
-                         image_basenames_from_csv, merge_confirm_flags,
+                         image_basenames_from_csv, limit_from_flags,
+                         merge_confirm_flags,
                          parse_enricher_log,
                          parse_image_urls, parse_publish_output,
                          parse_specs_cell, raw_sku_for_csv_sku,
@@ -238,6 +239,14 @@ def eligible_total(P, extra_flags: list, fallback: int) -> int:
     ended at 5/40. gui_helpers.eligible_rows mirrors the enricher's own skip
     rules. Falls back to the full count whenever the sheet cannot be read
     (not enriched yet, open in Excel, missing columns)."""
+    # --limit is knowable from argv alone, so cap the fallback BEFORE the
+    # no-sheet bail-out: on a FIRST launch (no <stem>_filled.xlsx yet) the
+    # documented `--limit 5` smoke run on a 300-row sheet otherwise stored
+    # enricher_total=300 -> '3 / 300' and a ~50x ETA, the P2-28 symptom on
+    # the most common launch path of all.
+    limit = limit_from_flags(extra_flags)
+    if limit:
+        fallback = min(limit, fallback) if fallback else limit
     if not P["filled"].exists():
         return fallback
     try:
@@ -245,6 +254,9 @@ def eligible_total(P, extra_flags: list, fallback: int) -> int:
         n = eligible_rows(df, extra_flags)
     except Exception:
         return fallback
+    # `n or fallback`: a genuine 0-eligible run (everything already done)
+    # collapses to the whole sheet rather than showing 0/0. Known owner nit,
+    # recorded in docs/NEXT_STEPS.md - deliberately left as-is.
     return n or fallback
 
 
@@ -1328,12 +1340,21 @@ def step_publish(P):
                 break
         return worst, "\n".join(outs)
 
+    # The dry-run flag is the SIGNATURE of the CSV that was dry-run, never a
+    # bool: Step 3 re-stamps built_scope/built_skus on every rebuild, so both
+    # guards above pass again on a freshly built CSV while a bare bool would
+    # still be sitting there unlocking Commit for rows nobody dry-ran (build
+    # 'Confirmed rows only' -> dry run -> rebuild 'All FOUND rows' -> commit).
+    # Comparing against the file on disk is also the only form that holds
+    # across sessions: session_state is per-tab, the CSV is shared.
     dry_key = f"dryrun_{P['run'].name}"
+    dry_sig = st.session_state.get(dry_key)
     st.subheader("Ⅰ · Dry run (nothing is written)")
     if st.button("🧪 Dry run", type="primary"):
         with st.spinner("Dry run…"):
             code, out = run_publish_pinned([])
-        st.session_state[dry_key] = (code == 0)
+        dry_sig = csv_signature(P["csv"]) if code == 0 else None
+        st.session_state[dry_key] = dry_sig
         rows, _ = parse_publish_output(out)
         if rows:
             creates = sum(r["action"] == "create" for r in rows)
@@ -1348,8 +1369,11 @@ def step_publish(P):
             "Dry run finished" if code == 0 else "Dry run FAILED — fix before "
             "committing")
 
-    if not st.session_state.get(dry_key):
-        st.caption("Commit unlocks after a successful dry run in this session.")
+    if dry_sig is None or dry_sig != csv_signature(P["csv"]):
+        st.caption(
+            "CSV was rebuilt since the last dry run — dry-run again before "
+            "committing." if dry_sig
+            else "Commit unlocks after a successful dry run in this session.")
         return
 
     st.subheader("Ⅱ · Commit")
@@ -1392,7 +1416,7 @@ def step_publish(P):
             update_meta(P, published=datetime.now().isoformat(timespec="seconds"),
                         published_live=go_live,
                         published_count=len(publish_skus))
-            st.session_state[dry_key] = False
+            st.session_state.pop(dry_key, None)
         else:
             st.error("Publish FAILED — see output above; full log in "
                      f"{P['publish_log'].name}")
@@ -1434,15 +1458,28 @@ def archive_run(run_dir: Path, dest: Path) -> int:
         if f.exists():
             shutil.copy2(f, dest / f.name)
             copied += 1
+    csv_note = ""
     if Pr["csv"].exists():
-        img_dest = dest / "images"
-        img_dest.mkdir(exist_ok=True)
-        csv_df = pd.read_csv(Pr["csv"], dtype=str).fillna("")
-        for name in dict.fromkeys(image_basenames_from_csv(csv_df)):
-            src = REPO_ROOT / "product_images_for_upload" / name
-            if src.exists():
-                shutil.copy2(src, img_dest / name)
-                copied += 1
+        # P2-25: a build killed mid-to_csv leaves a 0-byte (EmptyDataError) or
+        # ragged (ParserError) wordpress_ready.csv - both ValueError, neither
+        # an OSError. Archiving the REST of the run is far more useful than
+        # aborting, so the unreadable CSV only costs the images folder and
+        # earns a line in the README.
+        try:
+            csv_df = pd.read_csv(Pr["csv"], dtype=str).fillna("")
+        except (OSError, ValueError) as e:
+            csv_df = None
+            csv_note = (f"\n- **The CSV could not be read** "
+                        f"({e.__class__.__name__}), so NO images were "
+                        f"archived. Rebuild the CSV and archive again.\n")
+        if csv_df is not None:
+            img_dest = dest / "images"
+            img_dest.mkdir(exist_ok=True)
+            for name in dict.fromkeys(image_basenames_from_csv(csv_df)):
+                src = REPO_ROOT / "product_images_for_upload" / name
+                if src.exists():
+                    shutil.copy2(src, img_dest / name)
+                    copied += 1
     meta = load_json(Pr["meta"])
     (dest / "README.md").write_text(
         f"# Batch {run_dir.name}\n\n"
@@ -1454,7 +1491,8 @@ def archive_run(run_dir: Path, dest: Path) -> int:
         f"({len(meta.get('built_skus') or [])} SKUs)\n"
         f"- Validation issues: {meta.get('issue_count', '?')}\n"
         f"- Published: {meta.get('published', 'never')}"
-        + (" (LIVE)" if meta.get("published_live") else "") + "\n",
+        + (" (LIVE)" if meta.get("published_live") else "") + "\n"
+        + csv_note,
         encoding="utf-8")
     return copied
 
@@ -1632,9 +1670,11 @@ def main():
                 else:
                     try:
                         n = archive_run(tdir, dest)
-                    except OSError as e:
+                    except (OSError, ValueError) as e:
                         # a sheet open in Excel, an image deleted under us, a
-                        # full disk: a friendly message, never a red traceback
+                        # full disk: a friendly message, never a red traceback.
+                        # ValueError too - pandas' EmptyDataError/ParserError
+                        # on a truncated CSV are ValueError, not OSError (P2-25)
                         st.error(f"Could not finish archiving runs\\{target}: "
                                  f"{e.__class__.__name__} — {e}. "
                                  f"batches\\{target} may be partly written; "

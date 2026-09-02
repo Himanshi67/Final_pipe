@@ -3,11 +3,32 @@
 Unit-tested in tests/test_gui_helpers.py. Keep streamlit (and app.py)
 imports OUT of this module so the tests never boot the app."""
 
+import os
 import re
 
 import pandas as pd
 
 _URL_RE = re.compile(r"^https?://", re.I)
+
+
+def csv_signature(path) -> str | None:
+    """Identity of the CSV file on disk: `"<mtime_ns>:<size>"`, or None when
+    it is missing (or unreadable).
+
+    Step 5 pins its "a dry run succeeded" flag to this string instead of a
+    bare bool: a rebuild in Step 3 rewrites wordpress_ready.csv, the stored
+    signature stops matching, and Commit re-locks. Size catches every scope
+    change (different row count -> different length); mtime_ns catches a
+    same-length rebuild after a review edit. The one gap is a same-length
+    rewrite landing inside the filesystem's mtime tick (on this Windows box
+    ~1 in 4 back-to-back writes reuse st_mtime_ns) - a real Step-3 build
+    downloads images and takes seconds, far longer than that tick.
+    Deliberately NOT a content hash: this runs on every render."""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return f"{stat.st_mtime_ns}:{stat.st_size}"
 
 
 def flag_value(flags, name):
@@ -18,6 +39,18 @@ def flag_value(flags, name):
         return int(str(flags[flags.index(name) + 1]))
     except (ValueError, IndexError):
         return 0
+
+
+def limit_from_flags(flags):
+    """The `--limit N` cap as a positive int, or None when there is none.
+
+    Knowable from argv ALONE - no spreadsheet needed - which is the whole
+    point: gui.eligible_total can apply it on a FIRST launch, before
+    <stem>_filled.xlsx exists. Without it the documented `--limit 5` smoke
+    run on a 300-row sheet wrote enricher_total=300 and the panel showed
+    '3 / 300' with a ~50x ETA (P2-28 on the most common launch path)."""
+    limit = flag_value(flags, "--limit")
+    return limit if limit > 0 else None
 
 
 def sanity_issues(df, min_price=0):
@@ -354,7 +387,7 @@ def eligible_rows(df, flags) -> int:
                 if "blocked" not in status.lower():
                     continue
         n += 1
-    limit = flag_value(flags, "--limit")
+    limit = limit_from_flags(flags)
     return min(n, limit) if limit else n
 
 

@@ -515,6 +515,174 @@ def test_retry_launch_keeps_total_rows_as_the_sheet_count(tmp):
     assert meta["enricher_total"] == 5,         f"enricher_total must be the eligible count, got {meta}"
 
 
+def launch_enricher_total(run_dir_str, flags, total):
+    """launch_enricher, but with the sheet row count passed in - a FIRST
+    launch hands start_enricher the count of the INPUT sheet."""
+    import subprocess
+    from pathlib import Path as _P
+    import gui
+
+    class _Proc:
+        pid = 9999
+
+    real = subprocess.Popen
+    subprocess.Popen = lambda *a, **k: _Proc()
+    try:
+        gui.start_enricher(gui.run_paths(_P(run_dir_str)), list(flags),
+                           int(total))
+    finally:
+        subprocess.Popen = real
+
+
+def _first_launch_total(tmp, flags, sheet_rows=300):
+    """enricher_total after a launch with NO <stem>_filled.xlsx on disk."""
+    run = tmp / "runs" / f"fresh{len(flags)}"
+    run.mkdir(parents=True)
+    (run / "input.xlsx").write_bytes(b"")
+    assert not (run / "input_filled.xlsx").exists()   # the first-launch case
+    at = AppTest.from_function(launch_enricher_total,
+                               args=(str(run), flags, sheet_rows))
+    at.run(timeout=60)
+    assert not at.exception, [e.value for e in at.exception]
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["total_rows"] == sheet_rows          # still the sheet count
+    return meta["enricher_total"]
+
+
+def test_first_launch_with_limit_caps_the_eta_denominator(tmp):
+    """P2-28 on the most common path of all: the documented `--limit 5` smoke
+    run over a 300-row list. eligible_total used to bail to the full count
+    because input_filled.xlsx does not exist yet, so the panel showed
+    '3 / 300' and an ETA ~50x too long. --limit needs no sheet to be read."""
+    assert _first_launch_total(tmp, ["--limit", "5"]) == 5
+
+
+def test_first_launch_without_limit_still_counts_the_whole_sheet(tmp):
+    """The cap is the ONLY thing knowable without the sheet: an uncapped
+    first run must keep falling back to every row in the list."""
+    assert _first_launch_total(tmp, []) == 300
+
+
+# ------------------------------------------------- step 5 dry-run gate --
+
+
+def _write_publish_state(run, rows, scope):
+    """Write the CSV plus the run_meta Step 5 demands before it will show a
+    Dry run button - i.e. exactly what a Step 3 build + Step 4 validate
+    leave behind for that scope."""
+    (run / "wordpress_ready.csv").write_text(
+        "sku,title\n" + "".join(f'"{s}","{t}"\n' for s, t in rows),
+        encoding="utf-8")
+    (run / "run_meta.json").write_text(
+        json.dumps({"validated": True, "issue_count": 0,
+                    "built_scope": scope,
+                    "built_skus": [s for s, _ in rows]}), encoding="utf-8")
+
+
+def publish_wizard(runs_dir, calls):
+    """AppTest entry: the wizard with gui.run_publish stubbed out. No
+    subprocess, no store, no network - every invocation is just recorded so
+    the test can assert what would have been sent."""
+    import gui
+    gui.RUNS_DIR = runs_dir
+
+    def _fake_run_publish(P, extra):
+        calls.append(list(extra))
+        return 0, "DRY RUN\n"
+
+    gui.run_publish = _fake_run_publish
+    gui.main()
+
+
+def _open_step5(runs, calls, timeout=60):
+    at = AppTest.from_function(publish_wizard, args=(runs, calls))
+    at.run(timeout=timeout)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    assert "🔒" not in labels[4], labels
+    at.sidebar.radio[0].set_value(labels[4]).run(timeout=timeout)
+    return at
+
+
+def _click(at, needle, timeout=60):
+    hits = [b for b in at.button if needle in str(b.label)]
+    assert hits, f"{needle!r} missing: {[str(b.label) for b in at.button]}"
+    hits[0].click().run(timeout=timeout)
+    return at
+
+
+def _commit_armed(at) -> bool:
+    """The commit section only renders past the dry-run gate."""
+    return any("I reviewed the dry-run output" in str(c.label)
+               for c in at.checkbox)
+
+
+def _page_text(at) -> str:
+    els = list(getattr(at, "caption", [])) + list(getattr(at, "markdown", []))
+    return " ".join(str(e.value) for e in els)
+
+
+def test_dry_run_unlock_does_not_survive_a_rebuild(tmp):
+    """Step 3 re-stamps built_scope/built_skus on EVERY rebuild, so Step 5's
+    two scope guards pass again on the newly built CSV. While the dry-run
+    flag was a bare bool it was still sitting at True, and Commit stayed
+    armed for rows nobody had dry-run:
+
+        build 'Confirmed rows only' (2 rows) -> dry run -> back to Step 3,
+        rebuild 'All FOUND rows' (3 rows) -> Commit armed, 3 SKUs commit,
+        one of them never dry-run.
+
+    The flag is now the csv_signature of the file that was dry-run, compared
+    against the file on disk at render time - which also re-locks a second
+    tab, where this session's state was never visible at all."""
+    import os
+    import gui
+
+    runs = tmp / "runs"
+    run = runs / "pubgate"
+    run.mkdir(parents=True)
+    (run / "input.xlsx").write_bytes(b"")
+    make_filled(run / "input_filled.xlsx")
+    confirmed_rows = [("WM-SKU-A", "Samsung 7 kg Washer"),
+                      ("RF-SKU-B", "LG 190 L Fridge")]
+    _write_publish_state(run, confirmed_rows, "confirmed")
+
+    calls = []
+    real_run_publish = gui.run_publish
+    saved = {k: os.environ.get(k) for k in ("WC_URL", "WC_KEY", "WC_SECRET")}
+    os.environ.update({"WC_URL": "https://example.invalid",
+                       "WC_KEY": "ck_test", "WC_SECRET": "cs_test"})
+    try:
+        at = _open_step5(runs, calls)
+        assert_no_exception(at)
+        assert not _commit_armed(at), "Commit armed before any dry run"
+
+        _click(at, "Dry run")
+        assert_no_exception(at)
+        assert _commit_armed(at), "a clean dry run must unlock Commit"
+
+        # --- the replay: Step 3 rebuilt, wider scope, same session ---
+        _write_publish_state(run, confirmed_rows + [("AC-SKU-C",
+                                                     "Voltas 1.5 T AC")],
+                             "all_found")
+        at.run(timeout=60)
+        assert_no_exception(at)
+        assert not _commit_armed(at), \
+            "Commit stayed armed on a CSV that was never dry-run"
+        assert "rebuilt since the last dry run" in _page_text(at), \
+            _page_text(at)
+        assert all("--commit" not in c for c in calls), calls
+
+        # --- and dry-running the NEW csv re-arms it ---
+        _click(at, "Dry run")
+        assert_no_exception(at)
+        assert _commit_armed(at), "dry-running the rebuilt CSV must re-unlock"
+        assert sum("AC-SKU-C" in c for c in calls) == 1, calls
+    finally:
+        gui.run_publish = real_run_publish
+        for k, v in saved.items():
+            os.environ.pop(k, None) if v is None else os.environ.update({k: v})
+
+
 # ------------------------------------------------------------------ main --
 
 

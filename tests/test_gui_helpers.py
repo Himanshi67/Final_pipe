@@ -796,3 +796,64 @@ def test_eligible_tolerates_a_sheet_read_as_strings():
                         "status": float("nan"), "sale price": float("nan"),
                         "image_url": float("nan")}])
     assert eligible_rows(df, []) == 1
+
+
+from gui_helpers import limit_from_flags                       # noqa: E402
+
+
+def test_limit_from_flags_reads_the_cap_without_a_sheet():
+    # the whole point: knowable from argv alone, so gui.eligible_total can
+    # apply it on a first launch when <stem>_filled.xlsx does not exist yet
+    assert limit_from_flags(["--limit", "5"]) == 5
+    assert limit_from_flags(["--discover", "--limit", "3", "--force"]) == 3
+
+
+def test_limit_from_flags_is_none_when_there_is_no_usable_cap():
+    for flags in ([], None, ["--force"], ["--limit"], ["--limit", "all"],
+                  ["--limit", "0"], ["--limit", "-2"]):
+        assert limit_from_flags(flags) is None, flags
+
+
+from gui_helpers import csv_signature                          # noqa: E402
+
+
+def test_csv_signature_is_none_when_the_file_is_missing(tmp_path):
+    assert csv_signature(tmp_path / "wordpress_ready.csv") is None
+    # a directory is not a readable CSV either, but it must not raise
+    assert csv_signature(tmp_path) is not None                 # stat works
+    assert csv_signature(tmp_path / "a" / "b.csv") is None     # missing parent
+
+
+def test_csv_signature_is_stable_while_the_file_is_untouched(tmp_path):
+    p = tmp_path / "wordpress_ready.csv"
+    p.write_text("sku,title\nWM-A,one\n", encoding="utf-8")
+    first = csv_signature(p)
+    assert first and csv_signature(p) == first
+
+
+def test_csv_signature_changes_when_the_csv_is_rebuilt(tmp_path):
+    """The gate this backs: Step 3 rebuilding with a wider scope must make
+    the signature stored at dry-run time stop matching."""
+    p = tmp_path / "wordpress_ready.csv"
+    p.write_text("sku,title\nWM-A,one\nRF-B,two\n", encoding="utf-8")
+    two_rows = csv_signature(p)
+    p.write_text("sku,title\nWM-A,one\nRF-B,two\nAC-C,three\n",
+                 encoding="utf-8")
+    assert csv_signature(p) != two_rows
+    # and back to the same row count but edited content: size is equal-ish
+    # only by accident here, so this asserts the pair, not mtime alone
+    p.write_text("sku,title\nWM-A,ONE\nRF-B,two\n", encoding="utf-8")
+    assert csv_signature(p) != two_rows
+
+
+def test_csv_signature_pairs_mtime_and_size(tmp_path):
+    """Both halves are present and load-bearing. A same-length rewrite is
+    caught by mtime_ns alone, which on Windows can reuse a tick for two
+    back-to-back writes - so this asserts the FORM (mtime:size) rather than
+    racing the clock; the real gap is documented in csv_signature."""
+    p = tmp_path / "wordpress_ready.csv"
+    p.write_text("sku,title\nWM-A,one\n", encoding="utf-8")
+    mtime, _, size = csv_signature(p).partition(":")
+    import os
+    stat = os.stat(p)
+    assert mtime == str(stat.st_mtime_ns) and size == str(stat.st_size)

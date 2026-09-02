@@ -6,7 +6,7 @@ This file supersedes the STATUS columns in ISSUES_AUDIT.md / KNOWN_ISSUES.md
 where they disagree — those docs were last audited 2026-07-28 and several
 "open" items have since been fixed.
 
-## Test baseline — the gate (collected 2026-09-02; last full run: 169 passed, 0 failed, 0 skipped)
+## Test baseline — the gate (collected 2026-09-02; last full run: 180 passed, 0 failed, 0 skipped; 1 skips without an attached console)
 
 The whole suite is one command, and it makes no network call and touches no
 live store: `.venv\Scripts\python.exe -m pytest tests -q --no-header -p
@@ -24,13 +24,13 @@ scripts. 122 tests collect across nine files:
 | tests\test_bugfixes.py | 30 | yes |
 | tests\test_category_coverage.py | 1 | yes |
 | tests\test_crawl_findings.py | 4 | yes |
-| tests\test_gui_helpers.py | 76 | **no — pytest only** |
-| tests\test_gui_runmgr.py (archive_run + category-map editor, real functions) | 4 | yes |
-| tests\test_gui_ui.py (Streamlit AppTest, headless) | 21 | yes |
+| tests\test_gui_helpers.py | 82 | **no — pytest only** |
+| tests\test_gui_runmgr.py (archive_run + category-map editor, real functions) | 6 | yes |
+| tests\test_gui_ui.py (Streamlit AppTest, headless) | 24 | yes |
 | tests\test_hd_images.py | 3 | yes |
 | tests\test_polite_sleep.py | 7 | yes |
 | tests\test_two_pass.py | 7 | yes |
-| **total** | **169** | |
+| **total** | **180** | |
 
 "Tests collected" counts pytest test *functions*. Every suite except
 test_gui_helpers.py still carries an `if __name__ == "__main__"` runner

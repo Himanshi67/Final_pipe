@@ -128,6 +128,55 @@ def test_archive_run_without_a_csv_skips_the_images_folder(tmp: Path):
     assert (dest / "README.md").exists()
 
 
+def test_archive_run_survives_a_truncated_csv(tmp: Path):
+    """P2-25: a build killed mid-to_csv leaves a 0-byte wordpress_ready.csv.
+    pandas raises EmptyDataError - a ValueError, NOT an OSError - so the
+    Home-page `except OSError` missed it and the operator got a red
+    traceback. archive_run must now archive everything else, skip the images
+    folder, and say so in a README that names the run."""
+    repo = tmp / "repo"
+    run_dir = repo / "runs" / "truncated"
+    seed_run(run_dir)
+    gui.run_paths(run_dir)["csv"].write_bytes(b"")      # killed mid-write
+    seed_images(repo, ["WM-A_1.webp"])
+
+    dest = repo / "batches" / "truncated"
+    old_root = gui.REPO_ROOT
+    gui.REPO_ROOT = repo
+    try:
+        copied = gui.archive_run(run_dir, dest)         # must NOT raise
+    finally:
+        gui.REPO_ROOT = old_root
+
+    assert copied == 4                                 # the 4 output files
+    assert not (dest / "images").exists()
+    readme = (dest / "README.md").read_text(encoding="utf-8")
+    assert "# Batch truncated" in readme               # names the run
+    assert "could not be read" in readme and "EmptyDataError" in readme
+
+
+def test_archive_run_survives_a_ragged_csv(tmp: Path):
+    """The other truncation shape: a row with more fields than the header,
+    which pandas rejects with ParserError (also a ValueError)."""
+    repo = tmp / "repo"
+    run_dir = repo / "runs" / "ragged"
+    seed_run(run_dir)
+    gui.run_paths(run_dir)["csv"].write_text(
+        "sku,title\nWM-A,Washer A\nWM-B,Washer B,stray,fields\n",
+        encoding="utf-8")
+    dest = repo / "batches" / "ragged"
+    old_root = gui.REPO_ROOT
+    gui.REPO_ROOT = repo
+    try:
+        copied = gui.archive_run(run_dir, dest)
+    finally:
+        gui.REPO_ROOT = old_root
+    assert copied == 4
+    assert not (dest / "images").exists()
+    assert "could not be read" in (
+        dest / "README.md").read_text(encoding="utf-8")
+
+
 # ------------------------------------------------- category-map editor --
 
 def make_two_sheet_map(path: Path):

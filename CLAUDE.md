@@ -16,13 +16,13 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   `hunt_donors`/`merge_sources` to complete the row → write row → checkpoint-save.
   Interruption-safe; re-running resumes. Pages and searches are cached in `.cache\`,
   so a re-run does no network I/O. Writes `<output>_report.md` at the end.
-- `gui.py` (~1,700 lines, Streamlit) — the 5-step wizard over the whole pipeline
+- `gui.py` (~1,740 lines, Streamlit) — the 5-step wizard over the whole pipeline
   (upload+enrich → review → build CSV → validate → publish), state in `runs\<name>\`.
   It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so the
   pipeline stages stay in those scripts - but since the 2026-08-22 refit it DOES own
   operator-facing logic: a run manager (create/archive/delete `runs\<name>\`), a card
   review mode, image keep/drop, an in-app category-map editor with backups, an SEO
-  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~600 lines).
+  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~640 lines).
   Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
   a URL pasted in.
 - `app.py` (~2,170 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
