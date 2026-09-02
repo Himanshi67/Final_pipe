@@ -150,9 +150,38 @@ def test_flags_are_exclusive():
           "two halves of one flow" in (out.stdout + out.stderr), True)
 
 
+def test_gui_gate_refuses_discovery():
+    """The other half of the gate: even a human ✔ cannot import a discovery
+    row. gui.py confirms and builds through gui_helpers, so both the tick
+    and the build scope have to say no."""
+    print("a tick on a discovery row cannot reach the CSV")
+    import pandas as pd                                       # noqa: E402
+    from gui_helpers import found_status, select_build_rows   # noqa: E402
+
+    statuses = [
+        E.discovery_status({"url_link": "https://x.test/p",
+                            "status": "FOUND (x.test)"}),
+        E.discovery_status({"url_link": "https://x.test/p",
+                            "status": "CLOSE MATCH - CHECK (x.test)"}),
+        E.discovery_status({"url_link": "https://x.test/p",
+                            "status": "CHECK MANUALLY (x.test)"}),
+        E.discovery_status({"status": "NOT FOUND"}),
+        E.discovery_status({}),
+    ]
+    for status in statuses:
+        check(f"{status[:34]!r} is not tickable", found_status(status), False)
+        df = pd.DataFrame([{"sku": "S1", "status": status}])
+        kept, skipped = select_build_rows(df, "confirmed", {"S1"})
+        check(f"{status[:34]!r} is dropped from a confirmed build",
+              len(kept), 0)
+        check(f"{status[:34]!r} is named in the skipped list",
+              skipped, ["S1"])
+
+
 def main():
     for test in (test_discovery_status, test_discovery_is_not_importable,
-                 test_gui_buckets, test_query_tiers, test_flags_are_exclusive):
+                 test_gui_buckets, test_gui_gate_refuses_discovery,
+                 test_query_tiers, test_flags_are_exclusive):
         test()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0

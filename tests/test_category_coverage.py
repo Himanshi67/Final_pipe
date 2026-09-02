@@ -31,6 +31,17 @@ CASES = [
      "LG 1.5 Ton 5 Star AI DUAL Inverter Split AC PS-Q19YNZE"),
     ("Air Conditioner > Non-Inverter AC",
      "Blue Star 1.5 Ton 3 Star Fixed Speed Air Conditioner IA318DNU"),
+    # P1-14: 'Stabilizer Free Operation' is an AC feature (the unit needs no
+    # stabilizer), not a stabilizer. This exact title used to be filed under
+    # Small Appliances > Voltage Stabilizers & Regulators.
+    ("Air Conditioner > Inverter AC",
+     "Voltas Vertis Elite 1.5 Ton 3 Star Inverter Split AC Stabilizer Free "
+     "Operation"),
+    # ...and the same claim is standard refrigerator marketing, so it has to
+    # survive the rules that sit BELOW where the duplicate stabilizer rule was
+    ("Home Appliances > Refrigerators",
+     "LG 260 L 3 Star Frost Free Double Door Refrigerator with Stabilizer "
+     "Free Operation"),
     # ---- Washing Machines ------------------------------------------------
     ("Washing Machines > Front Load",
      "Samsung 8 kg Front Load Washing Machine WW80T504DAB"),

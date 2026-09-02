@@ -143,7 +143,7 @@ def test_batch_summary_empty_frame():
 
 
 from gui_helpers import (parse_image_urls, parse_specs_cell,
-                         raw_sku_for_csv_sku)
+                         raw_sku_for_csv_sku, _sanitized_sku)
 
 
 def test_parse_image_urls_basic_and_blank():
@@ -179,6 +179,71 @@ def test_raw_sku_sanitized_spaces():
 def test_raw_sku_longest_match_wins_and_none():
     assert raw_sku_for_csv_sku("AP-AB-100", ["100", "AB 100"]) == "AB 100"
     assert raw_sku_for_csv_sku("AP-ZZZ", ["AB 100"]) is None
+
+
+def test_raw_sku_recoded_prefix_still_maps_back():
+    """app.prefixed_sku re-codes a raw sku whose prefix contradicts the
+    detected category (P1-13): 'AP-X200' filed under Kitchen Appliances is
+    exported as 'KA-X200'. The review sheet still holds the raw form."""
+    assert raw_sku_for_csv_sku("KA-X200", ["AP-X200"]) == "AP-X200"
+    assert raw_sku_for_csv_sku("KA-X200", ["SA-X200"]) == "SA-X200"
+    # the codes must not swallow an unrelated sku
+    assert raw_sku_for_csv_sku("KA-X200", ["AP-X201"]) is None
+    # and the plain suffix behaviour is unchanged
+    assert raw_sku_for_csv_sku("AP-AB-100", ["AB 100"]) == "AB 100"
+
+
+def test_raw_sku_rules_are_ranked_not_ored():
+    """The code-stripped rule is a LAST resort. Flattening the three rules
+    into one length-ranked match let it beat a true suffix match and made the
+    answer depend on list order - both of which hand a review card, or the
+    'Fix in review' jump, somebody else's product."""
+    # 'X200' (Home Appliances -> 'HA-X200') and 'AC-X200' on one sheet: the
+    # suffix owner wins, whichever order the sheet lists them in
+    assert raw_sku_for_csv_sku("HA-X200", ["X200", "AC-X200"]) == "X200"
+    assert raw_sku_for_csv_sku("HA-X200", ["AC-X200", "X200"]) == "X200"
+    # an exact preimage beats a code-stripped guess, in either order
+    assert raw_sku_for_csv_sku("KA-X200", ["AP-X200", "KA-X200"]) == "KA-X200"
+    assert raw_sku_for_csv_sku("KA-X200", ["KA-X200", "AP-X200"]) == "KA-X200"
+
+
+def test_two_coded_raws_over_one_stem_do_not_depend_on_order():
+    """Refuted case: 'SA-X200' (Small Appliances, ships as itself) and
+    'AP-X200' (Kitchen, re-coded to 'KA-X200') on one sheet. Both reach the
+    code-stripped rank, so list order decided it - the 'SA-X200' card wore the
+    AP row's validation reasons, and 'Fix in review' on 'KA-X200' jumped the
+    operator to 'SA-X200'. The AP- fallback is the code prefixed_sku re-codes
+    as a matter of course, so it wins, in either order."""
+    assert raw_sku_for_csv_sku("KA-X200", ["SA-X200", "AP-X200"]) == "AP-X200"
+    assert raw_sku_for_csv_sku("KA-X200", ["AP-X200", "SA-X200"]) == "AP-X200"
+    # two SPECIFIC codes over one stem cannot be told apart from the raw list
+    # alone; showing no flags beats showing another product's, in either order
+    assert raw_sku_for_csv_sku("KA-X200", ["SA-X200", "EC-X200"]) is None
+    assert raw_sku_for_csv_sku("KA-X200", ["EC-X200", "SA-X200"]) is None
+    # the single-candidate cases the design pins are untouched
+    assert raw_sku_for_csv_sku("KA-X200", ["AP-X200"]) == "AP-X200"
+    assert raw_sku_for_csv_sku("KA-X200", ["SA-X200"]) == "SA-X200"
+    # and a true suffix owner still outranks both coded raws, either order
+    assert raw_sku_for_csv_sku("KA-X200", ["SA-X200", "X200"]) == "X200"
+    assert raw_sku_for_csv_sku("KA-X200", ["X200", "SA-X200"]) == "X200"
+
+
+def test_sanitized_sku_treats_nan_like_app_does():
+    """app.compact() reads a NaN cell as empty; str(nan) would have sanitized
+    to the literal 'nan' and back-mapped a junk row onto a real one."""
+    assert _sanitized_sku(float("nan")) == ""
+    assert _sanitized_sku(None) == ""
+    assert raw_sku_for_csv_sku("AP-NAN", [float("nan")]) is None
+
+
+def test_sku_codes_do_not_drift_from_app():
+    """gui_helpers deliberately does NOT import app (that would boot Streamlit
+    and read the taxonomy workbook in every helper test), so the code list is
+    a copy. Import app HERE, inside the one test that has to compare them, so
+    the drift is still caught."""
+    import app                                   # noqa: E402  (lazy on purpose)
+    import gui_helpers
+    assert tuple(gui_helpers.SKU_CODES) == tuple(app.SKU_PREFIXES)
 
 
 import os
@@ -364,3 +429,194 @@ def test_sheet_combos_split_and_header_skip():
         "Home Appliances > Washing Machines",
         "Home Appliances > Refrigerators",
         "Kitchen > Mixer Grinders", "Kitchen > Kettles"}
+
+
+from gui_helpers import (card_queue_index, found_status,
+                         merge_confirm_flags, select_build_rows)
+
+
+def test_found_status_true_for_every_found_form():
+    for s in ("FOUND", "FOUND (amazon.in)",
+              "FOUND (amazon.in) - no price shown",
+              "FOUND (x) - VERIFY: model differs", "found (x)"):
+        assert found_status(s) is True, s
+
+
+def test_found_status_false_for_everything_else():
+    for s in ("NEEDS CRAWL (amazon.in)", "NEEDS CRAWL - CHECK LINK (x)",
+              "NEEDS LINK - no usable search results",
+              "CLOSE MATCH - CHECK (x)", "CHECK MANUALLY (x)",
+              "NOT FOUND - 3 page(s) checked, none matched",
+              "ERROR: no product data in the page",
+              "SKIPPED - same unit as row 4", "", None):
+        assert found_status(s) is False, s
+
+
+def _orig(rows):
+    """review frame as loaded: sku / confirmed (bool) / status."""
+    base = {"confirmed": False, "status": "FOUND (amazon.in)"}
+    return pd.DataFrame([{**base, **r} for r in rows])
+
+
+def _part(rows):
+    return pd.DataFrame([{"sku": r[0], "confirmed": r[1]} for r in rows])
+
+
+def test_merge_tick_in_all_survives_untouched_bucket_copy():
+    orig = _orig([{"sku": "A"}, {"sku": "B"}])
+    all_tab = _part([("A", True), ("B", False)])
+    bucket = _part([("A", False)])            # untouched copy, processed last
+    flags, rejected = merge_confirm_flags(set(), orig, [all_tab, bucket])
+    assert flags["A"] is True and rejected == []
+
+
+def test_merge_untick_in_all_survives_untouched_bucket_copy():
+    orig = _orig([{"sku": "A", "confirmed": True}])
+    all_tab = _part([("A", False)])
+    bucket = _part([("A", True)])             # still shows the old ✔
+    flags, _ = merge_confirm_flags({"A"}, orig, [all_tab, bucket])
+    assert flags["A"] is False
+
+
+def test_merge_later_part_wins_when_both_changed():
+    orig = _orig([{"sku": "A"}])
+    flags, _ = merge_confirm_flags(set(), orig,
+                                   [_part([("A", True)]), _part([("A", True)])])
+    assert flags["A"] is True
+    orig2 = _orig([{"sku": "A", "confirmed": True}])
+    # All ticks it back on, the bucket tab (later) unticks it -> bucket wins
+    flags2, _ = merge_confirm_flags({"A"}, orig2,
+                                    [_part([("A", True)]), _part([("A", False)])])
+    assert flags2["A"] is False
+
+
+def test_merge_hidden_confirmed_sku_keeps_its_tick():
+    orig = _orig([{"sku": "A", "confirmed": True}, {"sku": "B"}])
+    flags, _ = merge_confirm_flags({"A"}, orig, [_part([("B", False)])])
+    assert flags["A"] is True
+
+
+def test_merge_rejects_tick_on_non_found_row():
+    orig = _orig([{"sku": "A", "status": "NEEDS CRAWL (amazon.in)"},
+                  {"sku": "B"}])
+    flags, rejected = merge_confirm_flags(
+        set(), orig, [_part([("A", True), ("B", True)])])
+    assert flags == {"A": False, "B": True}
+    assert rejected == ["A"]
+
+
+def test_merge_does_not_mutate_inputs():
+    orig = _orig([{"sku": "A"}])
+    part = _part([("A", True)])
+    existing = {"B"}
+    before = (orig.copy(deep=True), part.copy(deep=True), set(existing))
+    merge_confirm_flags(existing, orig, [part])
+    pd.testing.assert_frame_equal(orig, before[0])
+    pd.testing.assert_frame_equal(part, before[1])
+    assert existing == before[2]
+
+
+def test_merge_ignores_sku_unknown_to_original():
+    orig = _orig([{"sku": "A"}])
+    flags, rejected = merge_confirm_flags(set(), orig, [_part([("Z", True)])])
+    assert flags == {} and rejected == []
+
+
+def _build_df():
+    return pd.DataFrame([
+        {"sku": "A", "status": "FOUND (amazon.in)"},
+        {"sku": "B", "status": "FOUND (x) - no price shown"},
+        {"sku": "C", "status": "NEEDS CRAWL (flipkart.com)"},
+        {"sku": "D", "status": "NOT FOUND - nothing matched"},
+        {"sku": "E", "status": "CLOSE MATCH - CHECK (croma.com)"},
+    ])
+
+
+def test_select_confirmed_scope_drops_non_found_and_reports_them():
+    kept, skipped = select_build_rows(_build_df(), "confirmed",
+                                      {"A", "B", "C", "D", "E"})
+    assert list(kept["sku"]) == ["A", "B"]
+    assert skipped == ["C", "D", "E"]
+
+
+def test_select_confirmed_scope_drops_unconfirmed_found():
+    kept, skipped = select_build_rows(_build_df(), "confirmed", {"A"})
+    assert list(kept["sku"]) == ["A"] and skipped == []
+
+
+def test_select_all_found_scope_keeps_every_found_row():
+    kept, skipped = select_build_rows(_build_df(), "all_found", set())
+    assert list(kept["sku"]) == ["A", "B"] and skipped == []
+
+
+def test_select_without_status_column():
+    df = pd.DataFrame([{"sku": "A"}, {"sku": "B"}])
+    kept, skipped = select_build_rows(df, "all_found", set())
+    assert list(kept["sku"]) == ["A", "B"] and skipped == []
+    kept, skipped = select_build_rows(df, "confirmed", {"B"})
+    assert list(kept["sku"]) == ["B"] and skipped == []
+
+
+def test_select_returns_a_copy():
+    df = _build_df()
+    kept, _ = select_build_rows(df, "all_found", set())
+    kept.loc[kept.index[0], "sku"] = "CHANGED"
+    assert list(df["sku"]) == ["A", "B", "C", "D", "E"]
+
+
+def test_merge_is_stable_across_reloads_with_no_new_edits():
+    """Save must not make the ✔ oscillate. A genuine two-tab disagreement is
+    settled once (the bucket tab wins); after that gui.py rotates the editor
+    keys, so every editor reloads the saved value and the next merges see no
+    change at all - the flag stays put with no further operator input (P1-8:
+    sticky edit state used to flip it False/True on every Save press)."""
+    orig = _orig([{"sku": "A", "confirmed": True}])
+    flags, _ = merge_confirm_flags(
+        {"A"}, orig, [_part([("A", True)]), _part([("A", False)])])
+    assert flags["A"] is False
+    value = False
+    for _ in range(3):                       # three more Save presses
+        existing = {k for k, ok in flags.items() if ok}
+        orig = _orig([{"sku": "A", "confirmed": value}])
+        reloaded = [_part([("A", value)]), _part([("A", value)])]
+        flags, _ = merge_confirm_flags(existing, orig, reloaded)
+        value = bool(flags.get("A", False))
+        assert value is False
+
+    # and the same in the other direction: a tick made in the All tab only
+    orig = _orig([{"sku": "A"}])
+    flags, _ = merge_confirm_flags(
+        set(), orig, [_part([("A", True)]), _part([("A", False)])])
+    assert flags["A"] is True
+    for _ in range(3):
+        existing = {k for k, ok in flags.items() if ok}
+        orig = _orig([{"sku": "A", "confirmed": True}])
+        reloaded = [_part([("A", True)]), _part([("A", True)])]
+        flags, _ = merge_confirm_flags(existing, orig, reloaded)
+        assert flags["A"] is True
+
+
+def test_card_index_clamps_and_floors():
+    assert card_queue_index([], 3) == 0
+    assert card_queue_index([False, False, False], 99) == 2
+    assert card_queue_index([False, False, False], -4) == 0
+    assert card_queue_index([False, False, False], 1) == 1
+
+
+def test_card_index_snaps_off_the_confirmed_tail():
+    # approving the LAST unconfirmed card leaves it at position i while
+    # A, B, C are still unconfirmed - never strand the operator there (P1-9)
+    assert card_queue_index([False, False, False, True], 3) == 0
+    # a longer confirmed tail (mixed buckets) behaves the same
+    assert card_queue_index([False, False, True, True], 3) == 0
+    assert card_queue_index([False, False, True, True], 2) == 0
+
+
+def test_card_index_stays_put_when_the_card_is_unconfirmed():
+    # the happy path: the approved card left position 0, the next one slid in
+    assert card_queue_index([False, False, False, True], 0) == 0
+
+
+def test_card_index_rests_on_a_confirmed_card_once_nothing_is_left():
+    assert card_queue_index([True, True, True], 1) == 1
+    assert card_queue_index([True, True, True], 9) == 2

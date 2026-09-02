@@ -6,7 +6,7 @@ runs\\ batches are never read or written.
 
     .venv\\Scripts\\python.exe tests\\test_gui_ui.py
 
-Standalone script like the rest of tests\\ (no pytest in this venv). What
+Standalone script like the rest of tests\\, and collected by pytest too. What
 AppTest cannot drive (file_uploader, data_editor cell edits, real
 subprocesses) is covered by the enricher/CSV end-to-end tests instead; here we
 assert the wizard's structure: boot, run creation, step gating, and that each
@@ -203,6 +203,122 @@ def test_classify_buckets():
     for status, want in cases.items():
         got = gui.classify(status)
         assert got == want, f"{status!r}: {got} != {want}"
+
+
+def make_sku_list(path: Path):
+    """A minimal but REAL input sheet: the SKU header plus one row."""
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.append(["sku"])
+    ws.append(["WM-1234"])
+    wb.save(path)
+
+
+def test_uploader_rejects_xls():
+    """.xls is not offered: openpyxl cannot open it, so count_skus() would
+    read 0 rows and the enricher would exit on the first row."""
+    import gui
+    assert "xls" not in gui.UPLOAD_TYPES, gui.UPLOAD_TYPES
+    assert "xlsx" in gui.UPLOAD_TYPES and "csv" in gui.UPLOAD_TYPES, \
+        gui.UPLOAD_TYPES
+
+
+def test_step1_offers_replace_before_enrichment(tmp):
+    """The uploader hides once input.* exists, so an un-enriched run must
+    still offer a way to swap the file out."""
+    runs = tmp / "runs"
+    run = runs / "replaceable"
+    run.mkdir(parents=True)
+    make_sku_list(run / "input.xlsx")
+    at = boot(runs)
+    assert_no_exception(at)
+    assert any("Replace input" in str(b.label) for b in at.button), \
+        [str(b.label) for b in at.button]
+    assert not at.error, [str(e.value) for e in at.error]
+
+
+def test_step1_flags_unreadable_input(tmp):
+    """A corrupt / legacy sheet counts 0 SKUs - say so instead of letting the
+    operator start a run that dies on row 1."""
+    runs = tmp / "runs"
+    run = runs / "unreadable"
+    run.mkdir(parents=True)
+    (run / "input.xlsx").write_bytes(b"this is not a spreadsheet")
+    at = boot(runs)
+    assert_no_exception(at)
+    assert any("Could not read" in str(e.value) for e in at.error), \
+        [str(e.value) for e in at.error]
+    assert any("Replace input" in str(b.label) for b in at.button), \
+        [str(b.label) for b in at.button]
+
+
+def test_step3_seo_preview_matches_the_build(tmp):
+    """P1-16: ticking SEO on step 3 previews what the BUILD would write.
+
+    The preview reads the sheet the way the build does (read_excel ->
+    filter_active_inventory_rows -> select_build_rows) and derives every
+    field through app.row_context, so the NOT FOUND row must be absent and
+    the SKUs must be the prefixed, CSV-bound ones - not the raw sheet cells.
+    """
+    import app
+    runs = tmp / "runs"
+    seeded_run(runs, "seeded_seo")
+    at = boot(runs)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[2]).run(timeout=60)
+    boxes = [c for c in at.checkbox if "SEO meta" in str(c.label)]
+    assert boxes, [str(c.label) for c in at.checkbox]
+    boxes[0].check().run(timeout=60)
+    assert_no_exception(at)
+    assert at.dataframe, "SEO preview table did not render"
+    shown = at.dataframe[0].value
+    assert "slug" in shown.columns, list(shown.columns)
+
+    expected = [app.row_context(r)["sku"] for r in
+                (dict(zip(FILLED_HEADERS, row)) for row in FILLED_ROWS)
+                if str(r["status"]).startswith("FOUND")]
+    assert list(shown["sku"]) == expected, (list(shown["sku"]), expected)
+    assert "SKU-C" not in set(shown["sku"]), "NOT FOUND row leaked into the "\
+        "preview - select_build_rows' FOUND gate is not being applied"
+
+
+def test_preview_drops_the_rows_the_build_drops():
+    """P1-16 (refutation): scoping alone is not fidelity. process_inventory
+    drops a blank-title row and skips a repeated prefixed sku BEFORE it
+    writes, so a .head(5) preview showed products the CSV never contains -
+    and each of them ate a slot belonging to a row that IS built."""
+    import pandas as pd
+    import app
+    import gui
+
+    rows = [
+        # blank title (whitespace only): process_inventory drops it outright
+        {"sku": "BT-000", "title": "   ", "status": "FOUND (amazon)"},
+        {"sku": "WM-101", "title": "LG 7 kg Front Load Washing Machine FHM1207",
+         "status": "FOUND (amazon)"},
+        # same raw sku -> same prefixed sku: the build skips the second
+        {"sku": "WM-101", "title": "LG 7 kg Front Load Washing Machine FHM1207 "
+                                   "duplicate", "status": "FOUND (amazon)"},
+        {"sku": "MW-202", "title": "IFB 20 L Solo Microwave Oven 20PM2S",
+         "status": "FOUND (amazon)"},
+    ]
+    for r in rows:
+        r.setdefault("image_url", "")          # never download anything here
+        for col in ("regular price", "sale price", "specs", "categories",
+                    "Brands", "url_link"):
+            r.setdefault(col, "")
+    pf = pd.DataFrame(rows)
+
+    got = gui.preview_build_rows(pf, app, limit=5)
+    skus = [ctx["sku"] for _, ctx in got]
+    assert "BT-000" not in " ".join(skus), skus
+    assert len(skus) == len(set(skus)), skus
+
+    built = app.process_inventory(pf.copy(), media_base="https://x/up/2026/09")
+    assert skus == list(built["sku"]), (skus, list(built["sku"]))
+
+    # the window is still 5 rows of what the build writes
+    assert len(gui.preview_build_rows(pf, app, limit=1)) == 1
 
 
 # ------------------------------------------------------------------ main --

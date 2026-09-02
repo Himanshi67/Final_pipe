@@ -107,10 +107,12 @@ def batch_summary(result):
 # app.split_image_list, so commas inside a URL survive
 _IMG_SPLIT_RE = re.compile(r",(?=\s*(?:https?://|//))")
 
-# mirror of app.prefixed_sku's sanitization (app.py:605-612)
+# mirror of app.prefixed_sku's sanitization - keep the two in step or the
+# review back-map (raw_sku_for_csv_sku) stops recognising its own SKUs.
+# P1-18: a whitelist, exactly as app.prefixed_sku now does it.
 _SKU_SANITIZE = (
     (re.compile(r"\s+"), "-"),
-    (re.compile(r'[\/:*?"<>|()\[\]{}]+'), "-"),
+    (re.compile(r"[^A-Za-z0-9._-]+"), "-"),
     (re.compile(r"-{2,}"), "-"),
 )
 
@@ -136,8 +138,28 @@ def parse_specs_cell(cell):
     return pairs
 
 
+# mirror of app.SKU_PREFIXES (SKU_PREFIX_BY_PARENT's codes + the AP fallback).
+# Copied rather than imported: importing app here would drag Streamlit and the
+# taxonomy workbook into every gui_helpers test. tests/test_gui_helpers.py
+# pins the two lists together so the copy cannot drift.
+SKU_CODES = ("WM", "WH", "TV", "AC", "CF", "KA", "HA", "SA", "EC", "AP")
+_SKU_CODE_RE = re.compile(r"^(?:" + "|".join(SKU_CODES) + r")-")
+# every code EXCEPT the 'AP' fallback: a raw carrying one of these states a
+# category, so re-coding it means the sheet contradicted the detected one.
+_SPECIFIC_CODE_RE = re.compile(
+    r"^(?:" + "|".join(c for c in SKU_CODES if c != "AP") + r")-")
+
+
+def _strip_code(s):
+    """Remove one leading '<CODE>-' category prefix, if there is one."""
+    return _SKU_CODE_RE.sub("", str(s or ""), count=1)
+
+
 def _sanitized_sku(raw):
-    s = str(raw or "").strip()
+    # app.compact() treats a NaN cell as empty; str(nan) would sanitize to the
+    # literal 'nan' here while app.prefixed_sku made 'AP-UNKNOWN' from the same
+    # cell, so the back-map matched a junk row to nothing at best (NaN != NaN).
+    s = "" if raw is None or raw != raw else str(raw).strip()
     for rx, rep in _SKU_SANITIZE:
         s = rx.sub(rep, s)
     return s.strip("-")
@@ -147,13 +169,56 @@ def raw_sku_for_csv_sku(csv_sku, raw_skus):
     """Map a CSV/validation sku (app.prefixed_sku output) back to the raw
     sku the review sheet holds. The prefixed form is sanitize(raw) with an
     optional 'XX-' category prefix, so match sanitized suffixes; the
-    longest raw wins; None when nothing matches."""
+    longest raw wins; None when nothing matches.
+
+    P1-13: the raw sku may ALREADY carry a category code, and prefixed_sku
+    re-codes a code that contradicts the detected category ('AP-X200' under
+    Kitchen Appliances becomes 'KA-X200'). Neither the exact nor the suffix
+    rule sees through that, so a re-coded row silently lost its link back to
+    the review sheet; compare with both codes stripped as well.
+
+    The rules are RANKED, not OR'd: an exact preimage beats a suffix
+    match, which beats a code-stripped match, and only inside one rank does
+    the longest raw win. Flattening them let a code-stripped guess outrank a
+    true suffix match - with raws 'X200' and 'AC-X200' on one sheet, the CSV
+    sku 'HA-X200' (from 'X200') came back as 'AC-X200', a different product -
+    and made an exact hit lose to whatever came first in the list.
+
+    The code-stripped rank is split again, and ties inside it refuse to
+    guess. Two raws that already carry DIFFERENT category codes over the same
+    stem ('SA-X200' and 'AP-X200', CSV sku 'KA-X200') were previously settled
+    by list order, so reversing the sheet changed which product a card showed
+    - one card wore the other's validation reasons and 'Fix in review' jumped
+    the operator to the wrong SKU. 'AP-' is the documented fallback code for
+    'the taxonomy did not know' (app.SKU_PREFIX_BY_PARENT), so an AP- raw is
+    the one prefixed_sku re-codes as a matter of course and it wins over a raw
+    whose specific code contradicts the CSV's; when the tie is between two
+    specific codes nothing local can separate them, and None (no flags, no
+    jump) is safer than picking someone else's product."""
     c = str(csv_sku or "").strip()
-    best, best_len = None, -1
+    c_bare = _strip_code(c)
+    best, best_rank, best_len = None, (-1, -1), -1
+    tied = 0
     for raw in raw_skus:
         s = _sanitized_sku(raw)
-        if s and (c == s or c.endswith("-" + s)) and len(s) > best_len:
-            best, best_len = raw, len(s)
+        if not s:
+            continue
+        if c == s:
+            rank = (3, 0)
+        elif c.endswith("-" + s):
+            rank = (2, 0)
+        elif c_bare == _strip_code(s):
+            # sub-rank: a re-coded AP- (or uncoded) raw beats a raw whose own
+            # specific code contradicts the CSV sku's
+            rank = (1, 0 if _SPECIFIC_CODE_RE.match(s) else 1)
+        else:
+            continue
+        if (rank, len(s)) > (best_rank, best_len):
+            best, best_rank, best_len, tied = raw, rank, len(s), 1
+        elif (rank, len(s)) == (best_rank, best_len) and raw != best:
+            tied += 1
+    if best_rank[0] == 1 and tied > 1:
+        return None                    # genuinely ambiguous - do not guess
     return best
 
 
@@ -296,3 +361,119 @@ def sheet_combos(df):
             if sub:
                 combos.add(f"{parent} > {sub}")
     return combos
+
+
+def found_status(status) -> bool:
+    """True iff this row's enricher status is importable.
+
+    A tick only counts on a FOUND row. Any suffix qualifies - 'FOUND
+    (amazon.in) - no price shown' and 'FOUND (x) - VERIFY: ...' included;
+    they sit in the review bucket precisely so a human vets them, and once
+    vetted they are legitimate imports. Everything else is never
+    importable: NEEDS CRAWL / NEEDS LINK (two-pass, half-done), CLOSE
+    MATCH / CHECK MANUALLY (unverified page), NOT FOUND, ERROR, SKIPPED
+    and blank. The remediation path for those is not a tick: fix
+    url_link and press 'Crawl all info' (--crawl-urls re-crawls every
+    non-FOUND row that has a link and stamps it FOUND)."""
+    return str(status or "").strip().upper().startswith("FOUND")
+
+
+def merge_confirm_flags(existing, original, parts):
+    """Merge the ✔ column of several data_editor frames into one flag map.
+
+    existing  set of SKUs already persisted as confirmed (rows the search
+              filter hid from every editor keep their tick).
+    original  the review DataFrame as loaded - columns sku, confirmed
+              (bool, from the persisted state) and status.
+    parts     the frames the editors returned (columns sku, confirmed), in
+              priority order; LATER parts win.
+
+    A part's row counts as an EDIT only when its confirmed value differs
+    from that sku's value in `original`. Every row appears in two editors
+    (its bucket tab and the All tab), so without that test the untouched
+    copy would silently overwrite a tick made in the other tab. A sku the
+    original sheet does not know is ignored.
+
+    Finally the FOUND gate: a flag left True on a row whose original
+    status is not found_status() is forced back to False and the sku
+    reported. Returns (flags, rejected) - rejected sorted - and never
+    mutates its inputs."""
+    orig_conf, orig_status = {}, {}
+    for _, row in original.iterrows():
+        sku = str(row["sku"])
+        if sku in orig_conf:
+            continue
+        orig_conf[sku] = bool(row.get("confirmed", False))
+        orig_status[sku] = row.get("status", "")
+
+    flags = {str(sku): True for sku in existing}
+    for part in parts or []:
+        for _, row in part.iterrows():
+            sku = str(row["sku"])
+            if sku not in orig_conf:
+                continue
+            now = bool(row.get("confirmed", False))
+            if now != orig_conf[sku]:
+                flags[sku] = now
+
+    rejected = []
+    for sku, ok in flags.items():
+        # a sku the sheet no longer holds cannot be built either way; only
+        # judge rows whose status we actually know
+        if ok and sku in orig_status and not found_status(orig_status[sku]):
+            rejected.append(sku)
+    for sku in rejected:
+        flags[sku] = False
+    return flags, sorted(rejected)
+
+
+def select_build_rows(df, scope, confirmed):
+    """Rows that may reach the CSV build, plus the SKUs refused.
+
+    scope 'confirmed'  -> a row must be ticked AND found_status(); a ticked
+                          NEEDS CRAWL / NOT FOUND / CLOSE MATCH row is
+                          dropped and named in `skipped`.
+    scope 'all_found'  -> every found_status() row, ticked or not;
+                          skipped is always [].
+
+    A frame with no 'status' column is not an enricher sheet (a hand-made
+    or already-filtered input), so nothing can be judged: keep everything
+    for 'all_found', keep the ticked rows for 'confirmed', skipped = [].
+    Returns a copy; the input frame is untouched."""
+    conf = {str(s) for s in (confirmed or set())}
+    skus = df["sku"].astype(str) if "sku" in df.columns else None
+    if "status" not in df.columns:
+        if scope == "confirmed" and skus is not None:
+            return df[skus.isin(conf)].copy(), []
+        return df.copy(), []
+    is_found = df["status"].map(found_status)
+    if scope == "confirmed":
+        ticked = skus.isin(conf) if skus is not None else is_found & False
+        return (df[ticked & is_found].copy(),
+                sorted(set(df.loc[ticked & ~is_found, "sku"].astype(str))))
+    return df[is_found].copy(), []
+
+
+def card_queue_index(confirmed, i) -> int:
+    """Where the card-review pointer really belongs, given the queue's ✔ column.
+
+    `confirmed` is the queue's confirmed column in queue order (unconfirmed
+    rows sort first); `i` is the index the session state remembers. The
+    result is clamped into range and, whenever it lands on an already
+    confirmed card while unconfirmed cards remain, snapped forward to the
+    first unconfirmed one.
+
+    That snap is the P1-9 tail case: approving the LAST unconfirmed card
+    leaves it at position i (the unconfirmed rows shrink to 0..i-1 and the
+    confirmed group starts at i), so 'stay at i' re-shows the card just
+    approved and 'i + 1' clamps straight back onto it - Approve and Skip
+    would dead-loop there while earlier cards were still unconfirmed. Only
+    when nothing is left unconfirmed does the pointer rest on a confirmed
+    card."""
+    flags = [bool(c) for c in confirmed]
+    if not flags:
+        return 0
+    i = max(0, min(int(i), len(flags) - 1))
+    if flags[i] and not all(flags):
+        return flags.index(False)
+    return i

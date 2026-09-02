@@ -36,16 +36,26 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-from gui_helpers import (BADGE, batch_summary, classify, eta_text,
-                         filter_review_df, flag_value,
-                         image_basenames_from_csv, parse_enricher_log,
+from gui_helpers import (BADGE, batch_summary, card_queue_index, classify,
+                         eta_text,
+                         filter_review_df, flag_value, found_status,
+                         image_basenames_from_csv, merge_confirm_flags,
+                         parse_enricher_log,
                          parse_image_urls, parse_publish_output,
                          parse_specs_cell, raw_sku_for_csv_sku,
-                         run_stage, sanity_issues, sheet_combos)
+                         run_stage, sanity_issues, select_build_rows,
+                         sheet_combos)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
 RUNS_DIR = REPO_ROOT / "runs"
+
+# What the Step-1 uploader accepts. Legacy .xls is deliberately NOT here:
+# openpyxl cannot open it, so count_skus() reads 0 rows and the enricher dies
+# on the first row. run_paths() still SCANS for input.xls, because an older run
+# folder may already hold one - such a run lands on the "Could not read any
+# SKUs" error and its "Replace input file" button, which is the way out.
+UPLOAD_TYPES = ["xlsx", "csv"]
 
 def _sku_header_match(value) -> bool:
     """Does this header name the SKU column?
@@ -237,8 +247,11 @@ def start_enricher(P, extra_flags: list, total: int):
 
 
 def cancel_enricher(P):
-    """CTRL_BREAK first - the enricher treats it as KeyboardInterrupt and
-    checkpoints ('Stopped by user - progress saved') - then hard-kill."""
+    """CTRL_BREAK first - it reaches only this child's process group, and
+    sku_enricher.install_break_handler() maps it to KeyboardInterrupt so the
+    run checkpoints ('Stopped by user - progress saved'). Delivery waits for
+    the row's current sleep/request to return, hence the 15 s grace before the
+    hard kill (safe either way: saves are atomic)."""
     proc = st.session_state.get(f"proc_{P['run'].name}")
     pid = proc.pid if proc is not None else load_meta(P).get("enricher_pid")
     if not pid:
@@ -330,8 +343,8 @@ def step_enrich(P):
     st.header("1 · Upload & Enrich")
 
     if not P["input"].exists():
-        up = st.file_uploader("SKU list (.xlsx / .xls / .csv) - just a SKU "
-                              "column is enough", type=["xlsx", "xls", "csv"])
+        up = st.file_uploader("SKU list (.xlsx / .csv) - just a SKU "
+                              "column is enough", type=UPLOAD_TYPES)
         if up is None:
             st.info("Upload the bare SKU list to start this run.")
             return
@@ -350,6 +363,40 @@ def step_enrich(P):
         st.subheader("Enrichment running…")
         enricher_panel(P)
         return
+
+    if not P["filled"].exists():
+        # Nothing has been enriched yet, so the input file is still replaceable
+        # - and it HAS to be, because the uploader above hides itself the
+        # moment any input.* exists. Without this the run wedges: an unreadable
+        # sheet (a legacy .xls, a corrupt upload, a sheet with no SKU column)
+        # counts 0 rows, the enricher exits immediately, and there is no way
+        # back to the uploader. .csv is exempt from the count because
+        # count_skus() reads xlsx only.
+        if P["input"].suffix.lower() != ".csv" and total == 0:
+            st.error(f"Could not read any SKUs from {P['input'].name} - is it "
+                     "a real .xlsx/.csv with a sku column?")
+        if st.button("🔁 Replace input file",
+                     key=f"replace_input_{P['run'].name}"):
+            try:
+                P["input"].unlink(missing_ok=True)
+            except OSError:
+                # the operator's most likely state is the sheet still open in
+                # Excel, which holds the file without FILE_SHARE_DELETE - the
+                # same friendly message the rest of this file uses, not a red
+                # traceback. Nothing was changed; the button works next click.
+                st.error(f"Could not delete {P['input'].name} — it looks like "
+                         "the file is open in Excel. Close it and click "
+                         "Replace again.")
+                return
+            fresh = load_meta(P)
+            fresh.pop("original_name", None)
+            fresh.pop("uploaded", None)
+            # the row count belonged to the sheet just deleted; leaving it
+            # made the Home dashboard's 'rows' column report a file that is
+            # no longer there
+            fresh.pop("total_rows", None)
+            save_json(P["meta"], fresh)
+            st.rerun()
 
     if P["filled"].exists():
         text = tail_text(P["log"])
@@ -456,7 +503,11 @@ def category_options() -> list:
 
 
 def review_editor(df: pd.DataFrame, key: str,
-                  cat_options: list | None = None) -> pd.DataFrame:
+                  cat_options: list | None = None,
+                  allow_confirm: bool = True) -> pd.DataFrame:
+    """One review tab. allow_confirm=False locks the ✔ column: the rows in
+    that tab are not FOUND, so a tick there would be refused on save
+    anyway (see gui_helpers.found_status)."""
     view = df.copy()
     view.insert(0, "confirmed", view.pop("confirmed"))
     view.insert(1, "state", view["status"].map(
@@ -469,10 +520,14 @@ def review_editor(df: pd.DataFrame, key: str,
     show = [c for c in show if c in view.columns]
     return st.data_editor(
         view[show], key=key, num_rows="fixed", height=420,
-        disabled=["state", "sku", "thumb", "specs"],
+        disabled=(["state", "sku", "thumb", "specs"]
+                  + ([] if allow_confirm else ["confirmed"])),
         column_config={
-            "confirmed": st.column_config.CheckboxColumn("✔", default=False,
-                                                         width="small"),
+            "confirmed": st.column_config.CheckboxColumn(
+                "✔", default=False, width="small",
+                help=None if allow_confirm else
+                "Not confirmable — paste a URL and press Crawl all info "
+                "first"),
             "state": st.column_config.TextColumn("status", width="medium"),
             "thumb": st.column_config.ImageColumn("img", width="small"),
             "url_link": st.column_config.LinkColumn("url", width="medium"),
@@ -537,22 +592,30 @@ def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
     return changed
 
 
-def validator_flags(P, raw_sku: str) -> str:
+def validator_flags(P, raw_sku: str, all_raws=None) -> str:
     """Reasons the last validation run flagged this review row for, if any.
-    The issues CSV carries the PREFIXED sku, so map back by suffix."""
+    The issues CSV carries the PREFIXED sku, so map back by suffix.
+
+    all_raws is every sku on the sheet. Resolving the CSV sku against the
+    WHOLE list and then checking the winner is this row is what keeps a
+    re-coded-prefix match honest: asked in isolation, 'HA-X200' also matches
+    the raw 'AC-X200' (same sku, different code), so a card would have shown
+    another product's validation reasons. With the full list the true owner
+    ('X200') wins and this card correctly shows nothing."""
     if not P["issues"].exists():
         return ""
     try:
         idf = pd.read_csv(P["issues"], dtype=str).fillna("")
     except Exception:
         return ""
+    candidates = [str(s) for s in (all_raws or [raw_sku])]
     for _, r in idf.iterrows():
-        if raw_sku_for_csv_sku(str(r.get("sku", "")), [raw_sku]) == raw_sku:
+        if raw_sku_for_csv_sku(str(r.get("sku", "")), candidates) == raw_sku:
             return str(r.get("reasons", ""))
     return ""
 
 
-def card_review(P, df, cat_opts):
+def card_review(P, df, cat_opts, all_raws=None):
     """One SKU per screen: gallery with keep/drop, editable fields, an
     approve/skip queue. df is the (possibly filtered) review dataframe -
     prices numeric, confirmed bool, _bucket set."""
@@ -567,7 +630,12 @@ def card_review(P, df, cat_opts):
     ).reset_index(drop=True)
 
     ikey = f"card_i_{run}"
-    i = min(st.session_state.get(ikey, 0), len(queue) - 1)
+    # never rest on a confirmed card while unconfirmed ones remain: approving
+    # the LAST unconfirmed card leaves it at position i, and i + 1 clamps
+    # right back onto it, so Approve/Skip would dead-loop on an already
+    # approved card (P1-9 tail) - card_queue_index snaps forward instead
+    i = card_queue_index(queue["confirmed"], st.session_state.get(ikey, 0))
+    st.session_state[ikey] = i
     row = queue.iloc[i]
     sku = str(row["sku"])
 
@@ -578,12 +646,14 @@ def card_review(P, df, cat_opts):
     st.progress((i + 1) / len(queue),
                 text=f"Card {i + 1} / {len(queue)} — "
                      f"{int(queue['confirmed'].sum())} confirmed")
+    if bool(queue["confirmed"].all()):
+        st.success(f"All {len(queue)} cards confirmed.")
     st.subheader(f"{BADGE[row['_bucket']]} {sku}")
     st.caption(str(row["status"]))
     src = str(row.get("url_link", "") or "").strip()
     if src:
         st.markdown(f"🔗 [Open source page]({src})")
-    flagged = validator_flags(P, sku)
+    flagged = validator_flags(P, sku, all_raws)
     if flagged:
         st.warning(f"Validator flagged this SKU last run: {flagged}")
 
@@ -653,15 +723,23 @@ def card_review(P, df, cat_opts):
         return True
 
     b1, b2, b3, b4 = st.columns(4)
-    # a 'failed' row has no verified product page - approving it could pull
-    # an unvetted row into a confirmed-scope build
-    can_approve = row["_bucket"] != "failed"
+    # only a FOUND row is importable - approving anything else could pull an
+    # unvetted row into a confirmed-scope build (the save would refuse it
+    # anyway, see gui_helpers.found_status)
+    can_approve = found_status(row["status"])
     if b1.button("✅ Approve & next", type="primary", disabled=not can_approve,
-                 help=None if can_approve else "Paste a product URL and crawl "
-                 "it first — this row has no verified page.",
+                 help=None if can_approve else "Approve needs a FOUND row — "
+                 "paste or fix the URL and press Crawl all info first.",
                  key=f"ap_{run}_{sku}"):
         if save(True):
-            goto(i + 1)
+            # the queue sorts unconfirmed rows first, so an approved row
+            # leaves position i and the next unconfirmed card slides into
+            # it - advancing here would skip that card (P1-9). A row that
+            # was already confirmed does not move, so advance. The one
+            # position where an approved row does NOT leave i is the last
+            # unconfirmed one; card_queue_index catches that on the next
+            # run and snaps to the first card still unconfirmed.
+            goto(i if not bool(row["confirmed"]) else i + 1)
     if b2.button("💾 Save & next", key=f"sv_{run}_{sku}"):
         if save(None):
             goto(i + 1)
@@ -695,6 +773,11 @@ def step_review(P):
     m4.metric("🔴 No link / failed", int(n.get("failed", 0)))
     m5.metric("✔ Confirmed", int(df["confirmed"].sum()))
 
+    # the Save handler reruns immediately, so its outcome is reported here
+    for kind, text in st.session_state.pop(
+            f"review_msg_{P['run'].name}", []):
+        (st.warning if kind == "warning" else st.success)(text)
+
     probs = sanity_issues(
         df, min_price=flag_value(load_meta(P).get("enricher_flags", []),
                                  "--min-price"))
@@ -724,8 +807,17 @@ def step_review(P):
                    "before changing the filter — unsaved edits in hidden "
                    "rows are lost on rerender.")
     # a new filter must reset the editors, else stale edit state maps onto
-    # different rows; hashing the filter into the key does that
-    fsig = hashlib.md5(f"{query}|{'|'.join(brands)}".encode()).hexdigest()[:6]
+    # different rows; hashing the filter into the key does that. The save
+    # counter is in the hash for the same reason: streamlit keeps each
+    # editor's edited_rows under an UNCHANGED key, so after a save every tab
+    # would keep replaying the edit that was just written to disk. Once the
+    # sheet holds it, that replay is no longer an edit but a stale opinion —
+    # and two tabs replaying opposite stale opinions made the flag flip on
+    # every Save press (P1-8). A new key after each save reloads the editors
+    # from the saved sheet, so a merge only ever sees fresh edits.
+    egen = st.session_state.get(f"ed_gen_{P['run'].name}", 0)
+    fsig = hashlib.md5(
+        f"{query}|{'|'.join(brands)}|{egen}".encode()).hexdigest()[:6]
 
     mode = st.radio("View", ["Table", "Card review"], horizontal=True,
                     key=f"mode_{P['run'].name}",
@@ -733,7 +825,9 @@ def step_review(P):
                          "the full image gallery. Bulk actions (confirm all, "
                          "crawl, retries) live in the Table view.")
     if mode == "Card review":
-        card_review(P, fdf, cat_opts)
+        # the UNFILTERED sku column: validator_flags has to resolve a CSV sku
+        # against every raw on the sheet, not just the visible ones
+        card_review(P, fdf, cat_opts, df["sku"].astype(str).tolist())
         return
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
@@ -754,42 +848,66 @@ def step_review(P):
             st.caption("Paste a product URL into **url_link** for each row "
                        "here, save, then press **Crawl all info**.")
         parts.append(review_editor(fdf[fdf["_bucket"] == "failed"],
-                                   f"ed_failed_{fsig}", cat_opts))
+                                   f"ed_failed_{fsig}", cat_opts,
+                                   allow_confirm=False))
     with tabs[2]:
         parts.append(review_editor(fdf[fdf["_bucket"] == "pending"],
-                                   f"ed_pending_{fsig}", cat_opts))
+                                   f"ed_pending_{fsig}", cat_opts,
+                                   allow_confirm=False))
     with tabs[3]:
         parts.append(review_editor(fdf[fdf["_bucket"] == "found"],
                                    f"ed_found_{fsig}", cat_opts))
     with tabs[4]:
         parts.append(review_editor(fdf, f"ed_all_{fsig}", cat_opts))
 
+    # the All tab duplicates the bucket rows; parts is in TAB order - review,
+    # failed, pending, found, all - so All is the last one and goes first.
+    # merge_confirm_flags applies a part's value only when it CHANGES that
+    # sku's persisted flag, so an untouched copy of a row can never overwrite
+    # a tick made in the other tab. Order therefore decides one case only: the
+    # same sku changed in BOTH its bucket tab and the All tab during this
+    # render - the bucket tab, being later, wins.
+    ordered = [parts[-1]] + parts[:-1]
+
+    def persist_flags(flags, rejected, changed=None):
+        """Save the merged ✔ map, then stash the outcome and rerun. The rerun
+        throws the page away, so anything printed here would never be seen -
+        step_review pops these messages at the top of the next run."""
+        save_confirmed(P, flags)
+        head = "" if changed is None else f"Saved — {changed} cell(s) " \
+                                          "updated, "
+        msgs = [("success", f"{head}{sum(flags.values())} row(s) confirmed.")]
+        if rejected:
+            msgs.append(("warning",
+                         f"{len(rejected)} tick(s) ignored — a tick only "
+                         "counts on a FOUND row. Paste a URL and press Crawl "
+                         "all info first: " + ", ".join(rejected)))
+        st.session_state[f"review_msg_{P['run'].name}"] = msgs
+        # the sheet now holds these edits; retire the editors' edit state
+        st.session_state[f"ed_gen_{P['run'].name}"] = egen + 1
+        st.rerun()
+
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
-        # the All tab duplicates the bucket rows; later parts win, so pass it
-        # first and let bucket edits override it. parts is in TAB order -
-        # review, failed, pending, found, all - so All is the last one.
-        ordered = [parts[-1]] + parts[:-1]
         try:
             changed = write_edits_back(P, df, ordered)
         except PermissionError:
             st.error("The filled .xlsx is open in Excel — close it and save "
                      "again.")
             return
-        flags = {sku: True for sku in confirmed_set(P)}   # hidden rows keep ✔
-        for part in ordered:
-            for _, row in part.iterrows():
-                flags[str(row["sku"])] = bool(row["confirmed"])
-        save_confirmed(P, flags)
-        st.success(f"Saved — {changed} cell(s) updated, "
-                   f"{sum(flags.values())} row(s) confirmed.")
-        st.rerun()
+        flags, rejected = merge_confirm_flags(confirmed_set(P), df, ordered)
+        persist_flags(flags, rejected, changed)
 
     if b2.button("✅ Confirm all clean FOUND"):
-        flags = {str(r["sku"]): (bool(r["confirmed"]) or r["_bucket"] == "found")
-                 for _, r in df.iterrows()}
-        save_confirmed(P, flags)
-        st.rerun()
+        # merge the tabs FIRST: a tick made in any editor and not yet saved is
+        # an edit like any other, and rebuilding the map from `df` alone would
+        # silently drop it (the P1-8 data loss). The merge is also what applies
+        # the FOUND gate to ticks already sitting on disk.
+        flags, rejected = merge_confirm_flags(confirmed_set(P), df, ordered)
+        for _, r in df.iterrows():
+            if r["_bucket"] == "found" and found_status(r["status"]):
+                flags[str(r["sku"])] = True
+        persist_flags(flags, rejected)
 
     meta = load_meta(P)
     # --discover MUST be stripped: passing it alongside --crawl-urls is the one
@@ -828,6 +946,32 @@ def step_review(P):
 
 # ------------------------------------------------------------------- step 3 --
 
+def preview_build_rows(pf, app_mod, estimate_mrp=False, limit=5):
+    """The first `limit` rows the build would REALLY write, as (row, ctx).
+
+    Scoping alone is not enough for a faithful preview (P1-16): before it
+    writes anything, process_inventory drops rows whose title is blank and
+    skips a row whose prefixed sku it has already written. A preview that
+    only did .head(limit) showed products the CSV never contains - a blank
+    title row previews under its own sku with full SEO columns, and a
+    duplicate previews a second slug and meta description that are never
+    written - and each of them consumed a slot belonging to a row that IS
+    built. `app_mod` is passed in because gui.py imports app lazily.
+    """
+    out, seen = [], set()
+    for _, row in pf.iterrows():
+        if len(out) >= limit:
+            break
+        if not app_mod.compact(row.get("title")):
+            continue
+        ctx = app_mod.row_context(row, estimate_mrp=estimate_mrp)
+        if ctx["sku"] in seen:
+            continue
+        seen.add(ctx["sku"])
+        out.append((row, ctx))
+    return out
+
+
 def step_build(P):
     st.header("3 · Build WooCommerce CSV")
     if not P["filled"].exists():
@@ -857,24 +1001,36 @@ def step_build(P):
                          expanded=False):
             os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
             import app as _app
-            pf = pd.read_excel(P["filled"], dtype=str).fillna("")
-            if scope == "confirmed":
-                pf = pf[pf["sku"].astype(str).isin(conf)]
+            # read and scope the sheet EXACTLY as the build below does -
+            # same reader, same active-row filter, same select_build_rows
+            # (FOUND gate included), and every field through row_context, so
+            # the preview cannot drift from the CSV it is previewing (P1-16)
+            pf = _app.filter_active_inventory_rows(pd.read_excel(P["filled"]))
+            pf, _ = select_build_rows(pf, scope, conf)
 
-            def _p(v):
-                return str(v or "").replace(",", "").replace("₹", "").strip()
+            # process_inventory's own entry check: a sheet missing a required
+            # column renders a full preview and then fails at build time
+            preview_error = ""
+            try:
+                _app.require_input_columns(pf)
+            except Exception as exc:
+                preview_error = str(exc)
+                pf = pf.iloc[0:0]
+            if preview_error:
+                st.error(f"This sheet cannot be built yet: {preview_error}")
 
             sample = []
-            for _, r in pf.head(5).iterrows():
-                sample.append({"sku": r.get("sku", ""),
+            for _, ctx in preview_build_rows(pf, _app,
+                                             estimate_mrp=estimate_mrp):
+                sample.append({"sku": ctx["sku"],
                                **_app.seo_fields(
-                                   str(r.get("sku", "")),
-                                   str(r.get("title", "")),
-                                   str(r.get("Brands", "")),
-                                   str(r.get("categories", "")),
-                                   parse_specs_cell(r.get("specs", "")),
-                                   _p(r.get("regular price", "")),
-                                   _p(r.get("sale price", "")),
+                                   ctx["sku"],
+                                   ctx["title"],
+                                   ctx["brand"],
+                                   ctx["category_hierarchy"],
+                                   ctx["dynamic_attrs"],
+                                   ctx["regular price"],
+                                   ctx["sale price"],
                                    plugin=seo_plugin)})
             if sample:
                 st.dataframe(pd.DataFrame(sample), hide_index=True,
@@ -896,12 +1052,11 @@ def step_build(P):
 
     df = pd.read_excel(P["filled"])
     df = app.filter_active_inventory_rows(df)
-    if scope == "confirmed":
-        df = df[df["sku"].astype(str).isin(conf)].copy()
-    elif "status" in df.columns:
-        keep = (df["status"].map(app.compact).str.upper()
-                .str.startswith("FOUND"))
-        df = df[keep].copy()
+    df, skipped = select_build_rows(df, scope, conf)
+    if skipped:
+        st.warning(f"{len(skipped)} confirmed row(s) skipped — not FOUND "
+                   "(NEEDS CRAWL / NOT FOUND / CLOSE MATCH …). Fix them in "
+                   "Step 2 and crawl: " + ", ".join(skipped))
     if df.empty:
         st.error("Nothing to build — confirm rows in Step 2 first.")
         return

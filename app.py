@@ -385,6 +385,16 @@ def sku_prefix_category(raw_sku):
     return SKU_PREFIX_CATEGORY.get(token, ('', ''))
 
 
+# P1-14: phrases that mean "this product needs no stabilizer" - an AC feature -
+# and therefore CANCEL the stabilizer keyword rather than confirming it.
+NOT_A_STABILIZER_RE = (
+    r'stabili[sz]er[\s-]*free'
+    r'|no[\s-]+stabili[sz]er'
+    r'|(?:with|works?)?\s*without\s+(?:a\s+|any\s+)?stabili[sz]er'
+    r'|stabili[sz]er\s+(?:is\s+)?not\s+(?:required|needed)'
+)
+
+
 def detect_category(raw_item_name, raw_categories='', detected_brand='',
                     raw_sku=''):
     """Guess (parent, subcategory); canonicalize_category() then snaps the
@@ -407,13 +417,42 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
     def word(w):
         return re.search(r'\b' + w + r'\b', t) is not None
 
+    # P1-15: a reviewer's explicit pick outranks every keyword rule below.
+    # GUI Step 2 writes the exact 'Parent > Sub' string out of
+    # category_map.xlsx into `categories`, and without this a misfiled product
+    # could not be corrected short of rewriting its title - the rules would
+    # just overrule the human every rebuild. ONLY the full 'parent > sub' form
+    # counts: a bare parent from an ERP export, or a retailer breadcrumb like
+    # 'Home > Kitchen > Mixers', is not a pick from the taxonomy and still goes
+    # through the rules.
+    # The hint is normalised first: a hand-typed 'Home Appliances >Refrigerators'
+    # missed the lookup on the space alone, and a categories cell round-tripped
+    # from a built CSV still carries the importer escape ('Juicers\, Mixers &
+    # Grinders'), so the reviewer's own pick fell through to the keyword rules.
+    hint = re.sub(r'\s*>\s*', ' > ',
+                  _cat_norm(unescape_category_from_csv(raw_categories)))
+    if ' > ' in hint:
+        exact = CATEGORY_COMBOS.get(hint)
+        if exact:
+            parent, sub = exact.split(' > ', 1)
+            return parent, sub
+
     # --- accessories that NAME another category, checked FIRST ----------
     # 'V-Guard VG 400 Voltage Stabilizer for Air Conditioner' was filed as an
     # Air Conditioner, because the AC block only had to see the words "air
     # conditioner" anywhere in the title. A stabilizer is the appliance being
     # sold; the AC is what it is FOR. Same shape as the dishwasher exclusion
     # below - decide what it is not, before deciding what it is.
-    if has('stabilizer', 'stabiliser', 'voltage regulator'):
+    # P1-14: 'Stabilizer Free Operation' is the opposite claim - an AC feature
+    # meaning the unit needs NO stabilizer - and it is in the marketing name of
+    # most Indian inverter ACs (Voltas Vertis, Lloyd, Blue Star). Matching the
+    # bare word filed a 37,000-rupee AC under Small Appliances, so exclude the
+    # phrase before trusting the word.
+    # The same claim is written several ways: 'Stabilizer Free Operation',
+    # 'with No Stabilizer Required', 'Works without Stabilizer', 'Stabilizer
+    # Not Required'. All of them mean the product is NOT a stabilizer.
+    if (has('stabilizer', 'stabiliser', 'voltage regulator')
+            and not re.search(NOT_A_STABILIZER_RE, t)):
         return 'Small Appliances', 'Voltage Stabilizers & Regulators'
 
     # --- Washing Machines (dishwashers excluded first) ---
@@ -502,8 +541,16 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
     # --- Small Appliances ---
     if IRON_WORD_RE.search(t):
         return 'Small Appliances', 'Electric Iron'
-    if has('stabilizer', 'stabiliser', 'voltage regulator'):
-        return 'Small Appliances', 'Voltage Stabilizers & Regulators'
+    # NO stabilizer rule here. It used to be duplicated at this point, without
+    # the NOT_A_STABILIZER_RE guard, which silently cancelled the guarded rule
+    # near the top: a title carrying 'Stabilizer Free Operation' fell past the
+    # guarded rule and was caught by this unguarded copy instead. That shadowed
+    # every rule below it - 'LG 260 L Frost Free Double Door Refrigerator with
+    # Stabilizer Free Operation' (standard LG/Samsung/Whirlpool fridge
+    # marketing, not AC-only) shipped as Small Appliances > Voltage Stabilizers
+    # & Regulators, and so did stabilizer-free TVs and water purifiers.
+    # Genuine stabilizers are already claimed by the guarded rule above, which
+    # runs before everything, so this copy could only ever mis-file.
 
     # --- LED / TV ---
     if has('qled'):
@@ -623,11 +670,13 @@ def prefixed_sku(raw_sku, category):
     # doubled hyphens collapse ('WM--HW100...' duplicates came from this)
     sku = re.sub(r'\s+', '-', sku)
     # BUGFIX: filesystem/URL-unsafe characters break image saving on Windows
-    # ('WA70A4022FS/TL' made every image download fail -> images=0)
-    # Brackets go too: a BUSY ERP row can carry '(INNER)', and parentheses in a
-    # SKU end up in an image filename and then in a URL, where they are encoded
-    # inconsistently by different clients.
-    sku = re.sub(r'[\\/:*?"<>|()\[\]{}]+', '-', sku)
+    # ('WA70A4022FS/TL' made every image download fail -> images=0).
+    # P1-18: this was a BLACKLIST, so anything nobody had been bitten by yet
+    # survived - a ',' split the WooCommerce cell, '#' truncated the image URL
+    # at the fragment, '%' started a bogus percent-escape, '&' and '+' were
+    # mangled in query strings. A SKU only ever has to be a filename and a URL
+    # path segment, so whitelist what is safe in both and hyphenate the rest.
+    sku = re.sub(r'[^A-Za-z0-9._-]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
     if sku.startswith(('WM-', 'WH-')):
         return sku                     # live products carry these - never rename
@@ -778,6 +827,20 @@ def load_subcategory_attributes():
             # it from backups\category_map_<ts>.xlsx.
             problems.append(f'{name}: {type(exc).__name__}: {exc}')
             continue
+        # A parent is only safe to inherit from when it declares exactly ONE
+        # attribute row (the LED shape: one row listing every sub-category).
+        # 'Home Appliances' has 12 heterogeneous rows and Fans is the first, so
+        # inheriting "whichever row came first" gave every bare-parent product
+        # the ceiling-fan axes - build_tags shipped the tag 'Table' on a
+        # dishwasher and 'Wall' on a water softener, and missing_spec_axes
+        # invented gaps ('Type, Size, Star Rating, Capacity') that validate_csv
+        # then reported as missing_required_attribute.
+        parent_rows = {}
+        for _, row in table.iterrows():
+            if not compact(row.get('Sub-Category')):
+                continue
+            key = _cat_norm(compact(row.get('Parent Category')))
+            parent_rows[key] = parent_rows.get(key, 0) + 1
         for _, row in table.iterrows():
             sub = compact(row.get('Sub-Category'))
             if not sub:
@@ -792,6 +855,10 @@ def load_subcategory_attributes():
                 values = [] if looks_like_hint else [
                     compact(v) for v in cell.split(',') if compact(v)]
                 axes[axis] = values
+            # P1-17: the merged cell as written ('Juicers, Mixers & Grinders')
+            # is itself a taxonomy sub-category, and a product filed under the
+            # whole string used to find nothing here
+            out[_cat_norm(sub)] = axes
             # the LED row lists several sub-categories in one cell
             for one in re.split(r',', sub):
                 one = compact(one)
@@ -799,10 +866,11 @@ def load_subcategory_attributes():
                     out[_cat_norm(one)] = axes
             # a product filed under the bare parent (split_hierarchy turns
             # 'LED' into ('LED', 'LED')) keeps the same required axes as the
-            # parent's sub-categories; setdefault so a real sub named like a
-            # parent still wins
+            # parent's sub-categories - but ONLY when the parent has a single
+            # attribute row, so "the parent's axes" is not ambiguous.
+            # setdefault so a real sub named like a parent still wins.
             parent_name = compact(row.get('Parent Category'))
-            if parent_name:
+            if parent_name and parent_rows.get(_cat_norm(parent_name)) == 1:
                 out.setdefault(_cat_norm(parent_name), axes)
         break
     if not out:
@@ -821,6 +889,53 @@ def load_subcategory_attributes():
 # attribute sheet is missing/unreadable. Surfaced at import AND at build time.
 SUBCATEGORY_ATTRIBUTES_WARNING = ''
 SUBCATEGORY_ATTRIBUTES = load_subcategory_attributes()
+
+
+def attribute_axes(sub, parent=''):
+    """{axis: [allowed values]} the taxonomy declares for this product, or {}.
+
+    Looks up the sub-category as written first, then each comma part of it (a
+    merged cell like 'Juicers, Mixers & Grinders' reaches us both ways).
+
+    A merged name whose parts are SEPARATE taxonomy rows is the union of those
+    rows, not the first one: 'Juicers, Mixers & Grinders' has a 'Juicers' row
+    (Type, Capacity 250-1000W) and a 'Mixers & Grinders' row (Type, Size,
+    Capacity 500-1000W). Returning only the juicer row hid the 'Size' axis
+    entirely and judged 'Philips HL7756 750W Mixer Grinder' against a Capacity
+    vocabulary that has no 750W in it - the product was gap-reported for a
+    figure printed in its own title, and shipped without the 750W tag. Each
+    axis's allowed values are concatenated in first-seen order, de-duplicated;
+    the stored dicts are never mutated.
+
+    The fall back to the PARENT is deliberately limited to the bare-parent
+    case - no sub-category at all, or a sub that IS the parent (split_hierarchy
+    turns 'LED' into ('LED', 'LED')). An unknown sub-category must NOT inherit
+    its parent's axes: it would be judged complete, or gap-reported, against
+    axes nobody declared for it, and the mis-detection would be hidden.
+    The parent itself is only present in SUBCATEGORY_ATTRIBUTES when it has a
+    single attribute row (see load_subcategory_attributes), so a many-row
+    parent like 'Home Appliances' correctly resolves to {}.
+    """
+    axes = SUBCATEGORY_ATTRIBUTES.get(_cat_norm(sub))
+    if axes:
+        return axes
+    parts = [SUBCATEGORY_ATTRIBUTES.get(_cat_norm(part))
+             for part in str(sub or '').split(',')]
+    parts = [p for p in parts if p]
+    if len(parts) == 1:
+        return parts[0]
+    if parts:
+        merged = {}
+        for one in parts:
+            for axis, allowed in one.items():
+                bucket = merged.setdefault(axis, [])
+                for value in allowed:
+                    if value not in bucket:
+                        bucket.append(value)
+        return merged
+    if not compact(sub) or _cat_norm(sub) == _cat_norm(parent):
+        return SUBCATEGORY_ATTRIBUTES.get(_cat_norm(parent)) or {}
+    return {}
 
 RESOLUTION_PATTERNS = (
     (r'\b8k\b', '8K'),
@@ -949,8 +1064,8 @@ def build_tags(brand, parent, sub, title, sale_price, category_family):
         add(f'{brand} {sub or parent}')
 
     specs = spec_tags(title)
-    axes = SUBCATEGORY_ATTRIBUTES.get(_cat_norm(sub), {})
-    axis_to_spec = {'Ton': 'ton', 'Star Rating': 'star',
+    axes = attribute_axes(sub, parent)
+    axis_to_spec ={'Ton': 'ton', 'Star Rating': 'star',
                     'Size': 'screen', 'Storage': 'volume'}
 
     for axis, allowed in axes.items():
@@ -1014,10 +1129,13 @@ AXIS_SPEC_LABELS = {
 }
 
 
-def missing_spec_axes(sub, title, category_family, scraped=()):
+def missing_spec_axes(sub, title, category_family, scraped=(), parent=''):
     """Axes the taxonomy declares for this sub-category that this product
-    cannot fill from anywhere. Empty tuple means complete."""
-    axes = SUBCATEGORY_ATTRIBUTES.get(_cat_norm(sub), {})
+    cannot fill from anywhere. Empty tuple means complete.
+
+    `parent` only matters for a product filed under the bare parent - see
+    attribute_axes()."""
+    axes = attribute_axes(sub, parent)
     if not axes:
         return []
     specs = spec_tags(title)
@@ -1725,6 +1843,63 @@ def filter_active_inventory_rows(df):
     return cleaned[active_mask].copy()
 
 
+def row_context(row, estimate_mrp=False):
+    """Everything process_inventory derives from ONE input row before it starts
+    writing output columns: brand, category, family, prefixed sku, scraped
+    specs, attribute rows and the two prices.
+
+    Pure - no image download, no Streamlit, no per-batch bookkeeping (the
+    duplicate/unmapped/gap counters stay in process_inventory). It exists so
+    the GUI's preview panes and the tests can ask "what would the build make of
+    this row?" without running a build, and so there is exactly ONE definition
+    of that answer.
+
+    Returns {raw_sku, title, brand, parent, sub, category_hierarchy,
+    category_mapped, category_family, sku, scraped, dynamic_attrs,
+    regular_price, sale_price}.
+    """
+    raw_sku = row.get('sku')
+    title = compact(row.get('title'))
+    brand = compact(row.get('Brands')) or infer_brand(title, raw_sku)
+    parent_guess, sub_guess = detect_category(title, row.get('categories'),
+                                              brand, raw_sku)
+    category_hierarchy, category_mapped = canonicalize_category(parent_guess, sub_guess)
+    category_family = family_for(parent_guess, sub_guess)
+    # the PARENT names the prefix, the family names capacity/config text -
+    # passing the family here sent every FAMILY_BY_SUB product (microwaves,
+    # kettles, irons, dispensers...) to the AP- fallback while its parent
+    # siblings got the real code
+    sku = prefixed_sku(raw_sku, parent_guess)
+
+    sale_price = number_or_blank(row.get('sale price'))
+    regular_price = number_or_blank(row.get('regular price'))
+    # sanity: an MRP at or below the selling price is bogus data
+    if regular_price != '' and sale_price != '' and regular_price <= sale_price:
+        regular_price = ''
+    # MRP estimation is now opt-in: fabricated regular prices are not real
+    if estimate_mrp and regular_price == '' and sale_price != '':
+        regular_price = round(float(sale_price) * 1.25, 2)
+
+    scraped = parse_scraped_specs(row.get('specs'))
+    dynamic_attrs = product_specs(title, brand, category_family, scraped)
+
+    return {
+        'raw_sku': raw_sku,
+        'title': title,
+        'brand': brand,
+        'parent': parent_guess,
+        'sub': sub_guess,
+        'category_hierarchy': category_hierarchy,
+        'category_mapped': category_mapped,
+        'category_family': category_family,
+        'sku': sku,
+        'scraped': scraped,
+        'dynamic_attrs': dynamic_attrs,
+        'regular price': regular_price,
+        'sale price': sale_price,
+    }
+
+
 def process_inventory(df, media_base=None, estimate_mrp=False,
                       seo=False, seo_plugin='yoast'):
     """`seo` is OPT-IN. While it is off the output is byte-identical to what
@@ -1749,19 +1924,15 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
     total = len(working)
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
-        title = compact(row.get('title'))
-        brand = compact(row.get('Brands')) or infer_brand(title, row.get('sku'))
-        parent_guess, sub_guess = detect_category(title, row.get('categories'),
-                                                  brand, row.get('sku'))
-        category_hierarchy, category_mapped = canonicalize_category(parent_guess, sub_guess)
-        if not category_mapped:
+        ctx = row_context(row, estimate_mrp=estimate_mrp)
+        title = ctx['title']
+        brand = ctx['brand']
+        parent_guess, sub_guess = ctx['parent'], ctx['sub']
+        category_hierarchy = ctx['category_hierarchy']
+        if not ctx['category_mapped']:
             unmapped_categories.add(category_hierarchy)
-        category_family = family_for(parent_guess, sub_guess)
-        # the PARENT names the prefix, the family names capacity/config text -
-        # passing the family here sent every FAMILY_BY_SUB product (microwaves,
-        # kettles, irons, dispensers...) to the AP- fallback while its parent
-        # siblings got the real code
-        sku = prefixed_sku(row.get('sku'), parent_guess)
+        category_family = ctx['category_family']
+        sku = ctx['sku']
 
         # BUGFIX: identical SKUs used to produce duplicate WooCommerce rows
         if sku in seen_skus:
@@ -1769,14 +1940,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             continue
         seen_skus.add(sku)
 
-        sale_price = number_or_blank(row.get('sale price'))
-        regular_price = number_or_blank(row.get('regular price'))
-        # sanity: an MRP at or below the selling price is bogus data
-        if regular_price != '' and sale_price != '' and regular_price <= sale_price:
-            regular_price = ''
-        # MRP estimation is now opt-in: fabricated regular prices are not real
-        if estimate_mrp and regular_price == '' and sale_price != '':
-            regular_price = round(float(sale_price) * 1.25, 2)
+        sale_price = ctx['sale price']
+        regular_price = ctx['regular price']
 
         tracker.text(f'Compiling and downloading SKU: {sku} ({idx}/{total})')
         progress.progress(idx / max(total, 1))
@@ -1788,11 +1953,12 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         # BUGFIX: only map images that were really downloaded (previously a
         # minimum of 2 URLs was invented even when nothing was saved)
         mapped_images = ','.join([f'{media_base}/{sku}_{i}.webp' for i in saved_indexes])
-        scraped = parse_scraped_specs(row.get('specs'))
+        scraped = ctx['scraped']
         config, short_desc, long_desc, dynamic_attrs = build_descriptions(
             sku, title, brand, category_family, scraped)
 
-        gaps = missing_spec_axes(sub_guess, title, category_family, scraped)
+        gaps = missing_spec_axes(sub_guess, title, category_family, scraped,
+                                 parent=parent_guess)
         for axis in gaps:
             gap_counts[axis] = gap_counts.get(axis, 0) + 1
 

@@ -195,7 +195,11 @@ None of the discovery statuses (`NEEDS CRAWL (site)`, `NEEDS CRAWL - CHECK
 LINK (site)`, `NEEDS LINK - <why>`) start with `FOUND`, which is deliberate:
 app.py/gui.py/build_csv.py all gate the import on `status.startswith("FOUND")`,
 so a half-discovered sheet can never be imported by accident even if you build
-the CSV before pass 2 finishes. `tests\test_two_pass.py` pins that invariant.
+the CSV before pass 2 finishes. In the gui the gate applies to BOTH build
+scopes — "Confirmed rows only" and "All FOUND rows" — so a reviewer's ✔ cannot
+smuggle a non-FOUND row in; a tick or Approve on one is refused and the SKU is
+named, and the fix is to correct the url_link and press *Crawl all info*.
+`tests\test_two_pass.py` pins that invariant.
 
 **When to use it instead of the normal single-pass run:** a normal run is
 fine for a small or well-behaved batch. Reach for two-pass on a large batch,

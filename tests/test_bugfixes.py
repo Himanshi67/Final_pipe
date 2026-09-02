@@ -859,6 +859,239 @@ def test_25_live_site_audit_findings():
           "title_looks_like_raw_sku" in by_sku.get("TV-ACER-1", ""), True)
 
 
+def test_26_row_context_is_the_one_derivation():
+    section("#26 row_context() derives a row the same way process_inventory does")
+    row = {"sku": "43FSFHS", "title": "Foxsky 109 cm (43 Inch) Full HD Smart "
+                                      "LED TV 43FSFHS",
+           "categories": "", "Brands": "", "regular price": "22,599",
+           "sale price": "18,999", "url_link": "", "image_url": "",
+           "specs": ""}
+    ctx = app.row_context(row)
+    want_brand = app.infer_brand(row["title"], row["sku"])
+    check("a blank Brands cell falls back to infer_brand", ctx["brand"],
+          want_brand)
+    check("infer_brand actually produced something", bool(want_brand), True)
+    parent, sub = app.detect_category(row["title"], "", ctx["brand"],
+                                      row["sku"])
+    check("the hierarchy is the canonical taxonomy string",
+          ctx["category_hierarchy"],
+          app.canonicalize_category(parent, sub)[0])
+    check("the hierarchy came from the taxonomy file, not a guess",
+          ctx["category_mapped"], True)
+    check("the sku is prefixed_sku of the raw sku and the PARENT",
+          ctx["sku"], app.prefixed_sku(row["sku"], parent))
+    # the prices go through the same normalisation the builder used to inline
+    check("prices are parsed, not passed through", ctx["sale price"], 18999.0)
+    check("an MRP is only invented when asked",
+          app.row_context({**row, "regular price": ""})["regular price"], "")
+    check("estimate_mrp fills it with 1.25x",
+          app.row_context({**row, "regular price": ""},
+                          estimate_mrp=True)["regular price"],
+          round(18999.0 * 1.25, 2))
+
+
+def test_27_sku_charset_is_a_whitelist():
+    section("#27 a SKU keeps only characters that are safe in a filename AND "
+            "a URL")
+    check("comma and hash are hyphenated",
+          app.prefixed_sku("ABC,12#3", "Home Appliances"), "HA-ABC-12-3")
+    for raw, want in (("X100%", "AP-X100"),
+                      ("A&B", "AP-A-B"),
+                      ("A+B", "AP-A-B"),
+                      ("SAMSUNG X100", "AP-SAMSUNG-X100")):
+        check(f"{raw!r} -> {want}", app.prefixed_sku(raw, "Something New"),
+              want)
+    check("dots and underscores are legal in a filename, so they survive",
+          app.prefixed_sku("WW80T504DAB_1.2", "Something New"),
+          "AP-WW80T504DAB_1.2")
+
+    # gui_helpers mirrors this sanitisation so the review back-map can find a
+    # raw sku from the CSV sku; drift breaks Step 2 silently.
+    sys.path.insert(0, str(ROOT))
+    import gui_helpers                                 # noqa: E402
+    for raw in ("ABC,12#3", "X100%", "A&B", "A+B", "SAMSUNG X100",
+                "WA70A4022FS/TL"):
+        check(f"gui_helpers agrees with app on {raw!r}",
+              gui_helpers._sanitized_sku(raw),
+              app.prefixed_sku(raw, None)[len("AP-"):])
+
+
+def test_28_reviewer_category_pick_wins():
+    section("#28 an explicit 'Parent > Sub' pick outranks the keyword rules")
+    fridge = ("Haier 3 Star Inverter Frost Free Double Door Refrigerator "
+              "with Water Dispenser")
+    combo = "Home Appliances > Refrigerators"
+    check("the combo exists in the taxonomy",
+          app.CATEGORY_COMBOS.get(app._cat_norm(combo)), combo)
+    check("the reviewer's pick is honoured",
+          app.detect_category(fridge, combo), ("Home Appliances", "Refrigerators"))
+    check("with no pick the dispenser rule still fires",
+          app.detect_category(fridge, ""), ("Home Appliances", "Water Dispensers"))
+    # a bare parent is not a pick from the taxonomy - it is what an ERP export
+    # or a retailer breadcrumb carries, and it must not short-circuit
+    check("a bare parent does not short-circuit the rules",
+          app.detect_category("Samsung 8 kg Front Load Washing Machine "
+                              "WW80T504DAB", "Home Appliances"),
+          ("Washing Machines", "Front Load"))
+    check("a retailer breadcrumb does not short-circuit the rules",
+          app.detect_category("Prestige Iris 750 W Mixer Grinder",
+                              "Home > Kitchen > Mixers"),
+          ("Kitchen Appliances", "Juicers, Mixers & Grinders"))
+    # the pick has to survive being typed by hand and being read back out of a
+    # built CSV, where the importer escape '\,' is still on the category name
+    for typed in ("Home Appliances >Refrigerators",
+                  "home appliances>refrigerators",
+                  "Home Appliances  >  Refrigerators"):
+        check(f"a loosely spaced pick still wins: {typed!r}",
+              app.detect_category(fridge, typed),
+              ("Home Appliances", "Refrigerators"))
+    check("a pick round-tripped through the CSV escape still wins",
+          app.detect_category("Philips HL7756 750W Mixer Grinder",
+                              app.escape_category_for_csv(
+                                  "Kitchen Appliances > Juicers, "
+                                  "Mixers & Grinders")),
+          ("Kitchen Appliances", "Juicers, Mixers & Grinders"))
+    check("...and that really was escaped",
+          "\\," in app.escape_category_for_csv("Kitchen Appliances > Juicers, "
+                                               "Mixers & Grinders"), True)
+    check("a bare parent with no spacing to fix still does not short-circuit",
+          app.detect_category("Samsung 8 kg Front Load Washing Machine "
+                              "WW80T504DAB", "  Home Appliances  "),
+          ("Washing Machines", "Front Load"))
+
+
+def test_29_attribute_axes_lookup():
+    section("#29 one lookup for the taxonomy's required axes, parent fallback "
+            "only for a bare parent")
+    check("a bare-parent product inherits the parent's axes",
+          app.attribute_axes("", "LED"), app.SUBCATEGORY_ATTRIBUTES["led"])
+    check("the parent really declares some", bool(app.attribute_axes("", "LED")),
+          True)
+    check("sub == parent is the same case",
+          app.attribute_axes("LED", "LED"), app.SUBCATEGORY_ATTRIBUTES["led"])
+    check("a merged taxonomy cell resolves as written",
+          bool(app.attribute_axes("Juicers, Mixers & Grinders",
+                                  "Kitchen Appliances")), True)
+    # an unknown sub-category must NOT borrow its parent's axes - it would be
+    # judged against axes nobody declared for it and hide the mis-detection
+    check("an unknown sub-category inherits nothing",
+          app.attribute_axes("No Such Sub", "LED"), {})
+    check("missing_spec_axes sees the parent's axes for a bare parent",
+          "Size" in app.missing_spec_axes("", "Foxsky LED TV", "LED",
+                                          parent="LED"), True)
+    check("...and reports nothing when the parent is unknown",
+          app.missing_spec_axes("", "Foxsky LED TV", "LED"), [])
+    # P1-17 residual: 'Juicers, Mixers & Grinders' is TWO taxonomy rows, and
+    # returning only the first one dropped the 'Size' axis and every wattage
+    # the mixer row lists. 'Philips HL7756 750W Mixer Grinder' was reported
+    # missing 'Capacity' - a figure printed in its own title - and shipped
+    # without the 750W tag.
+    juicer = app.SUBCATEGORY_ATTRIBUTES["juicers"]
+    mixer = app.SUBCATEGORY_ATTRIBUTES["mixers & grinders"]
+    merged = app.attribute_axes("Juicers, Mixers & Grinders",
+                                "Kitchen Appliances")
+    check("the merged cell unions every part's axes",
+          set(merged), set(juicer) | set(mixer))
+    check("...including the axis only the mixer row declares",
+          "Size" in merged and "Size" not in juicer, True)
+    check("its Capacity keeps the juicer-only wattage",
+          "400W" in merged["Capacity"], True)
+    check("...and the mixer-only wattage",
+          "750W" in merged["Capacity"], True)
+    check("...and the Type vocabulary of the part that has one",
+          "Centrifugal" in merged["Type"], True)
+    check("no value is listed twice",
+          len(merged["Capacity"]), len(set(merged["Capacity"])))
+    check("the stored juicer row did not swallow the mixer wattages",
+          "750W" in juicer["Capacity"] or "Size" in juicer, False)
+    check("...nor the mixer row the juicer's",
+          "400W" in mixer["Capacity"] or "Centrifugal" in mixer["Type"], False)
+    check("...and the union is a new dict",
+          merged is juicer or merged is mixer, False)
+    check("a single-part sub is unchanged",
+          app.attribute_axes("Juicers", "Kitchen Appliances"), juicer)
+    mixer_title = "Philips HL7756 750W Mixer Grinder"
+    check("the wattage in the title now answers Capacity",
+          "Capacity" in app.missing_spec_axes(
+              "Juicers, Mixers & Grinders", mixer_title, "Kitchen Appliances",
+              parent="Kitchen Appliances"), False)
+    check("and it is tagged",
+          "750W" in app.build_tags(
+              "Philips", "Kitchen Appliances", "Juicers, Mixers & Grinders",
+              mixer_title, "4499",
+              app.family_for("Kitchen Appliances",
+                             "Juicers, Mixers & Grinders")).split(", "), True)
+
+
+def test_30_many_row_parent_lends_no_axes():
+    section("#30 a parent with many attribute rows lends its axes to nobody")
+    # 'Home Appliances' has a dozen heterogeneous attribute rows and Fans is
+    # the first of them. Inheriting "whichever row came first" put the fan
+    # Type vocabulary on every bare-parent product: 'Bosch Table Top
+    # Dishwasher' shipped the WooCommerce tag 'Table', 'Kent Wall Mounted
+    # Water Softener' shipped 'Wall', and both got the fan axes reported as
+    # _spec_gaps, which validate_csv turns into missing_required_attribute.
+    # detect_category returns a bare ('Home Appliances', '') for dishwashers
+    # and as its final catch-all, so this is the unclassified-row path.
+    check("a many-row parent lends nothing",
+          app.attribute_axes("", "Home Appliances"), {})
+    for title, leak in (("Bosch Table Top Dishwasher 6 Place Settings", "Table"),
+                        ("Kent Wall Mounted Water Softener 10 L", "Wall")):
+        parent, sub = app.detect_category(title)
+        check(f"{title[:20]}... is the bare-parent case", (parent, sub),
+              ("Home Appliances", ""))
+        family = app.family_for(parent, sub)
+        tags = app.build_tags("Bosch", parent, sub, title, "", family)
+        check(f"no fan Type '{leak}' tag leaks onto it", leak in tags, False)
+        check("no fabricated gaps",
+              app.missing_spec_axes(sub, title, family, {}, parent=parent), [])
+    # the single-row parent (LED) still works - that is the case the fallback
+    # exists for
+    check("a single-row parent still lends its axes",
+          bool(app.attribute_axes("", "LED")), True)
+
+
+def test_31_stabilizer_free_family():
+    section("#31 every way of saying 'needs no stabilizer' cancels the rule")
+    # The guard only knew the literal 'stabilizer free'. These three phrasings
+    # are just as common in Indian AC marketing names and all filed a 37,000
+    # rupee air conditioner under Small Appliances > Voltage Stabilizers.
+    for title in ("Samsung 1.5 Ton 5 Star Convertible Split AC with No "
+                  "Stabilizer Required",
+                  "Voltas 1.5 Ton Split AC Works without Stabilizer",
+                  "Lloyd 1.5 Ton Split AC Stabilizer Not Required",
+                  "Voltas Vertis Elite 1.5 Ton 3 Star Inverter Split AC "
+                  "Stabilizer Free Operation"):
+        parent, _ = app.detect_category(title)
+        check(f"{title[:32]}... is an AC", parent, "Air Conditioner")
+    # The guard was on the FIRST rule only, and an identical unguarded copy
+    # sat 89 lines lower under '--- Small Appliances ---', shadowing every
+    # rule below it. 'Stabilizer Free Operation' is standard LG/Samsung/
+    # Whirlpool refrigerator marketing, not AC-only, so live fridges, TVs,
+    # purifiers and geysers shipped as Voltage Stabilizers with _spec_gaps
+    # 'Type, Size, Ton'. Each pair is (title, expected combo).
+    for title, expect in (
+            ("LG 260 L 3 Star Frost Free Double Door Refrigerator with "
+             "Stabilizer Free Operation", ("Home Appliances", "Refrigerators")),
+            ("Samsung 253 L Convertible Double Door Refrigerator Stabilizer "
+             "Free Operation", ("Home Appliances", "Refrigerators")),
+            ("Whirlpool 192 L Direct Cool Single Door Fridge with No "
+             "Stabilizer Required", ("Home Appliances", "Refrigerators")),
+            ("Sony Bravia 139 cm 55 inch 4K Ultra HD Smart LED TV Works "
+             "without Stabilizer", ("LED", "")),
+            ("Kent Grand Plus RO Water Purifier Stabilizer Free Operation",
+             ("Home Appliances", "Water Purifiers")),
+            ("Havells Instanio 3 L Instant Water Heater No Stabiliser Needed",
+             ("Water Heaters", "Geysers"))):
+        check(f"non-AC: {title[:30]}...", app.detect_category(title), expect)
+    # the intended direction must survive: a real stabilizer is still one
+    for title in ("V-Guard VG 400 Voltage Stabilizer for Air Conditioner",
+                  "Microtek EM4090 Automatic Voltage Stabilizer"):
+        check(f"{title[:28]}... is still a stabilizer",
+              app.detect_category(title),
+              ("Small Appliances", "Voltage Stabilizers & Regulators"))
+
+
 def main():
     test_01_e2e_sparse_gallery()
     test_02_dead_page_is_not_a_block()
@@ -883,6 +1116,12 @@ def main():
     test_23_attribute_slugs_importable()
     test_24_promos_are_not_specs()
     test_25_live_site_audit_findings()
+    test_26_row_context_is_the_one_derivation()
+    test_27_sku_charset_is_a_whitelist()
+    test_28_reviewer_category_pick_wins()
+    test_29_attribute_axes_lookup()
+    test_30_many_row_parent_lends_no_axes()
+    test_31_stabilizer_free_family()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 

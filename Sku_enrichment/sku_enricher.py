@@ -32,6 +32,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import sys
 import time
 from datetime import datetime
@@ -3471,6 +3472,39 @@ def write_report(path, rows, out_file, started, args, min_images):
 
 # --------------------------------- main -----------------------------------
 
+def install_break_handler() -> bool:
+    """Make CTRL_BREAK behave like Ctrl+C. Returns True if it was installed.
+
+    CTRL_BREAK is the only console signal Windows can aim at ONE process
+    group, which is why gui.py starts this script with
+    CREATE_NEW_PROCESS_GROUP and stops it with
+    os.kill(pid, signal.CTRL_BREAK_EVENT) - Ctrl+C would hit every process on
+    the console. Without a handler the CRT default for SIGBREAK is to
+    terminate, killing the run mid-row; mapping it to KeyboardInterrupt sends
+    it down the same 'Stopped by user - progress saved' checkpoint path as
+    Ctrl+C instead.
+
+    Delivery waits for the current blocking call (a polite sleep, an HTTP
+    request) to return, so the stop is not instant. That is fine: atomic_save
+    means even a hard kill loses at most the row in flight, and the GUI
+    hard-kills anyway if the process outlives its grace period.
+
+    SIGBREAK exists only on Windows; elsewhere this is a no-op returning False.
+    """
+    sig = getattr(signal, "SIGBREAK", None)
+    if sig is None:
+        return False
+
+    def _on_break(signum, frame):
+        raise KeyboardInterrupt
+
+    try:
+        signal.signal(sig, _on_break)
+    except (ValueError, OSError):     # not the main thread / no console
+        return False
+    return True
+
+
 def main():
     global PW_ENABLED, PW_MAX_PER_RUN, PW_PROFILE_DIR, CACHE_ENABLED, CACHE_REFRESH
     global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED, DISCOVER_MODE
@@ -3480,6 +3514,7 @@ def main():
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    install_break_handler()
 
     ap = argparse.ArgumentParser(
         description="Fill product title / price / URL / images for SKUs from "

@@ -9,23 +9,23 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
              → validate_csv.py → validation_issues.csv
              → WooCommerce import (manual) | wc_publish.py (REST API)
 
-- `sku_enricher.py` (~3,800 lines, plain functions) — per SKU: brand/model split →
+- `sku_enricher.py` (~3,900 lines, plain functions) — per SKU: brand/model split →
   serper.dev search (DuckDuckGo fallback) → fetch pages (curl_cffi, browser
   impersonation) → site parsers (amazon/flipkart/croma/reliance/ifb/generic JSON-LD,
   dispatched in `extract()`) → spec-table scrape → strict `assess()` verdict →
   `hunt_donors`/`merge_sources` to complete the row → write row → checkpoint-save.
   Interruption-safe; re-running resumes. Pages and searches are cached in `.cache\`,
   so a re-run does no network I/O. Writes `<output>_report.md` at the end.
-- `gui.py` (~1,430 lines, Streamlit) — the 5-step wizard over the whole pipeline
+- `gui.py` (~1,620 lines, Streamlit) — the 5-step wizard over the whole pipeline
   (upload+enrich → review → build CSV → validate → publish), state in `runs\<name>\`.
   It shells out to `sku_enricher.py` and imports `app.process_inventory()`, so the
   pipeline stages stay in those scripts - but since the 2026-08-22 refit it DOES own
   operator-facing logic: a run manager (create/archive/delete `runs\<name>\`), a card
   review mode, image keep/drop, an in-app category-map editor with backups, an SEO
-  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~294 lines).
+  preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~480 lines).
   Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
   a URL pasted in.
-- `app.py` (~1,950 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
+- `app.py` (~2,150 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
   to exact strings in `category_map.xlsx`; images saved as `SKU_n.webp`; scraped
   specs become WooCommerce attributes; `_spec_gaps` records attributes the
   sub-category requires but nothing filled; optional SEO meta columns (off by default).
@@ -53,7 +53,10 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   CHECK LINK (site)` · `NEEDS LINK - <why>`. **None of them start with FOUND**,
   which is deliberate: `app.py` and `gui.py` both gate the import on
   `status.startswith("FOUND")`, so a half-done discovery sheet cannot be
-  imported by accident. `tests\test_two_pass.py` pins that.
+  imported by accident. The gui applies that FOUND gate in BOTH build scopes
+  ("Confirmed rows only" as well as "All FOUND rows"), and a ✔/Approve on a
+  non-FOUND row is refused with the SKU named — remediation is to fix the
+  url_link and crawl, never to tick. `tests\test_two_pass.py` pins that.
 - `.cache\` (gitignored) holds gzipped pages and search results, TTL 14 days.
   Only successes are cached; a cache error is always a miss, never a failure.
 - Politeness delays are owed to the remote host, so `polite_sleep()` skips them
