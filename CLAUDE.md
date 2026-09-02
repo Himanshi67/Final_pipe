@@ -5,7 +5,7 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
 
     SKUs.xlsx → sku_enricher.py → <stem>_filled.xlsx → [human review]
              → app.py (Streamlit) | build_csv.py (headless, same code path)
-             → WooCommerce CSV + product_images_for_upload\*.webp
+             → WooCommerce CSV + product_images_for_upload\<client>\*.webp
              → validate_csv.py → validation_issues.csv
              → WooCommerce import (manual) | wc_publish.py (REST API)
 
@@ -41,14 +41,29 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   EMPTY meta unless `--overwrite`, never touches slugs unless `--slugs`; snapshots via
   wc_checkpoint.py first unless `--no-checkpoint`.
 - `wc_checkpoint.py create|list|diff|restore` — gzipped JSON snapshot of every live
-  product (incl. all meta_data) under `checkpoints\`; restore writes only with `--commit`
-  and does NOT cover media files, orders, or products created after the snapshot.
+  product (incl. all meta_data) under `checkpoints\<slug>\`; `wc_publish.py --commit`
+  calls it automatically (`before-publish-<slug>`); restore writes only with `--commit`,
+  REFUSES (exit 4) a snapshot whose recorded store/client is not the target's — or an
+  unstamped legacy one — unless `--force-store`, and does NOT cover media files, orders,
+  or products created after the snapshot.
+- `client_config.py` — per-client config: `clients\<slug>\client.toml` holds the store
+  URL, media-base template, SEO site name, placeholder HTML, the taxonomy paths, the
+  `[sku]` prefix scheme and `[serper]` (BYOK key name + budgets); `clients\<slug>\.env`
+  holds that client's credentials. Slug resolution is `--client` > `$PIPELINE_CLIENT`
+  > `shreejee`; `app.configure(slug)` / `validate_csv.configure(slug)` do it in-process.
+  The GUI gets a client selector and the same guards; see docs/CLIENT_CONFIG.md.
 
 ## Environment
 - Windows 11 + PowerShell. Python is ALWAYS `.venv\Scripts\python.exe` — never bare
   `python`, never "activate".
 - `SERPER_API_KEY` (serper.dev) drives search: up to ~8 credits/SKU; free tier
-  2,500/month ≈ 300 SKUs. No in-code credit tracking.
+  2,500/month ≈ 300 SKUs. BYOK per client: the variable NAME comes from `[serper]
+  api_key_env`, its value from `clients\<slug>\.env` (which OVERRIDES the shell env).
+  `--budget N` caps a run at N credits (0 = unlimited; default `[serper]
+  default_run_budget`): serper is refused past N (the rest of that row falls back to
+  DuckDuckGo) and the run stops after that row on the same checkpoint-safe path as
+  Ctrl+C. Spend is tallied in `clients\<slug>\credits.json` and printed in the report
+  header; `monthly_budget` only WARNS at start when month-to-date is over it.
 - Statuses in `_filled.xlsx`: `FOUND (site)` · `FOUND … - no price shown` /
   `- only N image(s)` (verified but incomplete) · `FOUND … - price from <site>`
   (merged from another source) · `FOUND … - VERIFY: <why>` (pass 2 crawled the
@@ -80,20 +95,22 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   directions, and a block costs far more than the minutes saved.
 
 ## Repo layout
-    *.py                  the 9 pipeline scripts — MUST stay at root (see below)
-    category_map.xlsx     taxonomy; app.py loads it from NEXT TO app.py
-    SubCategory_Attributes_Master.xlsx   reference copy ONLY - no script reads it;
-                          the enforced attributes live in category_map.xlsx's
-                          'Sub-Category Attributes' sheet (load_subcategory_attributes)
-    category_seo.xlsx     curated per-category tags + SEO keywords (hand-written;
+    *.py                  the 10 pipeline scripts — MUST stay at root (see below)
+    clients\<slug>\       ALL per-client config; NO taxonomy file is at root any more
+      client.toml         store URL, media base, SEO name, placeholder, [sku], [serper]
+      category_map.xlsx   taxonomy (in git); its 'Sub-Category Attributes' sheet is what
+                          load_subcategory_attributes enforces
+      category_seo.xlsx   curated per-category tags + SEO keywords (hand-written;
                           rebuild with tools\build_category_seo.py)
+      SubCategory_Attributes_Master.xlsx  reference copy ONLY - no script reads it
+      backups\ .env credits.json   gitignored: editor backups, creds, serper ledger
     tools\                generators for the config sheets, not pipeline stages
     docs\                 all reference docs (KNOWN_ISSUES, PIPELINE_GUIDE, HANDOFF, …)
     docs\archive\         superseded code kept for reference (scraper2-source.zip)
     inputs\               source SKU lists
     runs\<name>\          loose outputs + logs from one run (gitignored)
     batches\<name>\       curated archived batch: filled xlsx, CSV, images, README
-    checkpoints\  .cache\  product_images_for_upload\  backups\   generated state
+    checkpoints\<slug>\  product_images_for_upload\<slug>\  .cache\  generated state
     blog_automate\        isolated blog generator
     Sku_enrichment\  _push_export\   mirrors — never edit directly, use /sync-copies
     Code_Unrelated\       portable Node toolchain, nothing to do with the pipeline
@@ -106,11 +123,15 @@ the persistent browser profile (`--js-profile`) and BUSY ERP input. Its
 name, hardcoded 230 V) and was deliberately NOT carried over.
 
 The scripts are anchored on `Path(__file__).parent`: `sku_enricher.py` → `.cache\`,
-`wc_checkpoint.py` → `checkpoints\`, `app.py`/`validate_csv.py` → `category_map.xlsx`.
+`wc_checkpoint.py` → `checkpoints\<slug>\`, `client_config.py` → `clients\` and
+`product_images_for_upload\<slug>\` — which app.py, validate_csv.py and wc_publish.py
+all resolve THROUGH it, so nothing is cwd-relative and a run from any directory finds
+the same taxonomy and images.
 Moving a `.py` file out of root silently relocates the directory it owns — don't.
 
 ## Commands (full flag semantics: docs/PIPELINE_GUIDE.md §3 — don't guess flags)
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --limit 3          # smoke
+    .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --client shreejee --budget 200
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --min-price 8000 --delay 5 8
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --retry-incomplete # re-do half-filled rows
     :: two-pass flow: review the links BEFORE paying for the full extraction
@@ -123,9 +144,14 @@ Moving a `.py` file out of root silently relocates the directory it owns — don
     .venv\Scripts\python.exe -m streamlit run app.py    # just the CSV builder
     .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" -o out.csv --month 2026/07
     .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" --seo          # SEO meta (opt-in)
+    .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" --pack         # hand-over pack + zip
     .venv\Scripts\python.exe validate_csv.py wordpress_ready_clean_repaired.csv
     .venv\Scripts\python.exe wc_publish.py --check          # test WooCommerce creds
+    .venv\Scripts\python.exe wc_publish.py --preflight      # store URL + API + media + signoff
     .venv\Scripts\python.exe wc_publish.py out.csv          # DRY RUN (no --commit)
+    .venv\Scripts\python.exe wc_publish.py out.csv --commit --max-commit 50
+    .venv\Scripts\python.exe wc_checkpoint.py list --client shreejee
+    :: EVERY entry point takes --client SLUG (or set PIPELINE_CLIENT); default shreejee
 
 ## Hard rules
 - NEVER feed a `*_filled.xlsx` back into the enricher — the script now refuses, but
@@ -134,6 +160,12 @@ Moving a `.py` file out of root silently relocates the directory it owns — don
   `WP_APP_USER`, `WP_APP_PASSWORD`) — NEVER in the repo, a file, or chat.
 - `wc_publish.py` writes to the LIVE store. Never pass `--commit` on more than one SKU
   without asking, and never `--status publish` on unreviewed rows.
+- Publish guards, exit code 4 = REFUSED and NOTHING was written: `WC_URL` must be the
+  client's own `[store] url`; a `--commit` writing more than `--max-commit` (default
+  25) products is refused; `--commit --status publish` and `--commit --delete-sku`
+  need `review_signoff.csv` (`sku,reviewer,signed_at`) next to the CSV listing every
+  SKU. Every `--commit` snapshots the store first (`before-publish-<slug>`) — never
+  reach for `--no-checkpoint` to get past a failed snapshot without asking.
 - `--force` re-pays every Serper credit ONLY when the cache is cold or expired.
   With `.cache\` warm it replays stored pages through the current parsers for
   free — that is how a parser fix gets applied retroactively. Check
@@ -169,6 +201,9 @@ subagent over 20 tool calls in the main context.
 - `docs/NEXT_STEPS.md` — **LOCAL ONLY, gitignored** (not on the public remote). The
   hardening backlog (48 verified findings, P0/P1/P2) from the 2026-09-01 audit. Check it
   before starting any fix. All 7 P0s are closed; the P1/P2 list is still open.
+- `docs/CLIENT_CONFIG.md` — the per-client design contract: `clients/<slug>/`,
+  every `client.toml` table, the publish guards, the credit ledger, review metrics
+  and the deliverable pack. Read it before touching anything client-scoped.
 - `docs/PRODUCT_PLAN.md` — **LOCAL ONLY, gitignored** (pricing, revenue and client names;
   must not reach the public remote). How this pipeline is being sold as a managed service,
   with the per-client-config roadmap. Read before adding a feature, so it lands on the

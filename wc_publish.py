@@ -29,11 +29,14 @@ script present the clearance cookie your own browser already earned:
 Keep that file out of the repo - it is a live session credential.
 
 Exit codes: 0 = every row went through, 2 = at least one row failed (dry run
-or commit), 3 = the run aborted because the edge served a challenge. gui.py
-gates the commit button on a 0, so a run that wrote nothing must not return it.
+or commit), 3 = the run aborted because the edge served a challenge, 4 = a
+blast-radius guard refused and NOTHING was written (wrong store, --max-commit,
+an unsigned go-live, or no pre-publish snapshot). gui.py gates the commit button
+on a 0, so a run that wrote nothing must not return it.
 """
 
 import argparse
+import csv
 import html as _html
 import mimetypes
 import os
@@ -43,6 +46,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlsplit
+
+import client_config
 
 import pandas as pd
 import requests
@@ -65,7 +70,19 @@ def split_image_list(raw):
     return [p.strip() for p in parts if p.strip()]
 
 
-IMAGE_ROOT = "product_images_for_upload"
+IMAGE_ROOT = "product_images_for_upload"   # folder NAME (kept for compatibility)
+
+# Which store's images this run uploads (PRODUCT_PLAN Phase 1 item 1).
+# CLIENT.image_dir is absolute, so a publish no longer silently uploads
+# whatever happened to be in the cwd's product_images_for_upload\.
+try:
+    CLIENT = client_config.load_client()
+except client_config.ClientConfigError as _exc:
+    raise SystemExit(
+        f"Cannot start: {_exc} "
+        f"(per-client config lives in clients/<slug>/client.toml - see "
+        f"docs/CLIENT_CONFIG.md)")
+
 TIMEOUT = 60
 # Bounded retry for transport failures only - see Store.call.
 NETWORK_RETRIES = 4
@@ -79,6 +96,13 @@ RETRYABLE_METHODS = ("GET", "PUT", "DELETE")
 EXIT_OK = 0
 EXIT_ROW_FAILED = 2        # at least one row failed (dry run or commit)
 EXIT_BLOCKED = 3           # the edge challenge stopped the run outright
+EXIT_REFUSED = 4           # a blast-radius guard tripped and NOTHING was written
+
+# PRODUCT_PLAN Phase 1 item 3 (docs/CLIENT_CONFIG.md "Item 3"): the publish
+# blast-radius guard. Every one of these refuses BEFORE the first write, so a
+# 4 always means the store is exactly as it was.
+DEFAULT_MAX_COMMIT = 25    # --max-commit: rows one command may write at once
+SIGNOFF_NAME = "review_signoff.csv"   # next to the CSV; gui.py writes it
 
 # A store behind a CDN JavaScript challenge (KI-15) answers every server-to-
 # server request with an interstitial instead of the API. The clearance cookie a
@@ -193,6 +217,189 @@ def env_or_die(name):
                  f"environment variables (never put them in the repo), then "
                  f"open a new terminal.")
     return value
+
+
+# ---------------------------------------------------------------------------
+# Blast-radius guards (PRODUCT_PLAN Phase 1 item 3). Each answers one question
+# a wrong-store publish would have answered too late: am I pointed at THIS
+# client's store, how many rows can this one command touch, has a human signed
+# off the rows about to go live, and is there a way back?
+# ---------------------------------------------------------------------------
+
+def apply_client_env(cfg=None):
+    """Inject clients/<slug>/.env into os.environ, then say what happened.
+
+    Called at the top of main() once --client is resolved, so env_or_die and
+    every direct os.environ["WC_URL"] read below see the CLIENT'S credentials
+    rather than whatever a stale `set WC_URL=...` left in the shell."""
+    cfg = cfg if cfg is not None else CLIENT
+    try:
+        values = client_config.apply_env(cfg)
+    except client_config.ClientConfigError as exc:
+        sys.exit(f"{exc}\n  Fix {cfg.env_file} - a credentials file that does "
+                 f"not parse is exactly how a publish lands on the wrong store.")
+    if values:
+        print(f"env: loaded {len(values)} key(s) from {cfg.env_file}")
+    else:
+        print(f"env: no {cfg.env_file}")
+    return values
+
+
+def store_mismatch(cfg=None, url=None):
+    """A message naming BOTH hosts when WC_URL is not this client's store,
+    else None.
+
+    Empty WC_URL is not a mismatch - env_or_die owns that message, and saying
+    "you are pointed at nothing" helps nobody."""
+    cfg = cfg if cfg is not None else CLIENT
+    env_url = (url if url is not None
+               else os.environ.get("WC_URL", "")).strip()
+    if not env_url:
+        return None
+    if client_config.same_store(env_url, cfg.store_url):
+        return None
+    here = client_config.store_host(env_url) or env_url
+    theirs = client_config.store_host(cfg.store_url) or cfg.store_url
+    return (f"WC_URL points at {here}, but client '{cfg.slug}' ({cfg.name}) is "
+            f"{theirs}. One of the two is wrong; publishing would write this "
+            f"client's catalogue into somebody else's store. Fix WC_URL (or "
+            f"{cfg.env_file}), or pass the --client that owns {here}.")
+
+
+def signoff_path(csv_path):
+    """<csv dir>/review_signoff.csv. A directory (or nothing) means cwd."""
+    base = Path(csv_path) if csv_path else Path.cwd()
+    if not base.is_dir():
+        base = base.parent
+    return base / SIGNOFF_NAME
+
+
+def load_signoff(csv_path):
+    """{SKU (upper): (reviewer, signed_at)} from <csv dir>/review_signoff.csv.
+
+    Missing file -> {}. gui.py writes this at the moment an operator arms a
+    go-live commit, so `--status publish` can only reach human-confirmed rows.
+    A malformed row is skipped rather than fatal: a half-written sign-off must
+    fail CLOSED (the SKU counts as unsigned), never open."""
+    path = signoff_path(csv_path)
+    if not path.is_file():
+        return {}
+    out = {}
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.DictReader(fh):
+                keys = {str(k or "").strip().lower(): v for k, v in row.items()}
+                sku = compact(keys.get("sku")).upper()
+                if sku:
+                    out[sku] = (compact(keys.get("reviewer")),
+                                compact(keys.get("signed_at")))
+    except OSError as exc:
+        print(f"  [warn] could not read {path}: {exc}")
+        return {}
+    return out
+
+
+def check_signoff(skus, csv_path, what="published live"):
+    """A refusal message when any SKU is not in review_signoff.csv, else None.
+
+    Only `--commit --status publish` and `--commit --delete-sku` call this:
+    those are the two actions a customer can see, and both are one typo away
+    from being irreversible."""
+    signed = load_signoff(csv_path)
+    wanted = [compact(s) for s in skus if compact(s)]
+    missing = [s for s in wanted if s.upper() not in signed]
+    path = signoff_path(csv_path)
+    if not missing:
+        # A row with the SKU but an empty reviewer or signed_at is a
+        # placeholder, not a sign-off: someone listed the SKU and never
+        # actually approved it. Fail CLOSED on it, the same as a missing row.
+        blank = []
+        for sku in wanted:
+            reviewer, signed_at = signed[sku.upper()]
+            gaps = [name for name, value in (("reviewer", reviewer),
+                                             ("signed_at", signed_at))
+                    if not value]
+            if gaps:
+                blank.append((sku, gaps))
+        if not blank:
+            return None
+        sku, gaps = blank[0]
+        return (f"\nREFUSED: {len(blank)} of {len(wanted)} SKU(s) about to be "
+                f"{what} have a blank sign-off - {sku} is listed with no "
+                f"{' and no '.join(gaps)}.\n"
+                f"  Every row in {path} needs BOTH a reviewer and a "
+                f"signed_at; an empty cell is a placeholder, not an "
+                f"approval.\n"
+                f"  Nothing was written. Exit code {EXIT_REFUSED}.")
+    return (f"\nREFUSED: {len(missing)} of {len(wanted)} SKU(s) about to be "
+            f"{what} are not signed off - the first is {missing[0]}.\n"
+            f"  Expected {path}\n"
+            f"  with columns sku,reviewer,signed_at listing every one of them "
+            f"({len(signed)} SKU(s) are listed there today).\n"
+            f"  gui.py writes that file when an operator arms a go-live; add "
+            f"the rows by hand when publishing from the CLI.\n"
+            f"  Nothing was written. Exit code {EXIT_REFUSED}.")
+
+
+def take_snapshot(store, cfg, skip=False):
+    """wc_checkpoint.create() before the first write of a --commit run.
+
+    Returns the checkpoint name, None when --no-checkpoint was passed, and
+    raises when the capture fails - the caller refuses in that case. A publish
+    with no way back is a decision for the operator to make explicitly."""
+    if skip:
+        print("  --no-checkpoint: NO snapshot was taken, so this run cannot "
+              "be rolled back.")
+        return None
+    import wc_checkpoint
+    name = wc_checkpoint.create(store, label=f"before-publish-{cfg.slug}",
+                                client=cfg)
+    print(f"  checkpoint: {name}")
+    return name
+
+
+def preflight(store, cfg, csv_path=None, image_mode="auto"):
+    """One line per check, then an exit code: 0 / 3 (challenge) / 4.
+
+    The store-URL match is checked by main() BEFORE the Store exists, so by
+    the time we get here it can only pass - it is printed anyway, because a
+    preflight that stays silent about the store it checked is not a preflight.
+    """
+    print(f"Preflight for {cfg.name} ({cfg.slug}) -> {store.base}\n")
+    print(f"  [OK  ] store URL matches client '{cfg.slug}' "
+          f"({client_config.store_host(cfg.store_url)})")
+    failed = False
+    try:
+        store.check()
+        print("  [OK  ] WooCommerce API answers and the key authenticates")
+    except ChallengeError as exc:
+        print("  [FAIL] the edge served a browser challenge, not the API")
+        print(f"\n{exc}")
+        return EXIT_BLOCKED
+    except Exception as exc:
+        print(f"  [FAIL] WooCommerce API: {exc}")
+        failed = True
+
+    have_media = all(media_creds())
+    if have_media:
+        print("  [OK  ] media upload credentials (WP_APP_USER / WP_APP_PASSWORD)")
+    elif image_mode in ("url", "skip"):
+        print(f"  [OK  ] media credentials not needed with --images {image_mode}")
+    else:
+        print("  [FAIL] WP_APP_USER / WP_APP_PASSWORD are not set, so no image "
+              "can be uploaded (or pass --images url)")
+        failed = True
+
+    path = signoff_path(csv_path)
+    signed = load_signoff(csv_path)
+    if signed:
+        print(f"  [INFO] {path.name}: {len(signed)} signed SKU(s) at {path}")
+    else:
+        print(f"  [INFO] no {path} yet - needed only for "
+              f"--commit --status publish")
+
+    print("\nPreflight " + ("FAILED." if failed else "passed."))
+    return EXIT_REFUSED if failed else EXIT_OK
 
 
 # WordPress stores and returns names HTML-escaped: a category created as
@@ -481,7 +688,7 @@ def images_for(row, sku, title, mode, allow_writes=True):
         return [{"src": u.strip(), "alt": title} for u in urls], []
 
     payload, notes = [], []
-    root = Path(os.getcwd()) / IMAGE_ROOT
+    root = CLIENT.image_dir
     # Take the filenames from the URLs, NOT from the position in the list.
     # app.py names each file after the index of the SOURCE url and only writes
     # the ones that survived download and the MIN_IMAGE_EDGE floor, so the
@@ -655,6 +862,7 @@ def use_utf8_stdout():
                 pass
 
 def main():
+    global CLIENT
     use_utf8_stdout()
     ap = argparse.ArgumentParser(
         description="Upsert products into WooCommerce from the generated CSV. "
@@ -678,6 +886,17 @@ def main():
     ap.add_argument("--delete-sku", metavar="SKU",
                     help="Permanently delete the product with this SKU "
                          "(needs --commit). For cleaning up test products.")
+    ap.add_argument("--max-commit", type=int, default=DEFAULT_MAX_COMMIT,
+                    metavar="N",
+                    help=f"Refuse a --commit that would write more than N "
+                         f"products (default {DEFAULT_MAX_COMMIT}). Dry runs "
+                         f"are never capped.")
+    ap.add_argument("--no-checkpoint", action="store_true",
+                    help="Skip the automatic pre-publish snapshot. Only for a "
+                         "run you are prepared not to be able to roll back.")
+    ap.add_argument("--preflight", action="store_true",
+                    help="Check the store URL, the API, the media credentials "
+                         "and the sign-off file, then exit. Writes nothing.")
     ap.add_argument("--cookie-file", metavar="PATH",
                     help="File holding your browser's Cookie header, for a "
                          "store behind a CDN JS challenge. Preferred over "
@@ -689,7 +908,25 @@ def main():
                     help="User-Agent to send. A clearance cookie is bound to the "
                          "browser that earned it, so this must match the browser "
                          "you copied the cookie from.")
+    client_config.cli_client(ap)
     args = ap.parse_args()
+    if args.client:
+        CLIENT = client_config.load_client(args.client)
+    print(f"Client: {CLIENT.name} ({CLIENT.slug})   images: {CLIENT.image_dir}")
+    apply_client_env(CLIENT)
+
+    # Guard 1: am I pointed at THIS client's store? A hard stop only where a
+    # write can happen or where the operator asked for a verdict (--commit,
+    # --check, --preflight). A plain dry run cannot write, so it warns loudly
+    # and carries on - which also keeps the offline suite, whose dry runs go
+    # to store.invalid, honest about what it is exercising.
+    mismatch = store_mismatch(CLIENT)
+    if mismatch:
+        if args.commit or args.check or args.preflight:
+            print(f"\nREFUSED: {mismatch}\n  Nothing was written. "
+                  f"Exit code {EXIT_REFUSED}.")
+            return EXIT_REFUSED
+        print(f"\nWARNING: {mismatch} (dry run, nothing written)\n")
 
     using_cookie, dropped = configure_session(
         read_cookie_arg(args.cookie, args.cookie_file), args.user_agent or "")
@@ -702,6 +939,9 @@ def main():
                   f"API key is what authenticates: {', '.join(dropped)}")
     store = Store(allow_writes=args.commit)
 
+    if args.preflight:
+        return preflight(store, CLIENT, args.csv, args.images)
+
     if args.check:
         store.check()
         have_media = all(media_creds())
@@ -710,6 +950,15 @@ def main():
         return
 
     if args.delete_sku:
+        # A delete is the one action no re-run can undo, so it needs the same
+        # human sign-off a go-live does. One product, so --max-commit (>= 1
+        # by default) can never be what refuses it.
+        if args.commit:
+            refusal = check_signoff([args.delete_sku], args.csv,
+                                    "permanently deleted")
+            if refusal:
+                print(refusal)
+                return EXIT_REFUSED
         found = store.by_sku(args.delete_sku)
         if not found:
             print(f"No product with SKU {args.delete_sku}")
@@ -718,6 +967,13 @@ def main():
         if not args.commit:
             print("DRY RUN - would permanently delete it. Re-run with --commit.")
             return
+        try:
+            take_snapshot(store, CLIENT, args.no_checkpoint)
+        except Exception as exc:
+            print(f"\nREFUSED: the pre-delete snapshot failed ({exc}), so "
+                  f"nothing was deleted. Fix it, or pass --no-checkpoint to "
+                  f"delete without a way back. Exit code {EXIT_REFUSED}.")
+            return EXIT_REFUSED
         store.call("DELETE", f"products/{found['id']}", params={"force": "true"})
         print(f"Deleted product {found['id']}.")
         return
@@ -751,6 +1007,41 @@ def main():
     print(f"{'PUBLISHING' if args.commit else 'DRY RUN'}: {len(df)} product(s) "
           f"from {path.name} -> {store.base}  (images: {image_mode}, "
           f"status: {args.status or 'draft for new, unchanged for existing'})\n")
+
+    # The rows this command would actually write, after --sku / --limit.
+    skus = [compact(v) for v in df["sku"].tolist() if compact(v)]
+
+    # Guard 2: blast radius. The difference between a 20-product test and
+    # rewriting the whole catalogue is one wrong CSV on the command line.
+    if args.commit and len(skus) > args.max_commit:
+        print(f"REFUSED: this run would write {len(skus)} product(s), over the "
+              f"--max-commit limit of {args.max_commit}.\n"
+              f"  Narrow it with --sku / --limit, or pass "
+              f"--max-commit {len(skus)} to allow it.\n"
+              f"  Nothing was written. Exit code {EXIT_REFUSED}.")
+        return EXIT_REFUSED
+
+    # Guard 3: a human signed off every row that is about to be visible.
+    signed = load_signoff(path)
+    if args.commit and args.status == "publish":
+        refusal = check_signoff(skus, path, "published live")
+        if refusal:
+            print(refusal)
+            return EXIT_REFUSED
+    n_signed = sum(1 for s in skus if s.upper() in signed)
+    print(f"signoff: {n_signed} of {len(skus)} rows signed "
+          f"({signoff_path(path).name})\n")
+
+    # Guard 4: a way back, taken before the first write.
+    if args.commit:
+        try:
+            take_snapshot(store, CLIENT, args.no_checkpoint)
+        except Exception as exc:
+            print(f"\nREFUSED: the pre-publish snapshot failed ({exc}), so "
+                  f"nothing was written. Fix it, or pass --no-checkpoint to "
+                  f"publish without a way back. Exit code {EXIT_REFUSED}.")
+            return EXIT_REFUSED
+        print("")
 
     created = updated = failed = 0
     blocked = False

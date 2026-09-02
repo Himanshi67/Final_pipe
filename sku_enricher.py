@@ -39,6 +39,8 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit
 
+import client_config
+
 # A comma-joined URL list cannot be split on commas alone: Amazon's rendition
 # modifiers legitimately contain them (`._AC_UL165_SR165,165_.jpg`), and a plain
 # split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
@@ -132,11 +134,23 @@ BLOCKED_DOMAINS = [                    # never use these results
 # assess() then demands the "brand" appear in the listing, so page after page
 # came back 'rejected: brand not found in listing' - the single largest cause
 # of NOT FOUND on ERP-coded lists.
+#
+# The codes themselves are per-client (PRODUCT_PLAN item 2): they come from
+# [sku] in clients/<slug>/client.toml as SkuScheme.enricher_codes - input
+# codes + emitted prefixes + strip codes. main() rebinds this from the
+# resolved --client; the literal below is only the fallback for the case
+# where no client config can be loaded at all (a stripped checkout, a broken
+# client.toml), because sku_parts()/build_queries() must keep working for
+# --probe and for anything that imports this module without a client dir.
 CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW",
                   "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW",
                   # store-side prefixes from app.SKU_PREFIX_BY_PARENT, so a
                   # published SKU pasted back in as input still parses
                   "CF", "KA", "HA", "SA", "EC", "AP")
+try:
+    CATEGORY_CODES = client_config.load_client().sku.enricher_codes
+except Exception:                 # ClientConfigError, or no clients/ at all
+    pass                          # keep the literal above - see the note
 
 # ---- strict-match filters: accessories & compatibility listings ----------
 # Listings whose titles contain the model code but are NOT the product
@@ -218,7 +232,26 @@ CACHE_STATS = {"page_hit": 0, "page_miss": 0, "page_write": 0,
 # what the run actually spent, for the batch report. serper.dev bills per
 # search call, so a cached search is a credit not spent.
 RUN_STATS = {"serper_calls": 0, "ddg_calls": 0, "pages_fetched": 0,
-             "blocked_domains": {}}
+             "blocked_domains": {},
+             # which client this batch was enriched for (PRODUCT_PLAN Phase 1
+             # item 1). Recorded in the report header so a sheet can never be
+             # mistaken for another store's.
+             "client": client_config.DEFAULT_CLIENT,
+             # how the run ended: "done" | "user" (Ctrl+C) | "budget"
+             # (--budget hit). Copied into the report header and the ledger.
+             "stopped_by": "done"}
+
+# --budget N, as a module var so the refusal can sit in front of EVERY search
+# and not only between rows (item 4). One row fires 3-5 tier-1 queries, so a
+# between-rows-only check overshoots by up to a row's worth of credits; with
+# this, the spend can never exceed N. 0 = unlimited. main() rebinds it.
+SERPER_BUDGET = 0
+_budget_warned = False
+
+# BYOK (item 4): which env var holds the serper.dev key. main() rebinds it
+# from [serper] api_key_env of the resolved client; the default keeps
+# --probe, --cache-info and every test behaving exactly as before.
+SERPER_KEY_ENV = "SERPER_API_KEY"
 
 # Live round-trips made so far - cache hits excluded. fetch() and web_search()
 # bump it just before they go to the network; polite_sleep() reads it to tell a
@@ -992,17 +1025,21 @@ def build_queries(sku):
 _serper_failed_warned = False
 
 def serper_search(query):
-    """Optional Google search via serper.dev — used if SERPER_API_KEY is set."""
+    """Optional Google search via serper.dev - used if the client's key env
+    var (SERPER_KEY_ENV, default SERPER_API_KEY) is set."""
     global _serper_failed_warned
-    key = os.environ.get("SERPER_API_KEY")
+    key = os.environ.get(SERPER_KEY_ENV)
     if not key:
         return None
     try:
-        RUN_STATS["serper_calls"] += 1        # billed whatever the response is
         r = creq.post("https://google.serper.dev/search",
                       headers={"X-API-KEY": key, "Content-Type": "application/json"},
                       json={"q": query, "gl": "in", "num": SEARCH_RESULTS},
                       timeout=20)
+        # Counted only once the POST has RETURNED: serper bills on a response
+        # of any HTTP status, but a timeout / DNS failure / connection reset
+        # never reaches their meter, and counting it inflated the ledger.
+        RUN_STATS["serper_calls"] += 1        # billed whatever the response is
         if r.status_code != 200:
             # error bodies parse fine but have no "organic" key, which used to
             # look like a trusted empty result and mask a dead/over-quota key
@@ -1044,7 +1081,7 @@ def web_search(query):
     spends no Serper credits at all. An EMPTY serper answer is cached (Google
     genuinely found nothing); an empty DuckDuckGo answer is not, because that
     is nearly always the library failing rather than a real absence."""
-    global NET_CALLS
+    global NET_CALLS, _budget_warned
     hit = cache_get("search", query)
     if hit is not None:
         CACHE_STATS["search_hit"] += 1
@@ -1053,7 +1090,17 @@ def web_search(query):
     CACHE_STATS["search_miss"] += 1
     NET_CALLS += 1
 
-    res = serper_search(query)
+    if SERPER_BUDGET and RUN_STATS["serper_calls"] >= SERPER_BUDGET:
+        # The budget is spent. Refuse the credit HERE rather than after the
+        # row, so the queries still in flight for this SKU cannot overshoot -
+        # returning None drops straight into the DuckDuckGo fallback below.
+        if not _budget_warned:
+            _budget_warned = True
+            log(f"      Serper budget of {SERPER_BUDGET} reached - remaining "
+                f"searches fall back to DuckDuckGo")
+        res = None
+    else:
+        res = serper_search(query)
     if res is not None:      # serper answered (even if empty) - trust Google
         cache_put("search", query, res)
         return res
@@ -3332,6 +3379,139 @@ def safe_save(wb, out):
         f"(Rename it back to '{out.name}' before the next run to resume.)")
     return atomic_save(wb, alt)
 
+# ----------------------------- credit ledger ------------------------------
+# PRODUCT_PLAN Phase 1 item 4. serper.dev bills per live search, and nothing
+# in this repo used to remember how many were spent once the terminal closed.
+# The ledger is per client (clients/<slug>/credits.json, gitignored): one
+# entry per run, a month-to-date total, and last month's total in `history`.
+# Cache hits never reach serper_search, so they are correctly not counted -
+# "credits actually spent" is exactly what this file records.
+
+
+def ledger_month(run_id):
+    """'20260902-153012-9184' -> '2026-09'. The trailing pid is optional
+    (ids written before item 4's concurrency fix have none). Empty string
+    when the id is not a run id at all."""
+    m = re.match(r"^(\d{4})(\d{2})\d{2}-\d{6}(?:-\d+)?$",
+                 str(run_id or "").strip())
+    return f"{m.group(1)}-{m.group(2)}" if m else ""
+
+
+class Ledger:
+    """clients/<slug>/credits.json - upsert-by-id, month-total, tmp+replace.
+
+    Never raises at the caller: the ledger is bookkeeping, and a read-only
+    disk or a locked file must not take a scraping run down. A write that
+    fails warns ONCE and the run carries on.
+    """
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.data = {"month": datetime.now().strftime("%Y-%m"),
+                     "serper_calls": 0, "runs": [], "history": {}}
+        self._warned = False
+
+    # ------------------------------------------------ read
+    def load(self):
+        """Read the file if it is there. A missing or corrupt file is an
+        empty ledger, never an error - the run matters more than the tally."""
+        try:
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return self.data
+        if isinstance(raw, dict):
+            self.data = {
+                "month": str(raw.get("month") or self.data["month"]),
+                "serper_calls": int(raw.get("serper_calls") or 0),
+                "runs": [dict(r) for r in (raw.get("runs") or [])
+                         if isinstance(r, dict)],
+                "history": {str(k): int(v or 0) for k, v
+                            in (raw.get("history") or {}).items()},
+            }
+        return self.data
+
+    @property
+    def month_total(self):
+        return int(self.data.get("serper_calls") or 0)
+
+    # ------------------------------------------------ write
+    def update(self, run_entry):
+        """Upsert this run by 'id', recompute the month total from the runs
+        of the current month, and roll any older month into `history`."""
+        entry = dict(run_entry or {})
+        run_id = str(entry.get("id") or "")
+        month = ledger_month(run_id) or datetime.now().strftime("%Y-%m")
+
+        # Read-modify-write: two enrichers can run for one client at once, and
+        # rewriting the whole file from the copy loaded at startup silently
+        # deleted the other run's entry. `entry` is complete, so the only
+        # state worth keeping from memory is this run's own row - everything
+        # else must come from whatever is on disk RIGHT NOW.
+        self.load()
+
+        runs = [dict(r) for r in self.data.get("runs") or [] if isinstance(r, dict)]
+        for i, row in enumerate(runs):
+            if str(row.get("id") or "") == run_id:
+                row.update(entry)
+                runs[i] = row
+                break
+        else:
+            runs.append(entry)
+
+        history = dict(self.data.get("history") or {})
+        stored = str(self.data.get("month") or "")
+        stored_total = int(self.data.get("serper_calls") or 0)
+        # A month that spent nothing is not history, it is an empty ledger
+        # that happened to be opened in a different month - do not record it.
+        if stored and stored != month and stored_total:      # month rollover
+            history[stored] = max(int(history.get(stored) or 0), stored_total)
+        kept, rolled = [], {}
+        for row in runs:
+            row_month = ledger_month(str(row.get("id") or "")) or month
+            if row_month == month:
+                kept.append(row)
+            else:
+                rolled[row_month] = (rolled.get(row_month, 0)
+                                     + int(row.get("serper_calls") or 0))
+        for row_month, spent in rolled.items():
+            if spent:
+                history[row_month] = max(int(history.get(row_month) or 0), spent)
+
+        self.data = {
+            "month": month,
+            "serper_calls": sum(int(r.get("serper_calls") or 0) for r in kept),
+            "runs": kept,
+            "history": history,
+        }
+        self.save()
+        return self.data
+
+    def save(self):
+        """tmp + os.replace, like atomic_save and cache_put: the file on disk
+        is either the previous ledger or the complete new one."""
+        # ...<pid>.tmp, not a fixed name: two processes writing the ledger of
+        # one client would otherwise share a scratch file and os.replace half
+        # of the other's JSON into place.
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(self.data, indent=2, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(tmp, self.path)
+            return True
+        except (OSError, ValueError, TypeError) as exc:
+            if not self._warned:
+                self._warned = True
+                log(f"  !! WARNING: cannot write the credit ledger "
+                    f"'{self.path}' ({type(exc).__name__}: {exc}) - the run "
+                    f"continues, credits just are not recorded.")
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
+
 # ------------------------------ batch report ------------------------------
 # Everything below used to exist only as terminal scrollback: what the run
 # cost, which domains blocked it, and - the one that actually matters - which
@@ -3378,6 +3558,25 @@ def collect_report_rows(ws, sku_col, cols):
     return rows
 
 
+def review_summary_line(path):
+    """'Review: N min · M min/SKU · needs-human X%' from a GUI-written
+    review_metrics.json (item 5), or '' when there is none / it is unusable."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(data, dict) or not data:
+        return ""
+    try:
+        minutes = float(data.get("review_minutes") or 0)
+        per_sku = float(data.get("min_per_sku") or 0)
+        needs = float(data.get("needs_human_pct") or 0)
+    except (TypeError, ValueError):
+        return ""
+    return (f"Review: {minutes:.1f} min · {per_sku:.1f} min/SKU · "
+            f"needs-human {needs:.0f}%")
+
+
 def write_report(path, rows, out_file, started, args, min_images):
     """Write the run summary next to the output. Never raises: a report that
     cannot be written must not fail a batch whose data is already saved."""
@@ -3404,6 +3603,14 @@ def write_report(path, rows, out_file, started, args, min_images):
         "",
         f"- run finished: {datetime.now():%Y-%m-%d %H:%M:%S}",
         f"- duration: {took / 60:.1f} min",
+        f"- Client: `{RUN_STATS.get('client') or client_config.DEFAULT_CLIENT}`",
+        # item 4: what this run cost and where the month stands, in the
+        # header - the ledger is the durable copy, this is the readable one.
+        f"- Credits: {RUN_STATS['serper_calls']} this run"
+        f" · {RUN_STATS.get('credits_month', RUN_STATS['serper_calls'])}"
+        f" month-to-date"
+        f" · budget {RUN_STATS.get('credits_budget', 0)}",
+        f"- Stopped by: {RUN_STATS.get('stopped_by') or 'done'}",
         f"- input: `{args.input}`",
         f"- output: `{out_file.name}`  ({len(rows)} data row(s))",
         f"- flags: `{' '.join(sys.argv[1:]) or '(none)'}`",
@@ -3435,6 +3642,14 @@ def write_report(path, rows, out_file, started, args, min_images):
     n_cache, bytes_cache = cache_size()
     lines.append(f"- cache now holds {n_cache} entr(ies), "
                  f"{bytes_cache / 1_048_576:.1f} MB")
+
+    # item 5: when the GUI has already reviewed this sheet (a retry run), say
+    # what the human time cost. Same one-liner gui_helpers.review_caption
+    # renders - deliberately duplicated rather than imported, so the enricher
+    # stays a standalone script with no streamlit-side dependency.
+    review_line = review_summary_line(out_file.parent / "review_metrics.json")
+    if review_line:
+        lines += ["", "## Review", "", review_line]
 
     if RUN_STATS["blocked_domains"]:
         lines += ["", "## Domains that blocked us", "",
@@ -3510,10 +3725,25 @@ def install_break_handler() -> bool:
     return True
 
 
+def nonneg_int(value):
+    """argparse type for --budget: 0 (unlimited) or more, never negative.
+    `--budget -5` used to be clamped to 0 by max(0, ...) - i.e. silently
+    UNLIMITED, the exact opposite of what an operator typing a budget means."""
+    try:
+        n = int(str(value).strip())
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a whole number")
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"a credit budget cannot be negative (got {n}); use 0 for unlimited")
+    return n
+
+
 def main():
     global PW_ENABLED, PW_MAX_PER_RUN, PW_PROFILE_DIR, CACHE_ENABLED, CACHE_REFRESH
     global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED, DISCOVER_MODE
-    global IMAGE_CHECK, IMAGE_MIN_PX
+    global IMAGE_CHECK, IMAGE_MIN_PX, SERPER_KEY_ENV, CATEGORY_CODES
+    global SERPER_BUDGET, _budget_warned
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3524,11 +3754,21 @@ def main():
     ap = argparse.ArgumentParser(
         description="Fill product title / price / URL / images for SKUs from "
                     "Amazon.in, Flipkart and other Indian retailers.")
+    client_config.cli_client(ap)
     ap.add_argument("input", nargs="?",
                     help="Path to .xlsx or .csv containing a SKU column")
     ap.add_argument("--sheet", help="Worksheet name (default: first sheet)")
     ap.add_argument("--sku-col", help="Header of the SKU column (default: auto-detect)")
     ap.add_argument("--limit", type=int, default=0, help="Process at most N SKUs this run")
+    ap.add_argument("--budget", type=nonneg_int, default=None, metavar="N",
+                    help="Cap this run at N serper.dev credits (0 = "
+                         "unlimited, negative refused). The Nth credit is the "
+                         "last one spent: any further query in that row falls "
+                         "back to DuckDuckGo, and the run stops after the row "
+                         "in which the Nth credit was spent. Progress is "
+                         "saved and the report is written, exactly as for "
+                         "Ctrl+C. Default: the client's [serper] "
+                         "default_run_budget.")
     ap.add_argument("--force", action="store_true",
                     help="Re-process every row, even ones already filled")
     ap.add_argument("--retry-missing", action="store_true",
@@ -3623,6 +3863,48 @@ def main():
     ap.add_argument("--no-report", action="store_true",
                     help="Do not write a batch report")
     args = ap.parse_args()
+
+    # Which client this batch belongs to (item 1), which env var holds its
+    # serper key and how many credits it may spend (item 4), and which SKU
+    # codes its ERP writes (item 2) - all from clients/<slug>/client.toml.
+    try:
+        cfg = client_config.load_client(args.client)
+    except client_config.ClientConfigError as exc:
+        sys.exit(f"{exc}")
+    RUN_STATS["client"] = cfg.slug
+    print(f"Client: {RUN_STATS['client']}")
+
+    # The client's own .env wins over a stale shell export (item 3), so the
+    # key read below is this client's key and no other's.
+    applied = client_config.apply_env(cfg)
+    if applied:
+        log(f"Loaded {len(applied)} key(s) from {cfg.env_file}")
+    else:
+        log(f"No .env for this client ({cfg.env_file}) - using the shell "
+            f"environment as-is")
+    SERPER_KEY_ENV = cfg.serper.api_key_env
+    CATEGORY_CODES = cfg.sku.enricher_codes
+
+    # --budget: explicit flag > the client's default_run_budget. 0 = unlimited.
+    budget = args.budget if args.budget is not None else cfg.serper.default_run_budget
+    budget = max(0, int(budget or 0))     # a client.toml value can still be junk
+    SERPER_BUDGET, _budget_warned = budget, False
+    RUN_STATS["credits_budget"] = cfg.serper.monthly_budget
+    ledger = Ledger(cfg.credits_file)
+    ledger.load()
+    RUN_STATS["credits_month"] = ledger.month_total
+    if budget:
+        log(f"Serper budget for this run: {budget} credit(s) "
+            f"({ledger.month_total} spent this month, monthly budget "
+            f"{cfg.serper.monthly_budget})")
+    # monthly_budget is ADVISORY by design (docs/CLIENT_CONFIG.md item 4): the
+    # hard stop is --budget, per run. Say the month is spent, once, and carry
+    # on - a batch that must finish tonight is not ours to abort.
+    monthly = int(cfg.serper.monthly_budget or 0)
+    if monthly and ledger.month_total >= monthly:
+        log(f"  !! WARNING: Month-to-date serper credits ({ledger.month_total}) "
+            f"already at or over the monthly budget ({monthly}) - "
+            f"consider --budget")
 
     PW_ENABLED, PW_MAX_PER_RUN = args.js_fallback, args.js_budget
     PW_PROFILE_DIR = args.js_profile
@@ -3736,10 +4018,11 @@ def main():
     if args.crawl_urls:
         log("PASS 2 (--crawl-urls): crawling the links in the sheet. "
             "No searches will run, so this costs no serper credits.")
-    elif os.environ.get("SERPER_API_KEY"):
-        log("Search: Google via serper.dev (API key detected)")
+    elif os.environ.get(SERPER_KEY_ENV):
+        log(f"Search: Google via serper.dev (${SERPER_KEY_ENV} detected)")
     else:
-        log("Search: DuckDuckGo (free). Tip: set SERPER_API_KEY for better results.")
+        log(f"Search: DuckDuckGo (free). Tip: set ${SERPER_KEY_ENV} for "
+            f"better results.")
     if args.discover:
         log("PASS 1 (--discover): finding a link and photos only - no spec "
             "table, no donor pages. Review the sheet, then run --crawl-urls.")
@@ -3747,6 +4030,27 @@ def main():
     done = found = missed = no_link = 0
     stopped = False
     started = time.time()
+    # One ledger entry per run, upserted on every checkpoint save, so a crash
+    # loses at most one row's worth of accounting (item 4).
+    run_started = datetime.now()
+    # ...-<pid>: two runs started in the same second share a stamp, and an
+    # upsert-by-id then made the second one REPLACE the first (a 0-credit warm
+    # replay wiped a 12-credit entry and took the month total with it).
+    run_id = run_started.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+
+    def record_credits():
+        ledger.update({
+            "id": run_id,
+            "input": Path(str(args.input)).name,
+            "started": run_started.isoformat(timespec="seconds"),
+            "ended": datetime.now().isoformat(timespec="seconds"),
+            "serper_calls": RUN_STATS["serper_calls"],
+            "ddg_calls": RUN_STATS["ddg_calls"],
+            "pages_fetched": RUN_STATS["pages_fetched"],
+            "stopped_by": RUN_STATS.get("stopped_by") or "done",
+        })
+        RUN_STATS["credits_month"] = ledger.month_total
+
     for r in range(2, ws.max_row + 1):
         sku = ws.cell(row=r, column=sku_col).value
         if sku is None or not str(sku).strip():
@@ -3816,6 +4120,7 @@ def main():
                     rec["status"] = discovery_status(rec)
         except KeyboardInterrupt:
             log("\nStopped by user - progress saved.")
+            RUN_STATS["stopped_by"] = "user"
             stopped = True
             rec = None
         except Exception as e:
@@ -3871,17 +4176,32 @@ def main():
                     "calls (80% of the 2,500/month free tier) - check your "
                     "serper.dev dashboard before continuing.")
 
+        # --budget (item 4): a hard stop, not a warning. web_search already
+        # refused every serper call past the Nth, so this fires after the row
+        # in which the Nth credit was spent (the rest of that row went to
+        # DuckDuckGo) and the spend can never exceed N. The row just done is
+        # already in `rec`, so breaking here leaves the sheet consistent and
+        # falls into the SAME save + summary + report path Ctrl+C uses.
+        if budget and RUN_STATS["serper_calls"] >= budget:
+            log(f"Budget of {budget} serper credit(s) reached - stopping, "
+                f"progress saved.")
+            RUN_STATS["stopped_by"] = "budget"
+            stopped = True
+
         out = safe_save(wb, out)
+        record_credits()             # checkpoint the ledger with the sheet
         if stopped:
             break
         try:
             polite_sleep(args.delay[0], args.delay[1], since=_net_before_sku)
         except KeyboardInterrupt:
             log("\nStopped by user - progress saved.")
+            RUN_STATS["stopped_by"] = "user"
             break
 
     out = safe_save(wb, out)
-    _pw_shutdown()               # close the browser before the summary prints
+    record_credits()                 # final entry: this run's real spend
+    _pw_shutdown()               # close the browser before the summary prints             # close the browser before the summary prints
     log(f"\nDone. Processed {done} SKUs: {found} found, {missed} not found / errors.")
     log(f"Output file: {out}")
     if CACHE_ENABLED and (CACHE_STATS["page_hit"] or CACHE_STATS["search_hit"]):

@@ -1,0 +1,65 @@
+# Shree Jee Electronics - the first client. See docs/CLIENT_CONFIG.md.
+# Every value here was a hard-coded literal in app.py / build_csv.py /
+# validate_csv.py before Phase 1 item 1; they are copied verbatim, so the
+# output for this client is byte-identical to what the pipeline produced
+# before the config existed.
+
+[client]
+slug = "shreejee"                       # must equal the directory name
+name = "Shree Jee Electronics"          # human label (GUI titles, reports)
+
+[store]
+url = "https://shreejeeelectronics.in"  # no trailing slash
+media_base = "{url}/wp-content/uploads/{yyyy}/{mm}"
+seo_site_name = "Shree Jee Electronics"
+placeholder_html = "<p>Premium product available at Shree Jee Electronics. Detailed specifications currently updating.</p>"
+
+[taxonomy]
+category_map = "category_map.xlsx"
+category_seo = "category_seo.xlsx"
+attributes_master = "SubCategory_Attributes_Master.xlsx"
+
+# One table replaces app.SKU_PREFIX_BY_PARENT / SKU_PREFIXES /
+# SKU_PREFIX_CATEGORY, validate_csv.SKU_PREFIX_RE, gui_helpers.SKU_CODES and
+# sku_enricher.CATEGORY_CODES, which used to drift independently.
+# (Sub-tables, not inline tables: TOML forbids a newline inside { }.)
+[sku]
+fallback_prefix = "AP"           # anything with no parent match
+never_rename = ["WM", "WH"]      # live products carry these - prefixed_sku returns them untouched
+strip_codes = ["DW", "LED", "MW"]  # extra tokens the enricher strips, no taxonomy hint
+
+# OUTPUT side: the canonical code emitted per taxonomy parent when building the
+# WooCommerce SKU. Order matters - it is the order of SkuScheme.prefixes.
+[sku.prefix_by_parent]
+"Washing Machines" = "WM"
+"Water Heaters" = "WH"
+"LED" = "TV"
+"Air Conditioner" = "AC"
+"Cooling & Freezing" = "CF"
+"Kitchen Appliances" = "KA"
+"Home Appliances" = "HA"
+"Small Appliances" = "SA"
+"Electronics & Computing" = "EC"
+
+# INPUT side: codes an operator/ERP writes at the front of a raw SKU ->
+# taxonomy hint [parent, sub].
+[sku.input_codes]
+WM = ["Washing Machines", ""]
+WH = ["Water Heaters", "Geysers"]
+SM = ["Home Appliances", "sewing machine"]
+HWD = ["Home Appliances", "Water Dispensers"]
+REF = ["Home Appliances", "Refrigerators"]
+FRIDGE = ["Home Appliances", "Refrigerators"]
+MWO = ["Kitchen Appliances", "Microwave Ovens"]
+IC = ["Kitchen Appliances", "Induction Cooktops"]
+ICT = ["Kitchen Appliances", "Induction Cooktops"]
+DI = ["Small Appliances", "Electric Iron"]
+DF = ["Cooling & Freezing", "Deep Freezers"]
+AC = ["Air Conditioner", ""]
+TV = ["LED", ""]
+
+[serper]
+api_key_env = "SERPER_API_KEY"   # BYOK: the env var (in the client's .env) that holds the key
+monthly_budget = 2500            # informational (free tier); the GUI shows month-to-date against it
+default_run_budget = 0           # 0 = unlimited; the GUI pre-fills --budget with it
+

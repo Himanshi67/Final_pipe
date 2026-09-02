@@ -1,3 +1,4 @@
+# Requires Python 3.11+  (gui.py uses `X | None` annotations at runtime)
 # Dependencies for the FULL active pipeline
 # (sku_enricher.py + app.py + validate_csv.py)
 #
@@ -21,3 +22,7 @@ streamlit
 pandas
 requests
 Pillow
+
+# -- tests (the /gate quality gate) --
+# .venv\Scripts\python.exe -m pytest tests -q
+pytest>=8

@@ -37,6 +37,8 @@ from collections import Counter
 
 import pandas as pd
 
+import client_config
+
 # A comma-joined URL list cannot be split on commas alone: Amazon's rendition
 # modifiers legitimately contain them (`._AC_UL165_SR165,165_.jpg`), and a plain
 # split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
@@ -113,8 +115,24 @@ def split_image_list(raw):
 
 
 MIN_IMAGES = 3
-IMAGE_ROOT = 'product_images_for_upload'
-PLACEHOLDER = '<p>Premium product available at Shree Jee Electronics. Detailed specifications currently updating.</p>'
+IMAGE_ROOT = 'product_images_for_upload'   # folder NAME (kept for compatibility)
+
+# Which store this report is checking (PRODUCT_PLAN Phase 1 item 1). Resolved
+# from --client / $PIPELINE_CLIENT / DEFAULT_CLIENT; build_csv.py and gui.py
+# set PIPELINE_CLIENT before importing this module.
+try:
+    CLIENT = client_config.load_client()
+except client_config.ClientConfigError as _exc:
+    raise RuntimeError(
+        f"Cannot start: {_exc} "
+        f"(per-client config lives in clients/<slug>/client.toml - see "
+        f"docs/CLIENT_CONFIG.md)") from _exc
+
+# <repo>/product_images_for_upload/<slug> - absolute, so the local-file
+# existence check no longer depends on which directory this was run from.
+IMAGE_DIR = str(CLIENT.image_dir)
+# The "we could not read a description" filler app.py writes for this client.
+PLACEHOLDER = CLIENT.placeholder_html
 
 # A product photo below this on its long edge is a thumbnail: it will look soft
 # on a product page and terrible in a lightbox.
@@ -163,6 +181,9 @@ CATEGORY_PRICE_CEILING = {
 # Wording that app.py used to emit when it could not read a spec. Nothing should
 # produce these any more (KI-14); if one appears, a stale CSV is being validated
 # or the placeholder behaviour has come back.
+# NOT client-derived on purpose: these are app.py's own invented spec VALUES
+# ('Standard Capacity'), identical for every store. The one string that IS
+# store-specific is PLACEHOLDER above, and it comes from client.toml.
 DEAD_PLACEHOLDERS = (
     'Standard Capacity', 'Standard Power Rating', 'Standard Washing Capacity',
     'Standard Tank Volume', 'Standard Cavity Volume', 'Standard Liquid Volume',
@@ -212,6 +233,26 @@ def issues_report_path(source_path):
     return os.path.join(folder, 'validation_issues.csv')
 
 
+def remove_stale_report(source_path):
+    """A clean run must not leave the PREVIOUS run's validation_issues.csv on
+    disk. gui.validator_flags reads that file whenever it exists, so a stale
+    copy keeps showing 'Validator flagged this SKU last run' after the operator
+    fixed the rows and rebuilt, and archive_run files it next to a README
+    saying 'Validation issues: 0' (P3-52). A locked file (open in Excel) must
+    not abort the build - say so and carry on. Returns True if one was removed.
+    """
+    report = issues_report_path(source_path)
+    if not os.path.exists(report):
+        return False
+    try:
+        os.remove(report)
+    except OSError as exc:
+        print(f'\nCould not remove the stale {report}: {exc}')
+        return False
+    print(f'\nRemoved the stale {report} - nothing flagged this run.')
+    return True
+
+
 def summary_key(reason):
     """The reason with its per-row detail stripped, so the summary counts
     kinds of problem rather than instances. Everything after '(' is detail,
@@ -239,7 +280,7 @@ def price_ceiling_for(categories):
     return None, None
 
 
-def image_dimension_problems(filenames, root=IMAGE_ROOT):
+def image_dimension_problems(filenames, root=None):
     """Sizes and shapes that disqualify a file as a product photo.
 
     Reads the header only (Pillow is lazy about pixel data), so this stays
@@ -249,6 +290,7 @@ def image_dimension_problems(filenames, root=IMAGE_ROOT):
         from PIL import Image
     except ImportError:
         return []
+    root = IMAGE_DIR if root is None else root
     problems = []
     for name in filenames:
         path = os.path.join(root, name)
@@ -282,7 +324,7 @@ def image_dimension_problems(filenames, root=IMAGE_ROOT):
     return problems
 
 
-def duplicate_image_content(records, root=IMAGE_ROOT):
+def duplicate_image_content(records, root=None):
     """Two SKUs whose DOWNLOADED FILES are byte-identical.
 
     On this file the URL-based cross-row checks are structurally unable to
@@ -300,6 +342,7 @@ def duplicate_image_content(records, root=IMAGE_ROOT):
     """
     import hashlib
 
+    root = IMAGE_DIR if root is None else root
     digests = {}
 
     def key_for(name):
@@ -388,12 +431,16 @@ def shared_image_pairs(records):
 
 
 def load_valid_categories():
-    """Exact category strings allowed by category_map.xlsx (if present)."""
+    """Exact category strings allowed by the CLIENT's category map (if present).
+
+    Only the client's own directory is searched. It used to try the cwd first,
+    which meant a stray category_map.xlsx in whatever folder the report was run
+    from silently decided which categories counted as valid.
+    """
     candidates = ('category_map.xlsx', 'category_map.csv',
                   'reorganise the catgory and sub category.xlsx')
-    here = os.path.dirname(os.path.abspath(__file__))
-    for base in (os.getcwd(), here):
-        for name in candidates:
+    for base in (str(CLIENT.dir),):
+        for name in (CLIENT.category_map.name,) + candidates:
             path = os.path.join(base, name)
             if not os.path.exists(path):
                 continue
@@ -538,6 +585,8 @@ def validate_filled(df, path):
                        'url': r['url']} for r in issues]
                      ).to_csv(report, index=False)
         print(f'\nSaved details to {report}')
+    else:
+        remove_stale_report(path)
     print('\nFix what matters, then run app.py / build_csv.py on this file.')
     return issues
 
@@ -545,7 +594,7 @@ def validate_filled(df, path):
 USAGE = """QA report for a WooCommerce import file or an enricher _filled.xlsx.
 
 Usage:
-    python validate_csv.py [path] [--warn-only]
+    python validate_csv.py [path] [--warn-only] [--client SLUG]
 
     path         the CSV to check, or a *_filled.xlsx (which routes to the
                  stage-1 checks instead). Defaults to
@@ -553,15 +602,58 @@ Usage:
     --warn-only  report without failing: exit 0 even when rows are flagged.
                  Without it the exit code is 1 when anything is flagged, so
                  this can gate a script.
+    --client SLUG  which client's config to use (clients/<slug>/client.toml):
+                 the placeholder text, the category map and the image folder
+                 all come from it. Falls back to $PIPELINE_CLIENT, then
+                 'shreejee'.
 
 Writes validation_issues.csv next to the file being checked."""
+
+
+def configure(slug):
+    """Switch this module to another client and return its ClientConfig.
+
+    Same contract as app.configure(): the GUI calls both so one selector
+    controls the whole pipeline. Raises ClientConfigError and changes nothing
+    on an unknown slug.
+    """
+    global CLIENT, IMAGE_DIR, PLACEHOLDER, SKU_PREFIX_RE
+    incoming = client_config.load_client(slug)
+    CLIENT = incoming
+    IMAGE_DIR = str(incoming.image_dir)
+    PLACEHOLDER = incoming.placeholder_html
+    SKU_PREFIX_RE = _sku_prefix_re(incoming)
+    return CLIENT
+
+
+def argv_without_client(argv=None):
+    """sys.argv[1:] with '--client X' / '--client=X' removed.
+
+    This script hand-rolls its argv scanning (there is no argparse), so the
+    slug and its value have to be taken out before the positional path is
+    picked - otherwise `validate_csv.py --client shreejee` would try to open a
+    file called 'shreejee'.
+    """
+    items = list(sys.argv[1:] if argv is None else argv)
+    out, skip = [], False
+    for i, arg in enumerate(items):
+        if skip:
+            skip = False
+            continue
+        if arg == '--client':
+            skip = i + 1 < len(items) and not items[i + 1].startswith('-')
+            continue
+        if arg.startswith('--client='):
+            continue
+        out.append(arg)
+    return out
 
 
 def pick_input_path():
     # Flags are not paths. sys.argv[1] was taken verbatim, so `--help` was read
     # as a filename ("File not found: --help") and `--warn-only` on its own
     # became the path instead of selecting the default file.
-    positional = [a for a in sys.argv[1:] if not a.startswith('-')]
+    positional = [a for a in argv_without_client() if not a.startswith('-')]
     if positional:
         return positional[0]
     for candidate in ('wordpress_ready_clean_repaired.csv', 'wordpress_ready.csv'):
@@ -597,12 +689,17 @@ def to_number(value):
     return number if math.isfinite(number) else None
 
 
-# Mirrors app.SKU_PREFIX_BY_PARENT (+ the AP fallback). This script stays
-# import-free of app.py on purpose (app.py drags in streamlit); the module
-# constant exists so tests can assert the two stay in sync -
-# tests\test_bugfixes.py test_19 fails the moment a prefix is added there
-# and not here.
-SKU_PREFIX_RE = re.compile(r'^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-')
+# Every prefix app.py can emit, straight from the client's [sku] block
+# (PRODUCT_PLAN item 2). This script stays import-free of app.py on purpose
+# (app.py drags in streamlit), so it used to carry a hand-synced copy of the
+# prefix list that could drift; now both read client_config. configure()
+# rebinds it, and tests\test_bugfixes.py test_19 still pins the two in sync.
+def _sku_prefix_re(client):
+    return re.compile(r'^(' + '|'.join(re.escape(p) for p in client.sku.prefixes)
+                      + r')-')
+
+
+SKU_PREFIX_RE = _sku_prefix_re(CLIENT)
 
 
 def validate_export(df, csv_path, check_images=True, write_issues=True):
@@ -623,16 +720,16 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
     sale_col = find_col(df, 'sale price', 'sale_price')
     gaps_col = find_col(df, '_spec_gaps')
 
-    local_images_available = os.path.isdir(IMAGE_ROOT)
+    local_images_available = os.path.isdir(IMAGE_DIR)
     if not local_images_available:
-        print(f"Note: '{IMAGE_ROOT}' folder not found here - skipping the "
+        print(f"Note: '{IMAGE_DIR}' folder not found - skipping the "
               f'local image-file existence check.')
 
     valid_categories = load_valid_categories()
     if valid_categories:
         print(f'Category map loaded: {len(valid_categories)} allowed category strings.')
     else:
-        print('Note: category_map.xlsx not found - skipping the category check.')
+        print(f'Note: {CLIENT.category_map} not found - skipping the category check.')
 
     attr_name_cols = [c for c in df.columns
                       if re.fullmatch(r'Attribute \d+ name', str(c))]
@@ -675,7 +772,7 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
 
         if local_images_available and image_urls:
             missing_local = [os.path.basename(u) for u in image_urls
-                             if not os.path.exists(os.path.join(IMAGE_ROOT, os.path.basename(u)))]
+                             if not os.path.exists(os.path.join(IMAGE_DIR, os.path.basename(u)))]
             if missing_local:
                 reasons.append(f'{len(missing_local)} image file(s) not downloaded locally')
             # a 60px file and a 1:4 sliver both pass every URL-level check and
@@ -820,6 +917,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
         report = issues_report_path(csv_path)
         pd.DataFrame(issues).to_csv(report, index=False)
         print(f'\nSaved details to {report}')
+    elif write_issues:
+        remove_stale_report(csv_path)
 
     return issues
 
@@ -842,12 +941,13 @@ def main():
     if {'-h', '--help'} & set(sys.argv[1:]):
         print(USAGE)
         sys.exit(0)
-    unknown = [a for a in sys.argv[1:]
+    unknown = [a for a in argv_without_client()
                if a.startswith('-') and a not in ('--warn-only',)]
     if unknown:
         print(f"Unknown option: {unknown[0]}\n")
         print(USAGE)
         sys.exit(2)
+    print(f'Client: {CLIENT.name} ({CLIENT.slug})')
     csv_path = pick_input_path()
     try:
         if csv_path.lower().endswith(('.xlsx', '.xls')):

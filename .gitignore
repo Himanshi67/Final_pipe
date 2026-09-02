@@ -83,13 +83,22 @@ _push_export/
 *.tsv
 
 # ...EXCEPT the taxonomy, which is configuration, not data. app.py cannot map a
-# single category without it, and it has no other backup. Must come after the
-# *.xlsx rule above to override it.
-!category_map.xlsx
-!SubCategory_Attributes_Master.xlsx
+# single category without it, and it has no other backup. It now lives per
+# client under clients/<slug>/ (Phase 1 item 1) - nothing taxonomy-shaped is
+# left at the repo root. Must come after the *.xlsx rule above to override it.
+!clients/*/category_map.xlsx
+!clients/*/SubCategory_Attributes_Master.xlsx
 # curated per-category tags and SEO keywords - hand-written configuration,
 # regenerable with tools\build_category_seo.py but edited by hand in between
-!category_seo.xlsx
+!clients/*/category_seo.xlsx
+
+# Per-client generated/secret state that must never reach the remote:
+#   backups/    category-map editor snapshots (same reason as root backups/)
+#   .env        this client's WC_*/WP_*/SERPER_* credentials (Phase 1 item 3)
+#   credits.json  serper usage ledger (Phase 1 item 4)
+clients/*/backups/
+clients/*/.env
+clients/*/credits.json
 
 # Nothing in here belongs to the catalogue pipeline - a portable Node
 # distribution plus scratch DSA work. Ignoring the whole folder rather than

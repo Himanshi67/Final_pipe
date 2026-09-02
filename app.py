@@ -9,6 +9,20 @@ import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from PIL import Image
 
+import client_config
+
+# Which store this process is building for (PRODUCT_PLAN Phase 1 item 1).
+# Resolved from --client / $PIPELINE_CLIENT / DEFAULT_CLIENT, so a caller that
+# needs a different client must set PIPELINE_CLIENT BEFORE importing app, or
+# call app.configure(slug) afterwards.
+try:
+    CLIENT = client_config.load_client()
+except client_config.ClientConfigError as _exc:
+    raise RuntimeError(
+        f"Cannot start: {_exc} "
+        f"(per-client config lives in clients/<slug>/client.toml - see "
+        f"docs/CLIENT_CONFIG.md)") from _exc
+
 # A comma-joined URL list cannot be split on commas alone: Amazon's rendition
 # modifiers legitimately contain them (`._AC_UL165_SR165,165_.jpg`), and a plain
 # split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
@@ -81,7 +95,11 @@ def _ui():
 
 REQUIRED_INPUT_COLUMNS = ['sku', 'title', 'categories', 'Brands', 'regular price', 'sale price', 'url_link', 'image_url']
 EXPORTED_OUTPUT_COLUMNS = ['sku', 'cross reference tag', 'configuration', 'short description', 'description', 'title', 'categories', 'Tags', 'regular price', 'sale price', 'Brands', '_consolidated_sku', 'Images', '_spec_gaps']
-IMAGE_ROOT = 'product_images_for_upload'
+IMAGE_ROOT = 'product_images_for_upload'   # folder NAME (kept for compatibility)
+# Where images are actually written: <repo>/product_images_for_upload/<slug>.
+# Absolute and per-client, so two clients cannot overwrite each other's
+# SKU_n.webp and a run no longer depends on the process's cwd (P3-57).
+IMAGE_DIR = CLIENT.image_dir
 MAX_ATTRIBUTES = 15   # each one costs 4 CSV columns, so the sheet stays usable
 # The short description renders right under the price; a 15-row table there
 # pushes the buy button off the screen. The essentials (brand, capacity,
@@ -198,8 +216,14 @@ def largest_rendition(url):
     return text
 
 
-def build_media_base():
-    return f"https://shreejeeelectronics.in/wp-content/uploads/{datetime.now():%Y/%m}"
+def build_media_base(month=None):
+    """The WordPress uploads URL this client's images will live at.
+
+    Same signature as before (callers pass nothing); the store URL and the
+    /wp-content/uploads/{yyyy}/{mm} shape now come from the client's
+    client.toml instead of being frozen into this file.
+    """
+    return CLIENT.media_base(month)
 
 
 MEDIA_BASE = build_media_base()
@@ -260,7 +284,10 @@ def infer_brand(title, sku=''):
     # added. Caught live: TCL, iFFALCON and Foxsky were all exporting as
     # "Authorized Brand" because they were simply missing from the list.
     token = re.split(r'[-\s_]+', compact(sku))[0].strip()
-    if re.fullmatch(r'[A-Za-z]{2,}', token) and token.upper() not in ('WM', 'WH', 'AP'):
+    # a leading never-rename code or the fallback prefix is a SKU prefix, not a
+    # brand (PRODUCT_PLAN item 2: both come from the client's [sku] block)
+    not_a_brand = set(CLIENT.sku.never_rename) | {CLIENT.sku.fallback_prefix}
+    if re.fullmatch(r'[A-Za-z]{2,}', token) and token.upper() not in not_a_brand:
         return brand_case(token)
     return 'Authorized Brand'
 
@@ -279,6 +306,23 @@ def infer_brand(title, sku=''):
 
 CATEGORY_MAP_CANDIDATES = ('category_map.xlsx', 'category_map.csv',
                            'reorganise the catgory and sub category.xlsx')
+
+
+def category_map_path(client=None):
+    """The taxonomy workbook for `client` (default: the loaded CLIENT), or ''.
+
+    The file named in client.toml wins; the historical alternate spellings are
+    still accepted, but only INSIDE the client's own directory - a second
+    client must never fall back to the first one's taxonomy.
+    """
+    client = client or CLIENT
+    if client.category_map.exists():
+        return str(client.category_map)
+    for name in CATEGORY_MAP_CANDIDATES:
+        candidate = client.dir / name
+        if candidate.exists():
+            return str(candidate)
+    return ''
 
 # taxonomy entries whose own names contain commas (the list separator)
 CATEGORY_COMMA_MERGES = (
@@ -324,16 +368,10 @@ def _split_subcategories(raw):
     return merged
 
 
-def load_category_map():
-    """Read the taxonomy file that sits next to app.py. Returns lookup dicts
-    whose VALUES keep the file's exact spelling/case/spacing."""
-    base = os.path.dirname(os.path.abspath(__file__))
-    path = ''
-    for name in CATEGORY_MAP_CANDIDATES:
-        candidate = os.path.join(base, name)
-        if os.path.exists(candidate):
-            path = candidate
-            break
+def load_category_map(client=None):
+    """Read the client's taxonomy file. Returns lookup dicts whose VALUES keep
+    the file's exact spelling/case/spacing."""
+    path = category_map_path(client)
     combos, parents = {}, {}
     if not path:
         return combos, parents, ''
@@ -362,21 +400,9 @@ CATEGORY_COMBOS, CATEGORY_PARENTS, CATEGORY_MAP_FILE = load_category_map()
 # about what a product IS - it was typed by someone holding the box. Used only
 # as a FALLBACK, because a real listing title ('Front Load', '1.5 Ton') is more
 # specific than a prefix that only says "washing machine".
-SKU_PREFIX_CATEGORY = {
-    'WM': ('Washing Machines', ''),
-    'WH': ('Water Heaters', 'Geysers'),
-    'SM': ('Home Appliances', 'sewing machine'),
-    'HWD': ('Home Appliances', 'Water Dispensers'),
-    'REF': ('Home Appliances', 'Refrigerators'),
-    'FRIDGE': ('Home Appliances', 'Refrigerators'),
-    'MWO': ('Kitchen Appliances', 'Microwave Ovens'),
-    'IC': ('Kitchen Appliances', 'Induction Cooktops'),
-    'ICT': ('Kitchen Appliances', 'Induction Cooktops'),
-    'DI': ('Small Appliances', 'Electric Iron'),
-    'DF': ('Cooling & Freezing', 'Deep Freezers'),
-    'AC': ('Air Conditioner', ''),
-    'TV': ('LED', ''),
-}
+# PRODUCT_PLAN item 2: the table itself lives in clients/<slug>/client.toml
+# ([sku.input_codes]); this is a per-client view of it, rebound by configure().
+SKU_PREFIX_CATEGORY = dict(CLIENT.sku.input_codes)
 
 
 def sku_prefix_category(raw_sku):
@@ -647,21 +673,18 @@ def family_for(parent, sub):
 
 # One prefix per parent category (operator decision 2026-08-11: prefixes
 # encode the category, settled while the catalogue is small because changing
-# them later renames live products). AP- stays the fallback for anything the
-# taxonomy does not know. Keep validate_csv.py's prefix-stripping regex and
-# sku_enricher.CATEGORY_CODES in sync with this map.
-SKU_PREFIX_BY_PARENT = {
-    'Washing Machines': 'WM',          # live products carry these two -
-    'Water Heaters': 'WH',             # never change them
-    'LED': 'TV',
-    'Air Conditioner': 'AC',
-    'Cooling & Freezing': 'CF',
-    'Kitchen Appliances': 'KA',
-    'Home Appliances': 'HA',
-    'Small Appliances': 'SA',
-    'Electronics & Computing': 'EC',
-}
-SKU_PREFIXES = tuple(SKU_PREFIX_BY_PARENT.values()) + ('AP',)
+# them later renames live products). The fallback prefix covers anything the
+# taxonomy does not know.
+# PRODUCT_PLAN item 2: this is no longer a literal table. Every prefix comes
+# from the client's [sku] block, which is the ONE source validate_csv.py's
+# stripping regex, gui_helpers.SKU_CODES and sku_enricher.CATEGORY_CODES all
+# read - they used to be four hand-synced copies. configure() rebinds all of
+# these, so a client swap re-codes SKUs without a restart.
+SKU_PREFIX_BY_PARENT = dict(CLIENT.sku.prefix_by_parent)
+SKU_PREFIXES = CLIENT.sku.prefixes
+# codes already on live products: prefixed_sku returns them untouched
+SKU_NEVER_RENAME = tuple(f'{code}-' for code in CLIENT.sku.never_rename)
+SKU_FALLBACK_PREFIX = CLIENT.sku.fallback_prefix
 
 
 def prefixed_sku(raw_sku, category):
@@ -678,7 +701,7 @@ def prefixed_sku(raw_sku, category):
     # path segment, so whitelist what is safe in both and hyphenate the rest.
     sku = re.sub(r'[^A-Za-z0-9._-]+', '-', sku)
     sku = re.sub(r'-{2,}', '-', sku).strip('-')
-    if sku.startswith(('WM-', 'WH-')):
+    if SKU_NEVER_RENAME and sku.startswith(SKU_NEVER_RENAME):
         return sku                     # live products carry these - never rename
     code = SKU_PREFIX_BY_PARENT.get(category)
     for p in SKU_PREFIXES:
@@ -690,7 +713,7 @@ def prefixed_sku(raw_sku, category):
             # category is re-coded, not trusted
             sku = sku[len(p) + 1:]
             break
-    code = code or 'AP'
+    code = code or SKU_FALLBACK_PREFIX
     return f'{code}-{sku}' if sku else f'{code}-UNKNOWN'
 
 
@@ -797,7 +820,7 @@ def configuration_text(title, category):
     return ''                                   # KI-14: was 'Appliance Utility Core'
 
 
-def load_subcategory_attributes():
+def load_subcategory_attributes(client=None):
     """Read the 'Sub-Category Attributes' sheet of the taxonomy file, if it has
     one. Returns {normalised sub-category: {axis: [allowed values]}}.
 
@@ -808,12 +831,11 @@ def load_subcategory_attributes():
     """
     global SUBCATEGORY_ATTRIBUTES_WARNING
     SUBCATEGORY_ATTRIBUTES_WARNING = ''
-    base = os.path.dirname(os.path.abspath(__file__))
     out = {}
     problems = []
-    for name in CATEGORY_MAP_CANDIDATES:
-        path = os.path.join(base, name)
-        if not os.path.exists(path) or path.lower().endswith('.csv'):
+    for path in ([category_map_path(client)] if category_map_path(client) else []):
+        name = os.path.basename(path)
+        if path.lower().endswith('.csv'):
             continue
         try:
             table = pd.read_excel(path, sheet_name='Sub-Category Attributes',
@@ -1001,18 +1023,17 @@ def price_band_tag(sale_price):
     return ''
 
 
-CATEGORY_SEO_FILE = 'category_seo.xlsx'
+CATEGORY_SEO_FILE = CLIENT.category_seo.name
 
 
-def load_category_seo():
+def load_category_seo(client=None):
     """Curated per-category tags and SEO keywords from category_seo.xlsx.
 
     Hand-written, because tags exist to group products the way a customer
     searches and nobody searches a model code. Missing file is not an error -
     the derived tags below still work, they are just not topped up.
     Regenerate with tools\\build_category_seo.py."""
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        CATEGORY_SEO_FILE)
+    path = str((client or CLIENT).category_seo)
     table = {}
     if not os.path.exists(path):
         return table
@@ -1034,6 +1055,42 @@ def load_category_seo():
 
 
 CATEGORY_SEO = load_category_seo()
+
+
+def configure(slug):
+    """Switch this module to another client and return its ClientConfig.
+
+    Every constant that was derived from the client at import time is rebound
+    here, so a process that already imported app (wc_seo.py, the GUI, the
+    tests) can build for a different store without a subprocess. Raises
+    ClientConfigError for an unknown slug and leaves the current client in
+    place, because a half-swapped module would write one store's images under
+    another store's media base.
+    """
+    global CLIENT, IMAGE_DIR, MEDIA_BASE, SEO_SITE_NAME, CATEGORY_SEO_FILE
+    global CATEGORY_COMBOS, CATEGORY_PARENTS, CATEGORY_MAP_FILE
+    global SUBCATEGORY_ATTRIBUTES, CATEGORY_SEO
+    global SKU_PREFIX_BY_PARENT, SKU_PREFIXES, SKU_PREFIX_CATEGORY
+    global SKU_NEVER_RENAME, SKU_FALLBACK_PREFIX
+    incoming = client_config.load_client(slug)
+    combos, parents, map_file = load_category_map(incoming)
+    attributes = load_subcategory_attributes(incoming)
+    seo_table = load_category_seo(incoming)
+
+    CLIENT = incoming
+    IMAGE_DIR = incoming.image_dir
+    MEDIA_BASE = incoming.media_base()
+    SEO_SITE_NAME = incoming.seo_site_name
+    CATEGORY_SEO_FILE = incoming.category_seo.name
+    CATEGORY_COMBOS, CATEGORY_PARENTS, CATEGORY_MAP_FILE = combos, parents, map_file
+    SUBCATEGORY_ATTRIBUTES = attributes
+    CATEGORY_SEO = seo_table
+    SKU_PREFIX_BY_PARENT = dict(incoming.sku.prefix_by_parent)
+    SKU_PREFIXES = incoming.sku.prefixes
+    SKU_PREFIX_CATEGORY = dict(incoming.sku.input_codes)
+    SKU_NEVER_RENAME = tuple(f'{code}-' for code in incoming.sku.never_rename)
+    SKU_FALLBACK_PREFIX = incoming.sku.fallback_prefix
+    return CLIENT
 
 
 def category_seo_for(parent, sub):
@@ -1421,7 +1478,7 @@ def build_descriptions(sku, title, brand, category, scraped=()):
 # `slug` is the one column the CSV importer cannot use (it has no slug field);
 # it is sent on the API route only.
 
-SEO_SITE_NAME = 'Shree Jee Electronics'
+SEO_SITE_NAME = CLIENT.seo_site_name
 SEO_TITLE_MAX = 60           # what Google renders before truncating
 SEO_DESC_MAX = 155
 SEO_SLUG_MAX = 70
@@ -1474,7 +1531,8 @@ def trim_to(text, limit):
 def model_code(sku):
     """The manufacturer's model code inside a prefixed SKU, for the slug and
     the focus keyword. 'WM-SAMSUNG-WW80T504DAB' -> 'WW80T504DAB'."""
-    text = re.sub(r'^(?:' + '|'.join(SKU_PREFIXES) + r')-', '', compact(sku))
+    text = re.sub(r'^(?:' + '|'.join(re.escape(p) for p in SKU_PREFIXES) + r')-',
+                  '', compact(sku))
     tokens = [t for t in re.split(r'[-\s_/]+', text)
               if len(t) >= 4 and re.search(r'\d', t) and re.search(r'[A-Za-z]', t)]
     tokens.sort(key=len, reverse=True)
@@ -1677,7 +1735,7 @@ def download_urls_for_sku(sku, urls):
     every main product image on a fixed 1:1 canvas - 1200x1200 when the source
     allows, 1000x1000 otherwise - so every catalogue tile is the same shape
     AND the same scale."""
-    root = os.path.join(os.getcwd(), IMAGE_ROOT)
+    root = str(IMAGE_DIR)
     os.makedirs(root, exist_ok=True)
     rejected = []
 
@@ -2049,12 +2107,13 @@ def main():
         st.session_state['final_wordpress_df'] = None
 
     st.title('BranchIQ Master Enterprise Engine')
+    st.caption(f'Client: {CLIENT.name} ({CLIENT.slug}) - media base {MEDIA_BASE}')
     if CATEGORY_MAP_FILE:
         st.caption(f'Category map loaded: {CATEGORY_MAP_FILE} '
                    f'({len(CATEGORY_PARENTS)} parent categories, '
                    f'{len(CATEGORY_COMBOS)} lookup entries)')
     else:
-        st.warning('category_map.xlsx not found next to app.py - category names '
+        st.warning(f'{CLIENT.category_map} not found - category names '
                    'will use built-in spellings instead of your taxonomy.')
     st.download_button(
         label='Download input_template.csv',
@@ -2126,7 +2185,7 @@ def main():
                         folder = f'{datetime.now():%Y/%m}'
                     st.session_state['final_wordpress_df'] = process_inventory(
                         incoming,
-                        media_base=f'https://shreejeeelectronics.in/wp-content/uploads/{folder}',
+                        media_base=CLIENT.media_base(folder),
                         estimate_mrp=estimate_mrp,
                         seo=seo,
                         seo_plugin=seo_plugin,

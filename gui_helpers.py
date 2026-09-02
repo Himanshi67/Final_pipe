@@ -3,8 +3,12 @@
 Unit-tested in tests/test_gui_helpers.py. Keep streamlit (and app.py)
 imports OUT of this module so the tests never boot the app."""
 
+import hashlib
 import os
 import re
+import shutil
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 
@@ -171,16 +175,45 @@ def parse_specs_cell(cell):
     return pairs
 
 
-# mirror of app.SKU_PREFIXES (SKU_PREFIX_BY_PARENT's codes + the AP fallback).
-# Copied rather than imported: importing app here would drag Streamlit and the
-# taxonomy workbook into every gui_helpers test. tests/test_gui_helpers.py
-# pins the two lists together so the copy cannot drift.
+# The same codes app.SKU_PREFIXES carries, read from the SAME source of truth
+# (the client's [sku] table) instead of hand-copied - the two used to drift.
+# app itself is still NOT imported here: that would drag Streamlit and the
+# taxonomy workbook into every gui_helpers test, while client_config is
+# stdlib-only. tests/test_gui_helpers.py still pins the two lists together.
 SKU_CODES = ("WM", "WH", "TV", "AC", "CF", "KA", "HA", "SA", "EC", "AP")
-_SKU_CODE_RE = re.compile(r"^(?:" + "|".join(SKU_CODES) + r")-")
-# every code EXCEPT the 'AP' fallback: a raw carrying one of these states a
-# category, so re-coding it means the sheet contradicted the detected one.
-_SPECIFIC_CODE_RE = re.compile(
-    r"^(?:" + "|".join(c for c in SKU_CODES if c != "AP") + r")-")
+_SKU_CODE_RE = None
+_SPECIFIC_CODE_RE = None
+
+
+def configure_sku_codes(prefixes):
+    """Rebind SKU_CODES and its two regexes for another client's scheme.
+
+    gui.switch_client() calls this the moment the sidebar's Client selector
+    moves, so the review helpers stop stripping the previous store's codes.
+    `prefixes` is client_config.SkuScheme.prefixes: the taxonomy parents'
+    codes in TOML order, with the fallback code LAST (that ordering is what
+    lets the 'specific code' regex know which one to leave out)."""
+    global SKU_CODES, _SKU_CODE_RE, _SPECIFIC_CODE_RE
+    codes = tuple(c for c in
+                  (str(p or "").strip().upper() for p in (prefixes or ()))
+                  if c)
+    if not codes:
+        raise ValueError("configure_sku_codes: no SKU prefixes given")
+    SKU_CODES = codes
+    _SKU_CODE_RE = re.compile(
+        r"^(?:" + "|".join(re.escape(c) for c in codes) + r")-")
+    # every code EXCEPT the fallback (the last one): a raw carrying one of
+    # these states a category, so re-coding it means the sheet contradicted
+    # the detected one.
+    _SPECIFIC_CODE_RE = re.compile(
+        r"^(?:" + "|".join(re.escape(c) for c in codes[:-1] or codes) + r")-")
+
+
+try:                                   # the client's own scheme, at import
+    import client_config as _client_config
+    configure_sku_codes(_client_config.load_client().sku.prefixes)
+except Exception:                      # no clients/ dir yet, bad toml, …
+    configure_sku_codes(SKU_CODES)     # the historical Shree Jee tuple above
 
 
 def _strip_code(s):
@@ -283,6 +316,10 @@ _SERPER_RE = re.compile(r"^\s*\[(\d+) serper\.dev call\(s\) this run", re.M)
 # (sku_enricher.py `if RUN_STATS["serper_calls"] and done % 10 == 0`), so a
 # short run has NO bracketed line at all and a 25-row run's last one is stale.
 # The end-of-run summary uses a different grammar and has to be matched too.
+# `Budget of N serper credit(s) reached - stopping, progress saved.` - the
+# exact line sku_enricher.py logs when --budget trips.
+_BUDGET_RE = re.compile(
+    r"^Budget of \d+ serper credit\(s\) reached", re.M)
 _SERPER_FINAL_RE = re.compile(
     r"^serper\.dev calls this run: (\d+)", re.M)
 
@@ -298,6 +335,10 @@ def parse_enricher_log(text):
     serper = _SERPER_RE.findall(text or "")
     serper_final = _SERPER_FINAL_RE.findall(text or "")
     return {
+        # sku_enricher's --budget stop (docs/CLIENT_CONFIG.md item 4). The run
+        # exits 0 and the sheet is saved, so nothing else in the log says the
+        # batch is UNFINISHED - without this the panel reads like a clean end.
+        "stopped_by_budget": bool(_BUDGET_RE.search(text or "")),
         "done": int(done_hits[-1]) if done_hits else 0,
         "buckets": buckets,
         # the summary line is authoritative when present, but a run killed
@@ -444,11 +485,23 @@ def parse_publish_output(text):
     return rows, totals
 
 
-def run_stage(meta, files):
+def run_stage(meta, files, csv_sig=None):
     """Highest pipeline stage a run has reached, from its meta dict and
-    {'input','filled','csv'} existence flags."""
+    {'input','filled','csv'} existence flags.
+
+    P3-54: "published" is only true of the CSV that was actually published.
+    A rebuild in Step 3 rewrites wordpress_ready.csv but leaves
+    published/published_live from the earlier publish, so the Home table kept
+    claiming a 43-row rebuild was live when 12 rows were. `published_csv`
+    (csv_signature at publish time) pins it: when the caller passes the
+    CURRENT signature and it differs, the run falls back to what the
+    build/validate keys say. A meta from before that key existed has no
+    signature to compare and stays "published" - never demote real history on
+    missing data."""
     if meta.get("published"):
-        return "published"
+        pub_sig = meta.get("published_csv")
+        if not pub_sig or csv_sig is None or pub_sig == csv_sig:
+            return "published"
     if meta.get("validated"):
         return "validated"
     if files.get("csv"):
@@ -535,6 +588,79 @@ def found_status(status) -> bool:
     url_link and press 'Crawl all info' (--crawl-urls re-crawls every
     non-FOUND row that has a link and stamps it FOUND)."""
     return str(status or "").strip().upper().startswith("FOUND")
+
+
+_FP_COLS = ("title", "regular price", "sale price", "url_link", "image_url")
+
+
+def _fp_value(v) -> str:
+    """One fingerprint field as a comparable string.
+
+    The same cell reaches this from two readers: gui.load_filled_df (dtype=str
+    then pd.to_numeric on the price columns -> 22599.0 / NaN) and step 3's
+    plain pd.read_excel ('22,599' / NaN). Both must hash the same, so a blank
+    of any flavour is "" and anything numeric is normalised through float."""
+    try:
+        if v is None or (not isinstance(v, str) and pd.isna(v)):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    if not s:
+        return ""
+    try:
+        f = float(s.replace(",", "").replace("₹", "").strip())
+    except ValueError:
+        return s
+    return str(int(f)) if f == int(f) else repr(f)
+
+
+def row_fingerprint(row) -> str:
+    """sha1 of the fields a re-enrichment rewrites: title, both prices,
+    url_link, image_url. Stored beside every tick so a ✔ made on a
+    'FOUND - no price shown' row does not survive --retry-incomplete
+    silently re-scraping that row (P3-53). Missing columns count as ""."""
+    get = row.get if hasattr(row, "get") else (lambda k, d=None: row[k])
+    joined = "|".join(_fp_value(get(c, "")) for c in _FP_COLS)
+    return hashlib.sha1(joined.encode("utf-8")).hexdigest()
+
+
+def confirmed_from_state(state) -> set:
+    """The confirmed SKUs in a review_state.json dict.
+
+    Values are {"confirmed": bool, "fp": "<sha1>"} since P3-53; a bare bool
+    is the legacy format and still counts."""
+    out = set()
+    for sku, v in (state or {}).get("confirmed", {}).items():
+        ok = v.get("confirmed") if isinstance(v, dict) else v
+        if ok:
+            out.add(str(sku))
+    return out
+
+
+def stale_confirmations(state, df) -> set:
+    """Confirmed SKUs whose sheet row changed since they were ticked.
+
+    A stored fp of None (legacy tick, or one saved without a frame to hash)
+    is never stale - there is nothing to compare. A sku the sheet no longer
+    holds is not stale either: it cannot be built, and the FOUND gate in
+    select_build_rows already covers that case."""
+    if df is None or "sku" not in getattr(df, "columns", []):
+        return set()
+    current = {}
+    for _, row in df.iterrows():
+        sku = str(row["sku"])
+        if sku not in current:
+            current[sku] = row_fingerprint(row)
+    stale = set()
+    for sku, v in (state or {}).get("confirmed", {}).items():
+        if not isinstance(v, dict) or not v.get("confirmed"):
+            continue
+        fp = v.get("fp")
+        sku = str(sku)
+        if fp and sku in current and current[sku] != fp:
+            stale.add(sku)
+    return stale
 
 
 def merge_confirm_flags(existing, original, parts):
@@ -636,3 +762,414 @@ def card_queue_index(confirmed, i) -> int:
     if flags[i] and not all(flags):
         return flags.index(False)
     return i
+
+
+# ------------------------------------------------- review instrumentation --
+# Phase 1 item 5: review_state.json carries an "events" list beside
+# "confirmed", and the GUI renders runs\<name>\review_metrics.json from it.
+# Everything here is pure - the clock reading and the session state live in
+# gui.py, these functions only ever see plain values.
+
+REVIEW_ACTIONS = ("approve", "unapprove", "edit", "url_pasted", "drop_image",
+                  "skip")
+
+# a row that took more than a bare tick: someone had to change something
+_HANDS_ON_ACTIONS = frozenset({"edit", "url_pasted", "drop_image"})
+
+# buckets a row lands in when the enricher could not finish the job alone
+_NEEDS_HUMAN_BUCKETS = frozenset({"review", "failed"})
+
+
+def review_event(sku, action, mode, secs, at=None) -> dict:
+    """One review_state.json event: who was reviewed, what happened, how long.
+
+    `secs` is wall time attributed to THIS event (see clock_elapsed); it is
+    clamped at 0 so a clock that jumped backwards can never subtract from
+    the run total. `at` defaults to now, and is a parameter so tests (and a
+    replay) can pin it."""
+    try:
+        s = float(secs)
+    except (TypeError, ValueError):
+        s = 0.0
+    if s != s or s < 0:          # NaN or negative
+        s = 0.0
+    return {"sku": str(sku), "action": str(action), "mode": str(mode),
+            "at": str(at) if at else datetime.now().isoformat(
+                timespec="seconds"),
+            "secs": round(s, 1)}
+
+
+def clock_elapsed(state, key, now, cap=600.0) -> float:
+    """Seconds since `state[key]` was stamped, capped so idling never counts.
+
+    `state` is anything with .get (streamlit's session_state included). No
+    previous stamp, a junk stamp or a clock that went backwards all read as
+    0.0 - a missing measurement is worth less than a wrong one. The cap
+    (600 s by default) is what keeps a reviewer who went to lunch from
+    booking ten hours against one SKU."""
+    try:
+        prev = state.get(key)
+    except Exception:
+        prev = None
+    if prev is None:
+        return 0.0
+    try:
+        prev = float(prev)
+        delta = float(now) - prev
+    except (TypeError, ValueError):
+        return 0.0
+    if delta != delta or delta <= 0:
+        return 0.0
+    return min(delta, float(cap))
+
+
+def append_events(state, events) -> dict:
+    """Append events to state["events"], creating the list if absent.
+
+    Returns the same dict (mutated) so a caller can save_json it straight
+    away. A legacy state - confirmed only, no events key - simply grows one;
+    confirmed_from_state ignores it, so the file format stays compatible."""
+    if not isinstance(state, dict):
+        state = {}
+    evs = state.get("events")
+    if not isinstance(evs, list):
+        evs = []
+    for e in (events or []):
+        if isinstance(e, dict):
+            evs.append(dict(e))
+    state["events"] = evs
+    return state
+
+
+def review_metrics(state, df) -> dict:
+    """How much human time this run's review has cost, from the event log.
+
+    review_minutes  total attributed seconds / 60
+    rows_touched    distinct SKUs with at least one event
+    min_per_sku     review_minutes / rows_touched (0.0 with nothing touched)
+    needs_human_pct rows of the SHEET that needed more than a bare tick -
+                    a hands-on event (edit / url_pasted / drop_image) or a
+                    status in the review/failed bucket - over all rows
+    actions         {action: count}
+
+    A legacy state with no "events" returns zeros rather than raising, so
+    the caption can be rendered against any review_state.json."""
+    events = (state or {}).get("events")
+    if not isinstance(events, list):
+        events = []
+    secs = 0.0
+    touched, hands_on, actions = set(), set(), {}
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        sku = str(e.get("sku", ""))
+        action = str(e.get("action", ""))
+        try:
+            v = float(e.get("secs", 0) or 0)
+        except (TypeError, ValueError):
+            v = 0.0
+        if v == v and v > 0:
+            secs += v
+        if sku:
+            touched.add(sku)
+            if action in _HANDS_ON_ACTIONS:
+                hands_on.add(sku)
+        if action:
+            actions[action] = actions.get(action, 0) + 1
+
+    minutes = round(secs / 60.0, 1)
+    rows = 0
+    needs_human = 0
+    if df is not None and "sku" in getattr(df, "columns", []):
+        seen = set()
+        has_status = "status" in df.columns
+        for _, row in df.iterrows():
+            sku = str(row["sku"])
+            if sku in seen:
+                continue
+            seen.add(sku)
+            rows += 1
+            bucket = classify(row["status"]) if has_status else ""
+            if sku in hands_on or bucket in _NEEDS_HUMAN_BUCKETS:
+                needs_human += 1
+    return {"review_minutes": minutes,
+            "rows_touched": len(touched),
+            "min_per_sku": round(minutes / len(touched), 2) if touched
+            else 0.0,
+            "needs_human_pct": round(100.0 * needs_human / rows, 1)
+            if rows else 0.0,
+            "actions": actions}
+
+
+def review_caption(metrics) -> str:
+    """The one-line summary the GUI, the archive README and the enricher
+    report all print. Empty string when nothing has been reviewed yet."""
+    if not isinstance(metrics, dict) or not metrics:
+        return ""
+    return (f"Review so far: {metrics.get('review_minutes', 0)} min · "
+            f"{metrics.get('min_per_sku', 0)} min/SKU · "
+            f"needs-human {metrics.get('needs_human_pct', 0)}%")
+
+
+# ------------------------------------------------------ deliverable pack --
+# Item 6 of docs/CLIENT_CONFIG.md. One coverage counter and ONE README
+# renderer, shared by gui.archive_run and build_csv.py --pack, so the two
+# hand-over routes cannot drift apart.
+
+_DIGITS_RE = re.compile(r"\d+")
+
+
+def _norm_suffix(text) -> str:
+    """A status suffix with its numbers collapsed to N, so 'only 2 image(s)'
+    and 'only 3 image(s)' land in the SAME coverage bucket instead of
+    producing one table row per SKU."""
+    return _DIGITS_RE.sub("N", str(text or "").strip())
+
+
+def coverage_summary(df) -> dict:
+    """Count every row of a _filled sheet into one status bucket.
+
+    The two dict buckets keep the human-readable reason: `found_incomplete`
+    is keyed by the text after the first ' - ' on a FOUND row ('only N
+    image(s)', 'price from flipkart.com', 'VERIFY: ...'), `not_found` by the
+    reason after 'NOT FOUND - ' (a bare 'NOT FOUND' becomes 'unspecified').
+
+    Statuses are matched with startswith, never ==: both the bare and the
+    '(site)'-suffixed forms occur. Every row lands in exactly one bucket, so
+    the counts always sum to `rows` - `other` is the catch-all that keeps
+    that promise for a status shape nobody has seen yet.
+    """
+    out = {"rows": 0, "found_clean": 0, "found_incomplete": {},
+           "close_match": 0, "check_manually": 0, "not_found": {},
+           "error": 0, "skipped": 0, "needs_crawl": 0, "needs_link": 0,
+           "blank": 0, "other": 0}
+    if df is None:
+        return out
+    if "status" not in getattr(df, "columns", []):
+        out["rows"] = len(df)
+        out["blank"] = out["rows"]
+        return out
+
+    for raw in df["status"]:
+        out["rows"] += 1
+        s = "" if raw is None or raw != raw else str(raw).strip()
+        u = s.upper()
+        if not s:
+            out["blank"] += 1
+        elif u.startswith("NEEDS CRAWL"):
+            out["needs_crawl"] += 1
+        elif u.startswith("NEEDS LINK"):
+            out["needs_link"] += 1
+        elif u.startswith("FOUND"):
+            if " - " in s:
+                label = _norm_suffix(s.split(" - ", 1)[1])
+                out["found_incomplete"][label] = (
+                    out["found_incomplete"].get(label, 0) + 1)
+            else:
+                out["found_clean"] += 1
+        elif u.startswith("CLOSE MATCH"):
+            out["close_match"] += 1
+        elif u.startswith("CHECK MANUALLY"):
+            out["check_manually"] += 1
+        elif u.startswith("SKIPPED"):
+            out["skipped"] += 1
+        elif u.startswith("NOT FOUND"):
+            rest = s[len("NOT FOUND"):].strip()
+            if rest.startswith("-"):
+                rest = rest[1:].strip()
+            reason = _norm_suffix(rest) or "unspecified"
+            out["not_found"][reason] = out["not_found"].get(reason, 0) + 1
+        elif u.startswith("ERROR"):
+            out["error"] += 1
+        else:
+            out["other"] += 1
+    return out
+
+
+def coverage_total(coverage) -> int:
+    """Sum of every bucket - equals coverage['rows'] on a well-formed dict."""
+    total = 0
+    for key, value in (coverage or {}).items():
+        if key == "rows":
+            continue
+        total += sum(value.values()) if isinstance(value, dict) else int(value)
+    return total
+
+
+def assemble_pack(dest, files, image_dir, csv_path) -> dict:
+    """Copy one hand-over pack into `dest` - the single copy routine behind
+    BOTH gui.archive_run and build_csv.py --pack.
+
+    files      {destination filename: source Path}; a missing source is
+               skipped, never an error (a half-done run has no CSV yet).
+    image_dir  where the build left the .webp files (app.IMAGE_DIR).
+    csv_path   the built CSV; its Images column names exactly the files worth
+               copying. A CSV that cannot be read costs the images folder and
+               nothing else - a build killed mid-to_csv leaves a 0-byte or
+               ragged file and pandas raises ValueError (EmptyDataError /
+               ParserError), not OSError (P2-25).
+
+    Returns {files, images, missing, copied, csv_error}. images\\ is created
+    only when the CSV actually references a photo, so a pack with none has no
+    empty folder in it.
+    """
+    dest = Path(dest)
+    dest.mkdir(parents=True, exist_ok=True)
+    res = {"files": 0, "images": 0, "missing": 0, "copied": 0,
+           "csv_error": None}
+    for name, src in (files or {}).items():
+        if not src:
+            continue
+        src = Path(src)
+        if src.exists():
+            shutil.copy2(src, dest / name)
+            res["files"] += 1
+
+    if csv_path and Path(csv_path).exists():
+        try:
+            csv_df = pd.read_csv(csv_path, dtype=str).fillna("")
+        except (OSError, ValueError) as exc:
+            res["csv_error"] = exc.__class__.__name__
+            csv_df = None
+        if csv_df is not None:
+            names = list(dict.fromkeys(image_basenames_from_csv(csv_df)))
+            if names:
+                img_dest = dest / "images"
+                img_dest.mkdir(exist_ok=True)
+                for name in names:
+                    src = Path(image_dir) / name
+                    if src.exists():
+                        shutil.copy2(src, img_dest / name)
+                        res["images"] += 1
+                    else:
+                        res["missing"] += 1
+    res["copied"] = res["files"] + res["images"]
+    return res
+
+
+_FILE_BLURB = {
+    "input_filled.xlsx": "the enriched sheet, one row per SKU with its status",
+    "wordpress_ready.csv": "the WooCommerce import file",
+    "validation_issues.csv": "rows the QA pass flagged before publishing",
+    "input_filled_report.md": "the enricher's end-of-run report",
+    "images": "exactly the photos the CSV references",
+    "README.md": "this file",
+}
+
+
+def _blurb(fname) -> str:
+    """What a file in the pack is FOR. The names are not fixed - the GUI
+    archives wordpress_ready.csv while `build_csv.py -o out.csv --pack`
+    archives out.csv, and the client's list arrives under whatever they
+    called it - so the exact-name table falls back to the extension."""
+    known = _FILE_BLURB.get(str(fname))
+    if known:
+        return known
+    low = str(fname).lower()
+    if low.endswith((".xlsx", ".xls")):
+        return "the list this batch was built from"
+    if low.endswith(".csv"):
+        return "the WooCommerce import file"
+    return ""
+
+_COVERAGE_ROWS = (
+    ("found_clean", "FOUND (clean)"),
+    ("found_incomplete", "FOUND (incomplete)"),
+    ("close_match", "CLOSE MATCH - CHECK"),
+    ("check_manually", "CHECK MANUALLY"),
+    ("not_found", "NOT FOUND"),
+    ("error", "ERROR"),
+    ("skipped", "SKIPPED - duplicate unit"),
+    ("needs_crawl", "NEEDS CRAWL (two-pass)"),
+    ("needs_link", "NEEDS LINK (two-pass)"),
+    ("other", "unrecognised status"),
+    ("blank", "(no status)"),
+)
+
+
+def _coverage_table(coverage) -> str:
+    cov = coverage or {}
+    lines = ["| bucket | rows |", "| --- | ---: |",
+             f"| **Rows** | **{cov.get('rows', 0)}** |"]
+    for key, label in _COVERAGE_ROWS:
+        value = cov.get(key, 0)
+        if isinstance(value, dict):
+            lines.append(f"| {label} | {sum(value.values())} |")
+            for reason, n in sorted(value.items(),
+                                    key=lambda kv: (-kv[1], kv[0])):
+                lines.append(f"| &nbsp;&nbsp;↳ {reason} | {n} |")
+        else:
+            lines.append(f"| {label} | {int(value)} |")
+    return "\n".join(lines)
+
+
+def render_batch_readme(name, meta, coverage, review_metrics=None,
+                        images=None, validation=None, source_name=None,
+                        notes=()) -> str:
+    """The README that ships with a hand-over pack - the SAME text for
+    gui.archive_run and build_csv.py --pack.
+
+    Pure: every fact arrives as an argument. `meta` is the run_meta.json dict
+    (or a synthesised one); `meta['archived_from']` names the run folder when
+    there is one, `meta['published_stale']` is the P3-54 flag that the
+    publish covered an EARLIER build than the CSV in this folder, and
+    `meta['files']` lists what the packer actually copied.
+    """
+    meta = meta or {}
+    cov = coverage or {}
+    stamp = f"{datetime.now():%Y-%m-%d %H:%M}"
+    origin = meta.get("archived_from")
+    lead = (f"Archived {stamp} from {origin}.\n\n" if origin
+            else f"Packed {stamp} by build_csv.py --pack.\n\n")
+
+    # P3-54: "Built scope: all (43 SKUs)" next to "Published: <date> (LIVE)"
+    # read as 43 live products when the publish covered an earlier build.
+    pub_note = " (LIVE)" if meta.get("published_live") else ""
+    if meta.get("published_stale"):
+        pub_note += (" — for a PREVIOUS build; the current CSV was "
+                     "rebuilt after publishing")
+
+    issues = meta.get("issue_count", "?")
+    if isinstance(validation, dict) and validation.get("issue_count") is not None:
+        issues = validation["issue_count"]
+
+    img = images or {}
+    img_line = (f"- Images: {img.get('count', 0)} file(s) copied"
+                + (f", {img['missing']} referenced but MISSING from the "
+                   f"image folder" if img.get("missing") else "")
+                + "\n")
+
+    body = [
+        f"# Batch {name}\n\n",
+        lead,
+        f"- Source list: {source_name or meta.get('original_name', '?')}\n",
+        f"- Rows enriched: {meta.get('total_rows', '?')}\n",
+        f"- Built scope: {meta.get('built_scope', '?')} "
+        f"({len(meta.get('built_skus') or [])} SKUs)\n",
+        f"- Validation issues: {issues}\n",
+        f"- Published: {meta.get('published', 'never')}{pub_note}\n",
+        img_line,
+    ]
+    for note in notes or ():
+        if note:
+            body.append(note if str(note).startswith("\n") else f"- {note}\n")
+
+    body.append("\n## Coverage\n\n")
+    body.append(_coverage_table(cov) + "\n")
+    if coverage_total(cov) != cov.get("rows", 0):
+        body.append("\n_(the bucket counts do not add up to the row count - "
+                    "the sheet changed under the packer)_\n")
+
+    body.append("\n## Review\n\n")
+    body.append((review_caption(review_metrics)
+                 or "no review metrics recorded") + "\n")
+
+    body.append("\n## Files\n\n")
+    listed = list(meta.get("files") or [])
+    if listed:
+        for fname in listed:
+            blurb = _blurb(fname)
+            body.append(f"- `{fname}`" + (f" - {blurb}\n" if blurb else "\n"))
+    else:
+        body.append("- (nothing was copied)\n")
+    return "".join(body)

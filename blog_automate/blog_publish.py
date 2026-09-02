@@ -4,6 +4,11 @@ Posts live at /wp-json/wp/v2/posts, which is WordPress core rather than
 WooCommerce - so this authenticates with the WordPress Application Password
 (WP_APP_USER / WP_APP_PASSWORD), not the WooCommerce consumer key.
 
+The client's WordPress credentials (clients/<slug>/.env) are applied lazily by
+ensure_client_env() on the first credential read - never at import - so that
+importing this module has no effect on the process environment. See that
+function for the pytest / APPLY_CLIENT_ENV escape hatches.
+
 Session handling, the borrowed-cookie logic and the CDN-challenge detection are
 imported from the parent `wc_publish.py` rather than reimplemented. That code
 cost real debugging (KI-15, and the WordPress-session cookie that reads exactly
@@ -29,14 +34,50 @@ except ImportError as exc:                          # pragma: no cover
 
 TIMEOUT = 60
 
+# The client's own WP credentials (clients/<slug>/.env) - PRODUCT_PLAN Phase 1
+# item 3, applied LAZILY. See ensure_client_env().
+CLIENT = None                  # resolved on first credential use
+APPLY_CLIENT_ENV = True        # set False to keep this module out of os.environ
+_ENV_APPLIED = False
+
+
+def ensure_client_env():
+    """Apply clients/<slug>/.env to os.environ once, on first credential use.
+
+    Deliberately NOT done at import time: importing this module must not
+    rewrite the process environment as a side effect, which under pytest would
+    change WC_URL / WP_APP_* for every later test in the session. The apply is
+    therefore skipped entirely when $PYTEST_CURRENT_TEST is set or when the
+    module flag APPLY_CLIENT_ENV is False; CLIENT is still resolved so callers
+    can see which client was picked.
+
+    A blog generator must never inherit whichever store the last shell export
+    named. Missing config or a missing .env is not an error: the environment as
+    it stands is then simply left alone.
+    """
+    global CLIENT, _ENV_APPLIED
+    if _ENV_APPLIED:
+        return CLIENT
+    _ENV_APPLIED = True
+    try:
+        import client_config as _client_config
+        CLIENT = _client_config.load_client()
+        if APPLY_CLIENT_ENV and not os.environ.get("PYTEST_CURRENT_TEST"):
+            _client_config.apply_env(CLIENT)
+    except Exception:                               # pragma: no cover
+        CLIENT = None
+    return CLIENT
+
 
 def have_creds():
+    ensure_client_env()
     return bool(os.environ.get("WP_APP_USER", "").strip()
                 and os.environ.get("WP_APP_PASSWORD", "").strip()
                 and os.environ.get("WC_URL", "").strip())
 
 
 def wp_auth():
+    ensure_client_env()
     user = os.environ.get("WP_APP_USER", "").strip()
     password = os.environ.get("WP_APP_PASSWORD", "").strip()
     if not (user and password):
@@ -49,6 +90,7 @@ def wp_auth():
 
 
 def base_url():
+    ensure_client_env()
     url = os.environ.get("WC_URL", "").strip()
     if not url:
         raise RuntimeError("WC_URL is not set.")
@@ -211,7 +253,9 @@ def publish(payload, slug="", category="", commit=False, status="draft",
 
 def configure(cookie_file="", cookie="", user_agent=""):
     """Borrow the browser cookie for the CDN challenge, exactly as
-    wc_publish.py does."""
+    wc_publish.py does. Also the CLI's cue to apply the client's .env, so a
+    real run has the credentials before the first call rather than after."""
+    ensure_client_env()
     using, dropped = W.configure_session(
         W.read_cookie_arg(cookie, cookie_file), user_agent or "")
     if using:

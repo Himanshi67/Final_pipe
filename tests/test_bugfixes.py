@@ -470,8 +470,17 @@ def test_01_e2e_sparse_gallery():
     tmp = Path(tempfile.mkdtemp())
     cwd = os.getcwd()
     real_get = app.requests.get
+    # The image folder is per-client and ABSOLUTE now (clients/<slug>/ config,
+    # Phase 1 item 1), so chdir alone no longer redirects it. Point the three
+    # consumers at the scratch dir instead - a test must never write into the
+    # real product_images_for_upload\.
+    import dataclasses
+    saved_image_dir = (app.IMAGE_DIR, V.IMAGE_DIR, W.CLIENT)
     try:
         os.chdir(tmp)
+        app.IMAGE_DIR = tmp / app.IMAGE_ROOT
+        V.IMAGE_DIR = str(tmp / app.IMAGE_ROOT)
+        W.CLIENT = dataclasses.replace(W.CLIENT, image_dir=tmp / app.IMAGE_ROOT)
         app.requests.get = fake_get
         base = "https://cdn.example.com/img"
         df = pd.DataFrame([{
@@ -546,6 +555,7 @@ def test_01_e2e_sparse_gallery():
                     os.environ[k] = v
     finally:
         app.requests.get = real_get
+        app.IMAGE_DIR, V.IMAGE_DIR, W.CLIENT = saved_image_dir
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -669,6 +679,59 @@ def test_19_category_prefixes():
               bool(V.SKU_PREFIX_RE.match(f"{p}-X")), True)
         check(f"enricher recognises {p} as a category code",
               p in E.CATEGORY_CODES, True)
+
+    # PRODUCT_PLAN item 2: the four hand-synced copies became views of the
+    # client's [sku] block. The expected values below are the LITERAL tables
+    # app.py carried before that refactor - shreejee's output must not move by
+    # a single byte.
+    check("SKU_PREFIX_BY_PARENT still matches the pre-config literal table",
+          app.SKU_PREFIX_BY_PARENT,
+          {"Washing Machines": "WM", "Water Heaters": "WH", "LED": "TV",
+           "Air Conditioner": "AC", "Cooling & Freezing": "CF",
+           "Kitchen Appliances": "KA", "Home Appliances": "HA",
+           "Small Appliances": "SA", "Electronics & Computing": "EC"})
+    check("SKU_PREFIXES still matches the pre-config literal tuple",
+          tuple(app.SKU_PREFIXES),
+          ("WM", "WH", "TV", "AC", "CF", "KA", "HA", "SA", "EC", "AP"))
+    check("SKU_PREFIX_CATEGORY still matches the pre-config literal table",
+          app.SKU_PREFIX_CATEGORY,
+          {"WM": ("Washing Machines", ""),
+           "WH": ("Water Heaters", "Geysers"),
+           "SM": ("Home Appliances", "sewing machine"),
+           "HWD": ("Home Appliances", "Water Dispensers"),
+           "REF": ("Home Appliances", "Refrigerators"),
+           "FRIDGE": ("Home Appliances", "Refrigerators"),
+           "MWO": ("Kitchen Appliances", "Microwave Ovens"),
+           "IC": ("Kitchen Appliances", "Induction Cooktops"),
+           "ICT": ("Kitchen Appliances", "Induction Cooktops"),
+           "DI": ("Small Appliances", "Electric Iron"),
+           "DF": ("Cooling & Freezing", "Deep Freezers"),
+           "AC": ("Air Conditioner", ""), "TV": ("LED", "")})
+    check("the never-rename guard still means WM-/WH-",
+          tuple(app.SKU_NEVER_RENAME), ("WM-", "WH-"))
+    check("the fallback prefix is still AP", app.SKU_FALLBACK_PREFIX, "AP")
+    check("validate_csv's regex is still the pre-config literal",
+          V.SKU_PREFIX_RE.pattern, "^(WM|WH|TV|AC|CF|KA|HA|SA|EC|AP)-")
+
+    # and every one of them is a VIEW of the client config, not a copy
+    scheme = app.CLIENT.sku
+    check("SKU_PREFIX_BY_PARENT is the client's [sku.prefix_by_parent]",
+          app.SKU_PREFIX_BY_PARENT, dict(scheme.prefix_by_parent))
+    check("SKU_PREFIXES is the client's derived prefix tuple",
+          tuple(app.SKU_PREFIXES), tuple(scheme.prefixes))
+    check("SKU_PREFIX_CATEGORY is the client's [sku.input_codes]",
+          app.SKU_PREFIX_CATEGORY, dict(scheme.input_codes))
+    check("SKU_NEVER_RENAME is the client's never_rename",
+          tuple(app.SKU_NEVER_RENAME),
+          tuple(f"{c}-" for c in scheme.never_rename))
+    check("SKU_FALLBACK_PREFIX is the client's fallback_prefix",
+          app.SKU_FALLBACK_PREFIX, scheme.fallback_prefix)
+    check("validate_csv's regex covers EXACTLY the client's prefixes",
+          V.SKU_PREFIX_RE.pattern,
+          "^(" + "|".join(scheme.prefixes) + ")-")
+    check("validate_csv strips nothing the client does not define",
+          [p for p in ("ZZ", "QQ", "XY") if V.SKU_PREFIX_RE.match(f"{p}-X")],
+          [])
 
 
 def test_20_inflated_mrp_flagged_not_deleted():

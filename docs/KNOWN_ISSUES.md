@@ -284,8 +284,10 @@ deleted; the store was verified back to its prior state.
 
 ## KI-7 · partially closed by Phase 3
 Silent exception swallowing in `fetch`, the short-body blind spot, and the 20 KB
-`looks_blocked` scan limit are all fixed. Still open: no caching of search results or
-fetched HTML, no Serper credit tracking, `is_product_url` defaults True for unknown
+`looks_blocked` scan limit are all fixed. Serper credit tracking is closed too
+(2026-09-02): `sku_enricher.Ledger` writes `clients\<slug>\credits.json` and
+`--budget N` stops a run at N credits on the checkpoint-safe path. Still open: no
+caching of search results or fetched HTML, `is_product_url` defaults True for unknown
 domains (mitigated — `domain_quality` now ranks those last), and the O(n²) workbook
 rewrite.
 
@@ -297,7 +299,10 @@ rewrite.
   fetch budget (FETCH_BUDGET=6).
 - Whole workbook rewritten after every SKU (:1177) — O(n²) I/O on big sheets.
 - No caching of search results / fetched HTML; `--force` re-pays every credit and fetch.
-- No Serper credit tracking (~8 credits/SKU; free tier 2,500/month).
+- ~~No Serper credit tracking~~ — CLOSED 2026-09-02. `Ledger` tallies every run into
+  `clients\<slug>\credits.json` (month total + per-run rows + `history`), the report
+  header prints `Credits:` and `Stopped by:`, and `--budget N` (default from the
+  client's `[serper] default_run_budget`) hard-stops a run before it overspends.
 - `looks_blocked` scans only the first 20,000 chars (:369).
 - `ensure_writable` checks the Excel lock once at t=0 only (:1116).
 - validate_csv.py:176 — substring removal of the title from joined text can corrupt

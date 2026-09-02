@@ -11,8 +11,9 @@ Run this after a chunk of work, not after every edit. It is the single source of
 ## The gate
 
 ```bash
-.venv\Scripts\python.exe -m py_compile app.py build_csv.py gui.py gui_helpers.py \
-  sku_enricher.py validate_csv.py wc_checkpoint.py wc_publish.py wc_seo.py \
+.venv\Scripts\python.exe -m py_compile app.py build_csv.py client_config.py gui.py \
+  gui_helpers.py sku_enricher.py validate_csv.py wc_checkpoint.py wc_publish.py \
+  wc_seo.py \
   && .venv\Scripts\python.exe -m pytest tests -q --no-header -p no:cacheprovider 2>&1 | tail -15
 ```
 
@@ -26,7 +27,7 @@ Report ONLY: the compile result, the final pytest counts line, and each failure 
   `.venv\Scripts\python.exe -m pytest tests\<file> -q --no-header 2>&1 | tail -20`
 - **Count shrank with no failure line** → a collection error swallowed tests. Check for
   a module-level `sys.exit`/`raise` at import time; that once made the whole suite
-  un-runnable (see `docs/NEXT_STEPS.md` P0).
+  un-runnable (see `docs/NEXT_STEPS.md` P0 — local only, not in the clone).
 - **Everything green** → say so with the counts as evidence. Do not claim green
   without the summary line in front of you.
 

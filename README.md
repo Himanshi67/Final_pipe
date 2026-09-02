@@ -14,12 +14,14 @@ separate, opt-in tool that can use one for prose only; see the bottom.)
   <name>_filled.xlsx  ->  [YOU: review the flagged rows]
      |  app.py  (browser)  or  build_csv.py  (headless)      (transform)
      v
-  wordpress_ready_clean_repaired.csv  +  product_images_for_upload\*.webp
+  wordpress_ready_clean_repaired.csv  +  product_images_for_upload\<client>\*.webp
      |  validate_csv.py     QA gate (runs automatically after build_csv.py)
      v
   WooCommerce  <-  Products > Import (by hand)  or  wc_publish.py (REST API)
 ```
 
+Per-client configuration (`clients\<slug>\`, the publish guards, the credit ledger):
+**docs/CLIENT_CONFIG.md**.
 Full documentation: **docs/PIPELINE_GUIDE.md** (every flag, every column, where data
 goes). Visual overview: **docs/data_flow.svg**. Pre-diagnosed bugs with line anchors:
 **docs/KNOWN_ISSUES.md**. Release checklist and the test baseline:
@@ -39,10 +41,31 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+Needs **Python 3.11 or newer**. That install also brings in `pytest`, which runs the
+quality gate — `.venv\Scripts\python.exe -m pytest tests -q` must be green before any
+change ships.
+
 Python is always `.venv\Scripts\python.exe` — never bare `python`, never "activate".
 
-Credentials go in environment variables, **never in the repo**. Open a new
-terminal after `setx`, or the value will not be visible.
+**Clients.** Every store-specific value lives in `clients\<slug>\`:
+`client.toml` (store URL, media base, SEO name, the `[sku]` prefix scheme,
+`[serper]` budgets), `category_map.xlsx`, `category_seo.xlsx`,
+`SubCategory_Attributes_Master.xlsx`, plus a gitignored `.env`, `backups\` and
+`credits.json`. `clients\shreejee` is the default client — a NEW client is
+`clients\shreejee` copied to `clients\<newslug>`, `client.toml` edited (its
+`slug` must equal the folder name), that client's `category_map.xlsx` dropped
+in, and a `.env` created with its credentials. Every script then takes
+`--client <slug>`; without it the slug comes from `PIPELINE_CLIENT`, then
+`shreejee`. Contract: **docs/CLIENT_CONFIG.md**.
+
+Credentials go in `clients\<slug>\.env` (gitignored) or in environment
+variables, **never in the repo**. The client's `.env` WINS over the shell env,
+so a stale `setx WC_URL` cannot redirect a publish. Open a new terminal after
+`setx`, or the value will not be visible.
+
+`.env` grammar: one `KEY=VALUE` per line; `#` comments and blank lines are
+ignored; a leading `export ` is tolerated; surrounding single or double quotes
+are stripped. Any other line is an error naming its line number.
 
 | Variable | Where to get it | Needed for |
 |---|---|---|
@@ -57,13 +80,17 @@ An Application Password is **24 characters in six space-separated groups** —
 not your account password — and must be quoted in `setx`.
 
 Serper costs about 8 credits per SKU; the free tier of 2,500/month is roughly
-300 SKUs. The batch report counts what a run spent.
+300 SKUs. `--budget N` stops a run once N credits are spent (progress saved,
+report written, exit 0, exactly like Ctrl+C); `0` means unlimited and the
+default comes from the client's `[serper] default_run_budget`. Spend is tallied
+in `clients\<slug>\credits.json`, and the batch report's header prints
+`Client:`, `Credits:` and `Stopped by:`.
 
 ## Every batch
 
 ```
-:: 1. put your SKU list in this folder, then fill it in:
-.venv\Scripts\python.exe sku_enricher.py "WM MODEL LIST FOR WEBSITE.xlsx" --min-price 8000 --delay 5 8
+:: 1. put your SKU list in this folder, then fill it in (--client defaults to shreejee):
+.venv\Scripts\python.exe sku_enricher.py "WM MODEL LIST FOR WEBSITE.xlsx" --client shreejee --min-price 8000 --delay 5 8 --budget 400
 
 :: 2. QA the enricher output BEFORE reviewing it by hand - this tells you which
 ::    rows to look at, including two SKUs that resolved to the same listing:
@@ -80,10 +107,11 @@ Serper costs about 8 credits per SKU; the free tier of 2,500/month is roughly
 ::    it just wrote, so this is only needed after the browser route or a hand edit:
 .venv\Scripts\python.exe validate_csv.py wordpress_ready_clean_repaired.csv
 
-:: 5a. publish by hand: upload product_images_for_upload\*.webp to WordPress
+:: 5a. publish by hand: upload product_images_for_upload\<client>\*.webp to WordPress
 ::     Media in the SAME month you set above, then WooCommerce > Products > Import
 :: 5b. or publish over the API (no media upload, no CSV import):
 .venv\Scripts\python.exe wc_publish.py --check
+.venv\Scripts\python.exe wc_publish.py --preflight
 .venv\Scripts\python.exe wc_publish.py wordpress_ready_clean_repaired.csv
 .venv\Scripts\python.exe wc_publish.py wordpress_ready_clean_repaired.csv --commit
 ```
@@ -92,6 +120,21 @@ Serper costs about 8 credits per SKU; the free tier of 2,500/month is roughly
 unless `--status publish`, and upserts on SKU so re-running a corrected batch
 updates instead of duplicating. Passing `--status` explicitly also applies it to
 products that already exist — that is how a reviewed draft goes live.
+
+Before it writes anything it checks the blast radius, and **exit code 4 means
+refused — nothing was written**:
+
+- `WC_URL` must be the same store as the client's `[store] url` (a plain dry run
+  only warns; `--commit`, `--check` and `--preflight` refuse).
+- `--commit` writes at most `--max-commit` products (default 25). Dry runs are
+  never capped.
+- `--commit --status publish` and `--commit --delete-sku` need
+  `review_signoff.csv` (`sku,reviewer,signed_at`) next to the CSV, listing every
+  SKU going live. The GUI writes it when you arm a go-live commit.
+- Every `--commit` takes a `before-publish-<slug>` checkpoint first, unless you
+  pass `--no-checkpoint` — which means no way back.
+- `--preflight` runs the store-URL, API, media-credential and sign-off checks and
+  exits without writing (0 pass, 3 edge challenge, 4 refused).
 
 ## Image quality
 
@@ -183,6 +226,15 @@ resize params, and a broken URL costs the image entirely.
 .venv\Scripts\python.exe wc_seo.py --commit           # fills only what is EMPTY
 .venv\Scripts\python.exe wc_seo.py --overwrite --commit
 
+:: stop a run once N serper credits are spent (progress saved, report written)
+.venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --budget 200
+
+:: build the hand-over pack (CSV, issues, images, input list, README) and zip it
+.venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" --pack
+
+:: check the store, API, media creds and sign-off file without writing anything
+.venv\Scripts\python.exe wc_publish.py --preflight
+
 :: publish or clean up a single product
 .venv\Scripts\python.exe wc_publish.py out.csv --sku AP-XYZ --commit
 .venv\Scripts\python.exe wc_publish.py out.csv --sku AP-XYZ --status publish --commit
@@ -219,18 +271,21 @@ blocked the run. `--no-report` turns it off.
   checkbox (browser) includes the rest.
 - Set the upload month to the month you will **actually** upload the images in —
   it is baked into the image URLs.
-- Run every script from `Final_pipe\`. `product_images_for_upload\` is resolved
-  from the current directory, so running from elsewhere silently looks in the
-  wrong place.
+- Every folder a script owns is anchored on the script's own location, so it no
+  longer matters which directory you run from: images go to
+  `product_images_for_upload\<client>\`, checkpoints to `checkpoints\<client>\`,
+  and the taxonomy comes from `clients\<client>\`.
 - When a batch is published, move its outputs to `batches\<name>\` and leave the
   `.xlsx` inputs in the root so it stays resumable. Archived batches are not in
   git — that folder is the only copy.
-- `category_map.xlsx` and `SubCategory_Attributes_Master.xlsx` **are** in git,
-  unlike every other `.xlsx`. They are configuration: without the taxonomy,
-  app.py cannot map a single category. `SubCategory_Attributes_Master.xlsx` is a
-  REFERENCE COPY that no script reads — the attributes actually enforced live in
-  the `Sub-Category Attributes` sheet of `category_map.xlsx`
-  (`app.load_subcategory_attributes`), so edit them there.
+- `clients\<slug>\category_map.xlsx`, `category_seo.xlsx` and
+  `SubCategory_Attributes_Master.xlsx` **are** in git, unlike every other
+  `.xlsx`. They are configuration: without the taxonomy, app.py cannot map a
+  single category. `SubCategory_Attributes_Master.xlsx` is a REFERENCE COPY that
+  no script reads — the attributes actually enforced live in the
+  `Sub-Category Attributes` sheet of `category_map.xlsx`
+  (`app.load_subcategory_attributes`), so edit them there. The client's `.env`,
+  `backups\` and `credits.json` are NOT in git.
 
 ## Known blocker — the store is behind a browser challenge
 

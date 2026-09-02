@@ -26,9 +26,15 @@ import openpyxl                                    # noqa: E402
 import pandas as pd                                # noqa: E402
 
 import app                                         # noqa: E402
+import client_config                               # noqa: E402
 import sku_enricher as E                           # noqa: E402
 import validate_csv as V                           # noqa: E402
 import wc_publish as W                             # noqa: E402
+
+# Everything store-specific comes from the client config, never a literal:
+# the taxonomy (CLIENT.category_map), the image folder (CLIENT.image_dir) and
+# the store URL (CLIENT.store_url) all moved out of the repo root in Phase 1.
+CLIENT = client_config.load_client()
 
 WORK = Path(tempfile.mkdtemp(prefix="qa_pipe_"))
 PASS, ISSUES = 0, []
@@ -193,8 +199,7 @@ def t_stage2_contract(filled):
     src = app.filter_active_inventory_rows(pd.read_excel(filled))
     src = src[src["status"].map(app.compact).str.upper().str.startswith("FOUND")]
     direct = app.process_inventory(src.copy(),
-                                   media_base="https://shreejeeelectronics.in"
-                                              "/wp-content/uploads/2026/08",
+                                   media_base=CLIENT.media_base("2026/08"),
                                    seo=True)
     check("app.py and build_csv.py produce the same columns",
           list(direct.columns) == list(df.columns),

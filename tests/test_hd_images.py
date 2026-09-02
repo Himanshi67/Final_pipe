@@ -101,8 +101,12 @@ def test_download_rules():
     tmp = Path(tempfile.mkdtemp())
     cwd = os.getcwd()
     real = app.requests.get
+    # app.IMAGE_DIR is per-client and absolute now (Phase 1 item 1), so chdir
+    # no longer redirects the downloads - repoint it at the scratch dir.
+    saved_image_dir = app.IMAGE_DIR
     try:
         os.chdir(tmp)
+        app.IMAGE_DIR = tmp / app.IMAGE_ROOT
         app.requests.get = fake_get
         urls = [f"https://cdn.example.com/i/{k}.png" for k in order]
         saved = app.download_urls_for_sku("AP-HD", urls)
@@ -135,6 +139,7 @@ def test_download_rules():
             check("padding is white, not a crop", px[5, 5], (255, 255, 255))
     finally:
         app.requests.get = real
+        app.IMAGE_DIR = saved_image_dir
         os.chdir(cwd)
         shutil.rmtree(tmp, ignore_errors=True)
 

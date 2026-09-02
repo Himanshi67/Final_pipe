@@ -31,7 +31,7 @@ trusted, and anything unverifiable is flagged instead of guessed.
         v   app.py       (Streamlit browser app - formats + downloads)
         v   build_csv.py (the same formatter, headless - for unattended runs)
  wordpress_ready_clean_repaired.csv   (WooCommerce columns + attributes)
- product_images_for_upload\*.webp     (SKU_1.webp, SKU_2.webp, ...)
+ product_images_for_upload\<client>\*.webp   (SKU_1.webp, SKU_2.webp, ...)
         |
         v   validate_csv.py  (QA gate)
  validation_issues.csv (anything worth fixing before import)
@@ -53,6 +53,89 @@ scripts below still work standalone — useful for headless/scripted runs, or
 when only one stage needs redoing.
 
 ## 3. The scripts
+
+### Per-client configuration — `client_config.py` + `clients\<slug>\`
+
+Every store-specific value lives in one folder per client, so a second client
+cannot leak into or break the first. The full design contract is
+**docs/CLIENT_CONFIG.md**; this is the operator's summary.
+
+```
+clients\shreejee\
+  client.toml                          store URL, media base, SEO site name,
+                                       placeholder HTML, taxonomy filenames,
+                                       [sku] prefix scheme, [serper] budgets
+  category_map.xlsx                    taxonomy (in git)
+  category_seo.xlsx                    curated tags + SEO keywords (in git)
+  SubCategory_Attributes_Master.xlsx   reference copy, read by no script (in git)
+  backups\                             category-map editor backups (NOT in git)
+  .env                                 this client's WC_*/WP_*/SERPER_* (NOT in git)
+  credits.json                         serper usage ledger (NOT in git)
+```
+
+**Every entry point takes `--client SLUG`** — `sku_enricher.py`, `build_csv.py`,
+`validate_csv.py`, `wc_publish.py`, `wc_seo.py`, `wc_checkpoint.py`. Resolution
+order is `--client` > the `PIPELINE_CLIENT` environment variable > `shreejee`.
+In-process, `app.configure(slug)` and `validate_csv.configure(slug)` reload every
+constant for another client. The GUI gets a client selector and the same guards;
+see CLIENT_CONFIG.md.
+
+**A new client** = copy `clients\shreejee\` to `clients\<newslug>\`, edit
+`client.toml` (`[client] slug` must equal the folder name), drop in that client's
+`category_map.xlsx`, and create its `.env`.
+
+**The `[sku]` table is the ONE source of the SKU prefix scheme.** app.py,
+validate_csv.py, gui_helpers.py and sku_enricher.py all derive from it instead of
+keeping their own copies:
+
+- `[sku.prefix_by_parent]` — the code emitted per taxonomy parent when the
+  WooCommerce SKU is built (`Washing Machines = "WM"`, `LED = "TV"`, …).
+- `fallback_prefix` (`AP`) — anything with no parent match.
+- `never_rename` (`["WM", "WH"]`) — live products already carry these, so
+  `app.prefixed_sku` returns such a SKU untouched.
+- `[sku.input_codes]` — codes an operator or ERP writes at the FRONT of a raw SKU,
+  mapped to a taxonomy hint (`HWD` → Home Appliances / Water Dispensers).
+- `strip_codes` — tokens the enricher strips before searching that carry no
+  taxonomy hint.
+
+Editing this table is how a new client gets its own prefixes; `[sku]` is required,
+so a client cannot silently inherit another's.
+
+**`clients\<slug>\.env` grammar** — parsed by `client_config.load_env`, no
+python-dotenv:
+
+```
+# comments and blank lines are ignored
+WC_URL=https://example.com
+export WC_KEY=ck_...            # a leading "export " is tolerated
+WC_SECRET="cs_... "             # surrounding ' or " are stripped
+SERPER_API_KEY=abc123
+```
+
+Any other line is an error naming its line number — a typo in a credentials file
+must not silently publish to the wrong store. These values **override** the shell
+environment for the scripts that load them (`wc_publish.py`, `wc_seo.py`,
+`wc_checkpoint.py`, `sku_enricher.py`), so a stale `setx WC_URL` cannot redirect
+a publish.
+
+**`clients\<slug>\credits.json`** — the serper ledger the enricher maintains
+(month total, per-run rows, previous months under `history`):
+
+```json
+{"month": "2026-09", "serper_calls": 412,
+ "runs": [{"id": "20260902-153012", "input": "LIST.xlsx", "started": "...",
+           "ended": "...", "serper_calls": 37, "ddg_calls": 2,
+           "pages_fetched": 140, "stopped_by": "done"}],
+ "history": {"2026-08": 1830}}
+```
+
+It is written on every checkpoint save and at exit, with a temp file + replace,
+and a ledger that cannot be written warns once instead of taking the run down.
+Cache hits never reach serper, so they are never counted.
+
+**Generated per-client folders:** images go to
+`product_images_for_upload\<slug>\` and snapshots to `checkpoints\<slug>\`, both
+anchored on the repo — not on the directory you happen to run from.
 
 ### sku_enricher.py — data collector
 
@@ -127,14 +210,32 @@ re-running an old batch through improved parsers. Failures are never cached (a
 transient block must not become permanent) and entries expire after
 `--cache-ttl` days (default 14), because a fortnight-old price is not a price.
 
+**Serper budget and the credit ledger.** `--budget N` caps the run at N serper.dev
+credits, enforced at two points: once N credits are spent, every further search is
+refused before it reaches serper (logged once as `Serper budget of N reached -
+remaining searches fall back to DuckDuckGo`, so the row in flight finishes for free),
+and after that row the loop logs
+`Budget of N serper credit(s) reached - stopping, progress saved.` and takes
+the same checkpoint-save + summary + report path as Ctrl+C, so the exit code is 0
+and nothing is lost. `0` means unlimited, a negative value is an argparse error, and
+the default is the client's `[serper] default_run_budget`. `monthly_budget` is
+advisory: when the ledger's month-to-date is already at or over it, the run starts
+with one `WARNING` line and does not stop. Spend accumulates in `clients\<slug>\credits.json`
+(above). The API key itself is BYOK: the variable NAME comes from `[serper]
+api_key_env` (default `SERPER_API_KEY`) and its value from the client's `.env`.
+
 **Batch report:** each run writes `<output>_report.md` next to the workbook —
-outcome counts, the rows that still need a human and why, Serper credits spent,
-cache hits, and which domains blocked the run. It describes the whole output
+a header with `Client:`, `Credits:` (this run / month-to-date / budget) and
+`Stopped by:` (`done`, `user` or `budget`), then outcome counts, the rows that
+still need a human and why, Serper credits spent, cache hits, and which domains
+blocked the run. When a `review_metrics.json` sits next to the output (the GUI
+wrote it while the sheet was reviewed) the report also carries a `## Review`
+section: `Review so far: N min · M min/SKU · needs-human X%`. It describes the whole output
 file, not just this run's rows, so a batch resumed across several sessions
 still reads as one batch. `--no-report` skips it.
 
-**Where data lives:** input SKU file in `final_pipe\`; output `<name>_filled.xlsx`
-appears next to it. The original file is never modified. Progress saves after
+**Where data lives:** the output `<name>_filled.xlsx` appears next to the input
+SKU file, wherever that is. The original file is never modified. Progress saves after
 every SKU; if the output is open in Excel the script waits instead of crashing.
 
 **Output is app.py-ready:** the filled sheet always carries the eight headers
@@ -150,6 +251,8 @@ the canonical ones in the output copy (your original file keeps its names).
 :: normal run (resumes automatically; skips rows already attempted)
 .venv\Scripts\python.exe sku_enricher.py "WM MODEL LIST FOR WEBSITE.xlsx" --min-price 8000 --delay 5 8
 
+:: which client's config to use  --client shreejee   (or set PIPELINE_CLIENT)
+:: stop after N serper credits   --budget 200        (0 = unlimited)
 :: quick test on 5 SKUs          --limit 5
 :: redo everything               --force
 :: re-attempt NOT FOUND rows     --retry-missing
@@ -230,7 +333,24 @@ Everything for one batch lives under `runs\<name>\`: input, `_filled.xlsx`,
 enricher log, the CSV, `validation_issues.csv`, review/run state. State is
 re-derived from those files, so closing the browser tab mid-enrichment loses
 nothing — the enricher checkpoints after every row and reopening the wizard
-resumes where it left off.
+resumes where it left off. It gets a client selector and the same guards as the
+CLI; see docs/CLIENT_CONFIG.md.
+
+**Review instrumentation.** `runs\<name>\review_state.json` records an `events`
+list beside `confirmed` — one entry per approve / unapprove / edit / url_pasted /
+drop_image / skip, with the mode (table or card), an ISO timestamp and the wall
+seconds since the previous event (capped at 600 s, so an idle gap never counts).
+From it the wizard writes `runs\<name>\review_metrics.json` on every save, and
+the same one-liner then appears in the GUI, in the archive README's `## Review`
+section and in the enricher's report:
+`Review so far: N min · M min/SKU · needs-human X%` — how much human time a batch
+actually costs, per client.
+
+**Hand-over pack.** Archiving a run copies its reviewable outputs plus the
+original input list into `batches\<name>\`, writes a README with `## Coverage`
+(status buckets), `## Review` (the line above) and `## Files`, and zips the whole
+folder to `batches\<name>.zip` — one file to hand over. `build_csv.py --pack`
+produces the same pack from the headless route.
 
 **Command:**
 ```
@@ -248,8 +368,9 @@ category detection (Washing Machines > Top load / Front Load / Semi Auto, AC,
 LED, etc.), SKU normalization + WM-/WH-/AP- prefixes, duplicate-SKU removal,
 description/short-description/configuration HTML, WooCommerce attribute
 columns, and downloads every image as `SKU_n.webp` into
-`product_images_for_upload\` — the Images column only lists files that really
-downloaded.
+`product_images_for_upload\<client>\` (the SKU prefixes come from the client's
+`[sku]` table, `WM-`/`WH-` never renamed) — the Images column only lists files
+that really downloaded.
 
 **Controls in the app:** upload the `_filled.xlsx` directly (Excel accepted);
 "Import only verified rows" (on by default — uses the status column);
@@ -297,17 +418,17 @@ only. Image alt text is likewise attachment-level, so it is set by
 `wc_publish.py` at upload time and cannot ride the CSV at all.
 
 **Category taxonomy:** the `categories` column is snapped to the EXACT strings
-(case- and space-sensitive) in **category_map.xlsx**, which sits next to
-app.py — e.g. `Washing Machines > Top load`, `Washing Machines > semi auto`.
+(case- and space-sensitive) in **`clients\<slug>\category_map.xlsx`** — e.g. `Washing Machines > Top load`, `Washing Machines > semi auto`.
 Edit that Excel to change the taxonomy; no code changes needed. Categories the
 app cannot map are left as detected and listed in a warning; validate_csv.py
 also flags any `category_not_in_map` rows. Note: "Juicers, Mixers & Grinders"
 is treated as ONE category name, and "electric kettle" maps to Small
 Appliances while plain "kettle" maps to Kitchen Appliances > Kettles.
 
-**Where data lives:** run it from `final_pipe\` so images land in
-`final_pipe\product_images_for_upload\`; download the generated CSV into
-`final_pipe\` as well.
+**Where data lives:** images land in `product_images_for_upload\<client>\`
+inside the repo, whatever directory you started the app from. Download the
+generated CSV wherever you like; keep it next to the images folder's repo root
+if you plan to publish from the CLI.
 
 **Command:**
 ```
@@ -354,13 +475,21 @@ titles labelled Top Load, plus:
 Prints a summary and writes `validation_issues.csv`. It also runs
 **automatically** at the end of `build_csv.py` and in the app after Generate.
 
-**Where data lives:** run from `final_pipe\` with the CSV and the
-`product_images_for_upload\` folder present.
+**Where data lives:** the image-existence check reads
+`product_images_for_upload\<client>\` inside the repo, so the directory you run
+from no longer matters. `validation_issues.csv` is written next to the file
+being checked.
 
 **Command:**
 ```
 .venv\Scripts\python.exe validate_csv.py wordpress_ready_clean_repaired.csv
+.venv\Scripts\python.exe validate_csv.py out.csv --client shreejee --warn-only
 ```
+
+`--warn-only` reports without failing (exit 0 even when rows are flagged);
+without it the exit code is 1 whenever anything is flagged, so it can gate a
+script. `--client` picks the placeholder text, the category map and the image
+folder.
 
 ### build_csv.py — the formatter without the browser
 
@@ -385,12 +514,22 @@ a batch can run unattended and so the formatter can be asserted on by tests.
 | `--seo` | Add the SEO meta columns (OFF by default) |
 | `--seo-plugin` | `yoast` (default) · `rankmath` · `both` |
 | `--no-validate` | Skip the QA pass that otherwise runs on the file just written |
+| `--pack` | Also write `<out stem>_pack\` — CSV, `validation_issues.csv`, the images the CSV references, the input list and a README — and zip it. The same deliverable the GUI's Archive button builds |
+| `--client SLUG` | Which client's config to use (default: `PIPELINE_CLIENT`, then `shreejee`) |
 
 The QA pass runs by default the moment the CSV is written, so a problem is
 reported while you are still looking at the build rather than one step later.
 
-Images are written to `product_images_for_upload\` **relative to the current
-directory**, so run it from `Final_pipe\` unless you want them elsewhere.
+Images are written to `product_images_for_upload\<client>\` **inside the repo**
+(anchored on the script, not on the current directory), so the same run from any
+folder puts them in the same place.
+
+`--pack` is the hand-over route: it produces one folder plus one
+`<out stem>_pack.zip` containing the CSV, the validation issues, every image the
+CSV references, the original input list and a README with `## Coverage`,
+`## Review` and `## Files` sections. The README is rendered by the same
+`gui_helpers.render_batch_readme` the GUI archive uses, so the two routes cannot
+drift.
 
 ### wc_publish.py — publish over the WooCommerce REST API
 
@@ -407,7 +546,9 @@ the product slug; that one has no CSV-importer equivalent, so this route is the
 only way to set it. Columns absent = nothing extra sent, so a CSV built without
 `--seo` produces exactly the payload it always did.
 
-**Credentials — environment variables only, never in the repo:**
+**Credentials — `clients\<slug>\.env` or environment variables, never in the
+repo.** The client's `.env` is loaded first and OVERRIDES the shell environment
+for these keys:
 
 | Variable | Where it comes from | Needed for |
 |---|---|---|
@@ -421,14 +562,27 @@ is why image upload needs a separate Application Password.
 **Commands:**
 ```
 .venv\Scripts\python.exe wc_publish.py --check                      # test credentials
+.venv\Scripts\python.exe wc_publish.py --preflight                  # every guard, no write
 .venv\Scripts\python.exe wc_publish.py out.csv                      # DRY RUN
 .venv\Scripts\python.exe wc_publish.py out.csv --sku AP-XYZ --commit # one product
 .venv\Scripts\python.exe wc_publish.py out.csv --commit --status publish
+.venv\Scripts\python.exe wc_publish.py out.csv --commit --max-commit 50
 .venv\Scripts\python.exe wc_publish.py --delete-sku AP-XYZ --commit  # clean up a test
 ```
 
 **Nothing is written without `--commit`**, and new products are created as `draft`
 unless `--status publish` is given. An update never flips a live product back to draft.
+
+**Blast-radius guards — exit code 4 means REFUSED and nothing was written**
+(distinct from 2 = some rows failed, 3 = the store's edge blocked us):
+
+| Guard | What it does |
+|---|---|
+| Store URL | `WC_URL` must be the same store as the client's `[store] url` (compared without scheme, `www.` or trailing slash). Hard stop on `--commit`, `--check` and `--preflight`; a plain dry run prints one loud `WARNING:` naming both hosts and carries on, because a dry run cannot write |
+| `--max-commit N` | Default 25. A `--commit` that would write more products than this is refused, and the message names the flag to raise it. Dry runs are never capped; `--delete-sku` counts as 1 |
+| `review_signoff.csv` | `--commit --status publish` and `--commit --delete-sku` require this file next to the CSV, with columns `sku,reviewer,signed_at`, listing every SKU about to go live or be deleted. A missing SKU is refused by name. The GUI writes the file from the confirmed rows when the operator arms a go-live commit |
+| Auto snapshot | Before the first write of any `--commit` run, a `before-publish-<slug>` checkpoint is taken and its name printed. `--no-checkpoint` skips it — that is a run you cannot roll back |
+| `--preflight` | Runs the store-URL check, `store.check()`, the media credentials and the sign-off file, prints one line per check and exits without writing: 0 = pass, 3 = edge challenge, 4 = mismatch or missing credentials |
 
 **Getting through a CDN browser challenge.** If the store answers with
 "Checking your browser before accessing…" instead of JSON, the script says so and
@@ -437,6 +591,7 @@ prints both routes out (it does not dump raw HTML at you):
 | Flag | Meaning |
 |---|---|
 | `--limit N` | At most N products — for smoke tests |
+| `--client SLUG` | Which client's config and `.env` to use (default: `PIPELINE_CLIENT`, then `shreejee`) |
 | `--images auto\|upload\|url\|skip` | `auto` (default) uploads the local `.webp` when `WP_APP_*` is set, else trusts the Images column |
 | `--cookie-file PATH` | file holding your browser's `Cookie` header — preferred, keeps it out of shell history |
 | `--cookie VALUE` | the cookie value inline |
@@ -460,7 +615,9 @@ the ones already on the storefront. Dry run unless `--commit`.
     .venv\Scripts\python.exe wc_seo.py --sku TV-... --commit
 
 Flags: `--commit` `--sku` `--limit` `--plugin` `--overwrite` `--slugs` `--report`
-`--no-checkpoint` `--checkpoint-label` `--cookie-file` `--cookie` `--user-agent`.
+`--no-checkpoint` `--checkpoint-label` `--cookie-file` `--cookie` `--user-agent`
+`--client`. The store-URL guard applies here too: a mismatch between `WC_URL` and
+the client's `[store] url` refuses with exit 4.
 It snapshots via wc_checkpoint.py first unless `--no-checkpoint`; `--slugs` rewrites
 permalinks, which breaks existing links - do not use it on an indexed store.
 
@@ -469,12 +626,22 @@ permalinks, which breaks existing links - do not use it on an indexed store.
 Takes a restorable copy of the products before a risky bulk change.
 
     .venv\Scripts\python.exe wc_checkpoint.py create --label before-seo
-    .venv\Scripts\python.exe wc_checkpoint.py list
+    .venv\Scripts\python.exe wc_checkpoint.py list --client shreejee
     .venv\Scripts\python.exe wc_checkpoint.py restore 20260901-1204-before-seo --commit
 
 Positional `action` + `name`; flags `--label` `--commit` `--fields` `--sku` `--limit`
-`--cookie-file` `--cookie` `--user-agent`. Snapshots land in `checkpoints\` (anchored
-on the script's own folder). Restore is a dry run unless `--commit`.
+`--cookie-file` `--cookie` `--user-agent` `--client` `--force-store`. Every snapshot
+records the store host and client slug it was taken from; `restore` (and `diff`,
+read-only) compares them with the target store and REFUSES with exit 4 when they
+differ or when the snapshot predates the stamping — `--force-store` overrides, and
+prints why. Snapshots land in
+`checkpoints\<slug>\` (anchored on the script's own folder); snapshots taken before
+checkpoints were split per client still sit in `checkpoints\` and `list` shows them
+under an "(unscoped)" label. Restore is a dry run unless `--commit`, and the
+store-URL guard refuses a mismatched store with exit 4.
+
+`wc_publish.py --commit` calls `create` for you (label `before-publish-<slug>`)
+unless `--no-checkpoint` is given.
 
 `--label` is **create-only** — it names a NEW snapshot `<timestamp>-<label>`. `restore`
 ignores it and restores its positional `name`, which defaults to `latest` (the
@@ -505,30 +672,40 @@ QA gate matching the site's real failure modes · reusable Claude prompt
 | `wc_checkpoint.py` | Snapshot / restore live product meta (§3) |
 | `docs\AUTOMATION_OPPORTUNITIES.md` | What else could be automated, ranked |
 | `docs\KNOWN_ISSUES.md` | Diagnosed bugs with line anchors and acceptance tests |
-| `category_map.xlsx` | Category taxonomy — output categories use these exact strings |
+| `client_config.py` | Loads `clients\<slug>\client.toml` + `.env` — every per-client value and path (§3) |
+| `clients\<slug>\category_map.xlsx` | Category taxonomy — output categories use these exact strings |
+| `docs\CLIENT_CONFIG.md` | The per-client design contract: layout, `client.toml`, publish guards, credit ledger, pack |
 | `requirements.txt` | All dependencies for every root script |
 | `README.md` | Quickstart commands |
 | `docs\PIPELINE_GUIDE.md` | This document |
 | `docs\data_flow.svg` | Visual pipeline diagram (open in a browser) |
 | `docs\claude_prompt.md` | Manual-lookup prompt for flagged rows |
 
-Generated at runtime: `<name>_filled.xlsx`, `product_images_for_upload\`,
-`wordpress_ready_clean_repaired.csv`, `validation_issues.csv`.
+Generated at runtime: `<name>_filled.xlsx`,
+`product_images_for_upload\<client>\`, `wordpress_ready_clean_repaired.csv`,
+`validation_issues.csv`, `clients\<client>\credits.json`,
+`runs\<name>\review_metrics.json`.
 
 ### Folder layout
 
 ```
 Final_pipe\
   *.py  *.md  requirements.txt      the pipeline and its docs (in git)
-  category_map.xlsx                 taxonomy - CONFIG, kept in git on purpose
-  SubCategory_Attributes_Master.xlsx   REFERENCE COPY ONLY - no script reads it.
+  clients\<slug>\                   ALL per-client config (§3). No taxonomy file
+                                    is at the repo root any more:
+    client.toml                     store URL, [sku] scheme, [serper] budgets
+    category_map.xlsx               taxonomy - CONFIG, kept in git on purpose
+    category_seo.xlsx               curated tags + SEO keywords (in git)
+    SubCategory_Attributes_Master.xlsx   REFERENCE COPY ONLY - no script reads it.
                                     The attributes app.py actually enforces live in
                                     the 'Sub-Category Attributes' SHEET of
                                     category_map.xlsx (app.load_subcategory_attributes)
+    backups\ .env credits.json      editor backups, credentials, ledger (NOT in git)
   <name>.xlsx  <name>_filled.xlsx   the batch you are working on
-  product_images_for_upload\        images for the CURRENT batch
+  product_images_for_upload\<slug>\ images for the CURRENT batch, per client
+  checkpoints\<slug>\               store snapshots, per client (NOT in git)
   batches\<name>-<YYYY-MM>\         finished batches, archived (NOT in git)
-  backups\                          dated copies of config (NOT in git)
+                                    + batches\<name>.zip, the one-file hand-over
   .claude\                          agents and skills
   Sku_enrichment\                   enricher-only mirror - CODE ONLY, no data
   _push_export\                     nested export repo, own remote
@@ -536,9 +713,10 @@ Final_pipe\
 
 Two working rules that follow from this:
 
-- **`product_images_for_upload\` is resolved from the current directory**, so run
-  `build_csv.py`, `validate_csv.py` and `wc_publish.py` from `Final_pipe\`. To
-  work on an archived batch again, copy its `images\` back to that name first.
+- **`product_images_for_upload\<slug>\` is resolved from the repo**, not from the
+  current directory, so `build_csv.py`, `validate_csv.py` and `wc_publish.py`
+  agree on it wherever you run them. To work on an archived batch again, copy its
+  `images\` back into that folder first.
 - **Archive a batch when it is published**, into `batches\<name>-<YYYY-MM>\`.
   Keep the `.xlsx` inputs in the root so the batch stays resumable, and leave a
   short README in the archive saying what is in it.
@@ -553,4 +731,10 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 setx SERPER_API_KEY "your_key_here"
 ```
-(Open a NEW Command Prompt after `setx` so the key is picked up.)
+(Open a NEW Command Prompt after `setx` so the key is picked up. Per client, the
+key can instead live in `clients\<slug>\.env` as `SERPER_API_KEY=...`, under
+whatever name `[serper] api_key_env` gives — that file wins over the shell.)
+
+`clients\shreejee\` ships with the repo and is the default client. Set up a
+second one by copying that folder, editing `client.toml` and dropping in its own
+`category_map.xlsx` (§3).

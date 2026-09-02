@@ -45,6 +45,7 @@ fresh SKU, product created, verified, deleted, store left as found.
 | `wc_publish.py` | stage 3 — upsert to WooCommerce over REST, keyed on SKU |
 | `wc_seo.py` | back-fill SEO meta on products already live |
 | `wc_checkpoint.py` | snapshot/restore products before a risky bulk change |
+| `client_config.py` | loads `clients\<slug>\client.toml` + `.env`; every script takes `--client` (docs/CLIENT_CONFIG.md) |
 
 ## Environment
 
@@ -53,7 +54,9 @@ fresh SKU, product created, verified, deleted, store left as found.
   Read them explicitly:
   `[Environment]::GetEnvironmentVariable('WC_KEY','User')`. This bit twice.
 - All set and working: `SERPER_API_KEY`, `WC_URL`, `WC_KEY`, `WC_SECRET`,
-  `WP_APP_USER`, `WP_APP_PASSWORD`.
+  `WP_APP_USER`, `WP_APP_PASSWORD`. Since Phase 1 these may instead live in
+  `clients\<slug>\.env`, which **overrides** the shell environment for the
+  scripts that load it.
 - WooCommerce keys authenticate `/wc/v3` only; the Media Library is `/wp/v2`,
   hence the separate WordPress Application Password (24 chars, six groups —
   not the account password, and it must be quoted in `setx`).
@@ -73,13 +76,20 @@ fresh SKU, product created, verified, deleted, store left as found.
 - `sku_enricher.py` exists in 4 copies on disk (root, `Sku_enrichment\`,
   `_push_export\`, `_push_export\Sku_enrichment\` — the last three are the
   sync-copies skill's mirror targets); root is the source of truth, mirrored
-  via the sync-copies skill and hash-verified.
+  via the sync-copies skill and hash-verified. `client_config.py` and
+  `clients\shreejee\` (client.toml + the three taxonomy workbooks) mirror to
+  `_push_export\` in the SAME relative layout — the scripts anchor on
+  `Path(__file__).parent / "clients"`, so a flattened copy breaks the export.
 - Gitignored on purpose and **only on disk**: `.cache\`, `batches\`, `backups\`,
-  `product_images_for_upload\`, `Code_Unrelated\_tools\` (92 MB Node), all
-  `*.xlsx` **except** `category_map.xlsx` and `SubCategory_Attributes_Master.xlsx`,
+  `product_images_for_upload\`, `checkpoints\`, `Code_Unrelated\_tools\` (92 MB
+  Node), `clients\*\backups\`, `clients\*\.env`, `clients\*\credits.json`, and
+  all `*.xlsx` **except** `clients\*\category_map.xlsx`,
+  `clients\*\category_seo.xlsx` and `clients\*\SubCategory_Attributes_Master.xlsx`,
   which are configuration and are committed deliberately. (The Master workbook is a
   REFERENCE COPY read by no script — the enforced attributes live in the
   'Sub-Category Attributes' sheet of `category_map.xlsx`, `app.load_subcategory_attributes`.)
+  Those three workbooks MOVED out of the repo root into `clients\<slug>\` in
+  Phase 1; nothing taxonomy-shaped is at root any more.
 
 ## Security incident — mostly closed, one step left
 
@@ -173,11 +183,14 @@ two SKU pairs shared a gallery:
 - NEVER edit `Sku_enrichment\` or `_push_export\` directly — edit root, then sync.
 - `wc_publish.py` writes to the LIVE store. Never `--commit` more than one SKU
   without asking; never `--status publish` on unreviewed rows.
-- Credentials in env vars only — never in the repo, a file, or chat. Do not
-  print more than the first few characters of a secret.
+- Credentials in env vars or the gitignored `clients\<slug>\.env` — never in the
+  repo, a tracked file, or chat. Do not print more than the first few characters
+  of a secret.
 - Acceptance tests run on scratch copies of spreadsheets, never live batch files.
-- Run every script from `Final_pipe\` — `product_images_for_upload\` is resolved
-  from the current directory.
+- Paths are anchored on the scripts, not on the working directory:
+  `product_images_for_upload\<slug>\`, `checkpoints\<slug>\`, `clients\<slug>\`.
+- `wc_publish.py` exit code 4 = a blast-radius guard refused and NOTHING was
+  written (store-URL mismatch, `--max-commit`, or a missing `review_signoff.csv`).
 
 ## Traps that already cost time — don't re-learn these
 

@@ -43,9 +43,17 @@ from pathlib import Path
 
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
 
+import client_config                         # noqa: E402
 import wc_publish as W                       # noqa: E402  session, auth, challenge
 
-CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+# One client's snapshots never sit next to another's: a restore is chosen by
+# name from a listing, and two stores in one folder is how the wrong catalogue
+# gets written back (PRODUCT_PLAN Phase 1 item 3).
+CHECKPOINT_ROOT = Path(__file__).resolve().parent / "checkpoints"
+# The directory the module is CURRENTLY reading and writing. main() and
+# create() point it at checkpoint_dir(cfg); it starts at the legacy root so an
+# importer that never configures still finds the pre-split files.
+CHECKPOINT_DIR = CHECKPOINT_ROOT
 PAGE_SIZE = 100
 # Below this a capture is almost certainly truncated rather than a small store.
 PARTIAL_THRESHOLD = 25
@@ -70,21 +78,69 @@ def is_restorable_meta(key):
 
 # ------------------------------- storage ---------------------------------
 
-def checkpoint_path(name):
-    return CHECKPOINT_DIR / f"{name}.json.gz"
+def checkpoint_dir(cfg):
+    """<repo>/checkpoints/<slug>/ for a ClientConfig (or a bare slug)."""
+    slug = str(getattr(cfg, "slug", cfg) or "").strip()
+    return CHECKPOINT_ROOT / slug if slug else CHECKPOINT_ROOT
 
 
-def save_checkpoint(name, payload):
-    CHECKPOINT_DIR.mkdir(exist_ok=True)
-    path = checkpoint_path(name)
+def resolve_client(store=None, client=None):
+    """Whose checkpoints these are: an explicit client wins, else the client
+    whose store.url IS the store being captured, else whatever --client /
+    $PIPELINE_CLIENT resolved to. Returns None when no config loads at all,
+    which keeps the legacy unscoped folder working."""
+    if client is not None:
+        return client
+    host = client_config.store_host(getattr(store, "base", "") or "")
+    if host:
+        for slug in client_config.available_clients():
+            try:
+                cfg = client_config.load_client(slug)
+            except client_config.ClientConfigError:
+                continue
+            if client_config.store_host(cfg.store_url) == host:
+                return cfg
+    cfg = getattr(W, "CLIENT", None)
+    if cfg is not None:
+        return cfg
+    try:
+        return client_config.load_client()
+    except client_config.ClientConfigError:
+        return None
+
+
+def configure(cfg):
+    """Point the module at one client's checkpoint folder."""
+    global CHECKPOINT_DIR
+    CHECKPOINT_DIR = checkpoint_dir(cfg) if cfg is not None else CHECKPOINT_ROOT
+    return CHECKPOINT_DIR
+
+
+def checkpoint_path(name, directory=None):
+    return (directory or CHECKPOINT_DIR) / f"{name}.json.gz"
+
+
+def save_checkpoint(name, payload, directory=None):
+    directory = directory or CHECKPOINT_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    path = checkpoint_path(name, directory)
     with gzip.open(path, "wt", encoding="utf-8") as fh:
         json.dump(payload, fh)
     return path
 
 
+def legacy_files():
+    """Snapshots taken before checkpoints/ was split per client. They are
+    still restorable, so they are still listed - just not silently mixed in
+    with a named client's."""
+    if CHECKPOINT_DIR == CHECKPOINT_ROOT or not CHECKPOINT_ROOT.exists():
+        return []
+    return sorted(CHECKPOINT_ROOT.glob("*.json.gz"))
+
+
 def load_checkpoint(name):
     if name == "latest":
-        found = sorted(CHECKPOINT_DIR.glob("*.json.gz"))
+        found = sorted(CHECKPOINT_DIR.glob("*.json.gz")) or legacy_files()
         if not found:
             sys.exit(f"No checkpoints in {CHECKPOINT_DIR}. Make one with: "
                      f"wc_checkpoint.py create")
@@ -92,35 +148,49 @@ def load_checkpoint(name):
     else:
         path = checkpoint_path(name)
         if not path.exists():
-            sys.exit(f"No such checkpoint: {path}")
+            # a name from before the per-client split still resolves
+            legacy = checkpoint_path(name, CHECKPOINT_ROOT)
+            if legacy.exists():
+                path = legacy
+            else:
+                sys.exit(f"No such checkpoint: {path}")
     with gzip.open(path, "rt", encoding="utf-8") as fh:
         return path, json.load(fh)
 
 
+def _print_entry(path):
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as fh:
+            data = json.load(fh)
+        n = len(data.get("products", []))
+        when = data.get("created_at", "?")
+        label = data.get("label", "")
+        size = path.stat().st_size / 1_048_576
+        flag = "  <-- PARTIAL, not a full restore point" if n < PARTIAL_THRESHOLD else ""
+        print(f"  {path.stem}{flag}")
+        print(f"    {n} product(s), {when}, {size:.1f} MB"
+              + (f", label: {label}" if label else ""))
+    except Exception as exc:
+        print(f"  {path.stem}  (unreadable: {exc})")
+
+
 def list_checkpoints():
-    if not CHECKPOINT_DIR.exists():
-        print(f"No checkpoints yet ({CHECKPOINT_DIR} does not exist).")
-        return
-    found = sorted(CHECKPOINT_DIR.glob("*.json.gz"))
-    if not found:
+    found = sorted(CHECKPOINT_DIR.glob("*.json.gz")) if CHECKPOINT_DIR.exists() else []
+    if found:
+        print(f"{len(found)} checkpoint(s) in {CHECKPOINT_DIR}:\n")
+        for path in found:
+            _print_entry(path)
+    else:
         print(f"No checkpoints in {CHECKPOINT_DIR}.")
-        return
-    print(f"{len(found)} checkpoint(s) in {CHECKPOINT_DIR}:\n")
-    for path in found:
-        try:
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                data = json.load(fh)
-            n = len(data.get("products", []))
-            when = data.get("created_at", "?")
-            label = data.get("label", "")
-            size = path.stat().st_size / 1_048_576
-            flag = "  <-- PARTIAL, not a full restore point" if n < PARTIAL_THRESHOLD else ""
-            print(f"  {path.stem}{flag}")
-            print(f"    {n} product(s), {when}, {size:.1f} MB"
-                  + (f", label: {label}" if label else ""))
-        except Exception as exc:
-            print(f"  {path.stem}  (unreadable: {exc})")
-    print("\n'latest' always refers to the newest of these.")
+    legacy = legacy_files()
+    if legacy:
+        print(f"\n{len(legacy)} checkpoint(s) in {CHECKPOINT_ROOT} "
+              f"(unscoped - taken before checkpoints were split per client, "
+              f"so which store they hold is only recorded inside the file):\n")
+        for path in legacy:
+            _print_entry(path)
+    if found or legacy:
+        print("\n'latest' always refers to the newest of these.")
 
 
 # ------------------------------- capture ---------------------------------
@@ -142,7 +212,13 @@ def fetch_all_products(store):
     return products
 
 
-def create(store, label):
+def create(store, label="", client=None):
+    """Capture every product into checkpoints/<slug>/.
+
+    `client` is how wc_publish/wc_seo say whose store this is; without one the
+    client is inferred from the store URL, then from --client / the env."""
+    cfg = resolve_client(store, client)
+    directory = checkpoint_dir(cfg)
     print(f"Capturing products from {store.base}")
     products = fetch_all_products(store)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -150,11 +226,12 @@ def create(store, label):
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "store": store.base,
+        "client": getattr(cfg, "slug", ""),
         "label": label,
         "product_count": len(products),
         "products": products,
     }
-    path = save_checkpoint(name, payload)
+    path = save_checkpoint(name, payload, directory)
     print(f"\nCheckpoint '{name}'")
     print(f"  {len(products)} product(s) -> {path} "
           f"({path.stat().st_size / 1_048_576:.1f} MB)")
@@ -288,7 +365,52 @@ def restore_payload(old, live, fields):
     return payload
 
 
-def restore(store, checkpoint, live_products, fields, only_skus, commit, limit=0):
+def checkpoint_store_mismatch(checkpoint, store_url, cfg=None):
+    """Why this snapshot must not be written into `store_url`, else "".
+
+    A restore is chosen by NAME from a listing, and 'latest' falls back to the
+    unscoped legacy folder when a client has no snapshots of its own - so the
+    file that comes back can easily be another store's catalogue. create()
+    stamps every snapshot with the store URL and client slug it came from
+    (PRODUCT_PLAN Phase 1 item 3); this is the check that reads them back.
+    A snapshot with no stamp at all predates that, so it cannot be cleared
+    either - it is refused the same way, with a different reason."""
+    recorded_store = str(checkpoint.get("store") or "").strip()
+    recorded_client = str(checkpoint.get("client") or "").strip()
+    target = str(store_url or "").strip()
+    slug = str(getattr(cfg, "slug", "") or "").strip()
+    target_host = client_config.store_host(target) or target or "(no WC_URL)"
+
+    if not recorded_store:
+        return (f"this snapshot predates store stamping - it records no "
+                f"'store', so nothing proves it was taken from {target_host}")
+    if not client_config.same_store(recorded_store, target):
+        return (f"this snapshot was taken from "
+                f"{client_config.store_host(recorded_store)} but the store "
+                f"being written is {target_host}")
+    if recorded_client and slug and recorded_client != slug:
+        return (f"this snapshot belongs to client '{recorded_client}' but the "
+                f"resolved client is '{slug}'")
+    return ""
+
+
+def restore(store, checkpoint, live_products, fields, only_skus, commit,
+            limit=0, force_store=False, client=None):
+    # Belt and braces: main() checks this before it ever gets here, but
+    # restore() is also called directly (wc_seo, tests, a future caller) and a
+    # cross-store write is the one mistake with no way back.
+    cfg = client if client is not None else getattr(W, "CLIENT", None)
+    mismatch = checkpoint_store_mismatch(checkpoint, getattr(store, "base", ""),
+                                         cfg)
+    if mismatch and not force_store:
+        print(f"\nREFUSED: {mismatch}.")
+        print(f"  Nothing was written. Pass --force-store only if you really "
+              f"mean to write this snapshot into that store. "
+              f"Exit code {W.EXIT_REFUSED}.")
+        sys.exit(W.EXIT_REFUSED)
+    if mismatch:
+        print(f"\n  !! --force-store: {mismatch}.")
+
     old_by_id = {p["id"]: p for p in checkpoint["products"]}
     live_by_id = {p["id"]: p for p in live_products}
 
@@ -378,14 +500,40 @@ def main():
                     help="Restore only this SKU (repeatable)")
     ap.add_argument("--limit", type=int, default=0,
                     help="Touch at most N products (use to rehearse)")
+    ap.add_argument("--force-store", action="store_true",
+                    help="Restore a snapshot whose recorded store/client is "
+                         "not the one being written (or that records none at "
+                         "all, i.e. predates store stamping). Without this a "
+                         "cross-store restore is REFUSED and nothing is "
+                         "written.")
     ap.add_argument("--cookie-file", metavar="PATH")
     ap.add_argument("--cookie", metavar="VALUE")
     ap.add_argument("--user-agent", metavar="UA")
+    client_config.cli_client(ap)
     args = ap.parse_args()
+
+    cfg = None
+    try:
+        cfg = client_config.load_client(args.client)
+    except client_config.ClientConfigError as exc:
+        sys.exit(str(exc))
+    W.CLIENT = cfg
+    # the client's own credentials, overriding a stale shell export - the
+    # snapshot must come from the store this client owns (item 3)
+    W.apply_client_env(cfg)
+    configure(cfg)
+    print(f"Client: {cfg.name} ({cfg.slug})   checkpoints: {CHECKPOINT_DIR}")
 
     if args.action == "list":
         list_checkpoints()
         return
+
+    mismatch = W.store_mismatch(cfg)
+    if mismatch:
+        # every action here either writes (restore) or is a verdict about the
+        # store's contents, so a wrong WC_URL is never harmless
+        print(f"REFUSED: {mismatch}")
+        sys.exit(W.EXIT_REFUSED)
 
     using, dropped = W.configure_session(
         W.read_cookie_arg(args.cookie, args.cookie_file), args.user_agent or "")
@@ -401,6 +549,23 @@ def main():
     print(f"Checkpoint: {path.stem}  "
           f"({checkpoint.get('product_count', '?')} products, "
           f"{checkpoint.get('created_at', '?')})")
+
+    # Which store this snapshot came from, before a single product is read
+    # back: 'latest' can resolve into the unscoped legacy folder, and those
+    # files' store is only recorded inside them.
+    origin = checkpoint_store_mismatch(checkpoint, store.base, cfg)
+    if origin and args.action == "restore" and not args.force_store:
+        print(f"\nREFUSED: {origin}.")
+        print(f"  Nothing was written. Pass --force-store only if you really "
+              f"mean to write this snapshot into that store. "
+              f"Exit code {W.EXIT_REFUSED}.")
+        sys.exit(W.EXIT_REFUSED)
+    if origin:
+        print(f"\n  !! WARNING: {origin}.")
+        if args.action == "diff":
+            print("     This diff compares two different catalogues; every "
+                  "product will look changed.")
+
     print("Reading current store state...")
     live = fetch_all_products(store)
 
@@ -415,7 +580,8 @@ def main():
         sys.exit(f"Not restorable: {', '.join(unknown)}\n"
                  f"Choose from: {', '.join(RESTORABLE)}")
     restore(store, checkpoint, live, fields,
-            {s.strip().upper() for s in args.sku}, args.commit, args.limit)
+            {s.strip().upper() for s in args.sku}, args.commit, args.limit,
+            force_store=args.force_store, client=cfg)
 
 
 if __name__ == "__main__":

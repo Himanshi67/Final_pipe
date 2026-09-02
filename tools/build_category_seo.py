@@ -14,7 +14,13 @@ import sys
 import openpyxl
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, "category_seo.xlsx")
+sys.path.insert(0, ROOT)
+
+import client_config                      # noqa: E402  (after sys.path)
+
+# The sheet belongs to a client, not to the repo root (Phase 1 item 1).
+# `--client <slug>` / $PIPELINE_CLIENT pick which one gets rebuilt.
+OUT = str(client_config.load_client().category_seo)
 
 # parent, sub, tags, focus keyword, supporting keywords
 SEED = [

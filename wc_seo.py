@@ -35,6 +35,11 @@ from pathlib import Path
 
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
 
+# app.py and wc_publish.py both read the client at import time, so --client has
+# to be resolved before either import (argparse has not run yet).
+import client_config                        # noqa: E402
+os.environ["PIPELINE_CLIENT"] = client_config.resolve_slug()
+
 import app                                  # noqa: E402  deterministic SEO text
 import wc_publish as W                      # noqa: E402  session, auth, challenge
 
@@ -327,7 +332,24 @@ def main():
     ap.add_argument("--cookie", metavar="VALUE", help="The Cookie header itself")
     ap.add_argument("--user-agent", metavar="UA",
                     help="Must match the browser the cookie came from")
+    client_config.cli_client(ap)
     args = ap.parse_args()
+    if args.client:
+        # already applied through PIPELINE_CLIENT above; re-applying keeps
+        # app's derived constants right if the env was overridden in between
+        app.configure(args.client)
+        W.CLIENT = app.CLIENT
+    print(f"Client: {app.CLIENT.name} ({app.CLIENT.slug})")
+    # This client's own credentials, overriding a stale shell export, before
+    # anything reads WC_URL (PRODUCT_PLAN Phase 1 item 3).
+    W.apply_client_env(app.CLIENT)
+
+    mismatch = W.store_mismatch(app.CLIENT)
+    if mismatch:
+        # --commit rewrites meta on live products and a dry run reads the same
+        # store, so pointing at the wrong one is never harmless here
+        print(f"REFUSED: {mismatch}")
+        return W.EXIT_REFUSED
 
     using_cookie, dropped = W.configure_session(
         W.read_cookie_arg(args.cookie, args.cookie_file), args.user_agent or "")
@@ -448,7 +470,8 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        # main() returns None on success, W.EXIT_REFUSED when a guard refused
+        sys.exit(main() or W.EXIT_OK)
     except W.ChallengeError as exc:
         sys.exit(str(exc))
     except RuntimeError as exc:

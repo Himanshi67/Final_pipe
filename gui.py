@@ -18,7 +18,9 @@ Existing scripts are not modified; app.py remains usable on its own.
 """
 
 import contextlib
+import csv as csv_module
 import ctypes
+import getpass
 import hashlib
 import io
 import json
@@ -36,7 +38,15 @@ import openpyxl
 import pandas as pd
 import streamlit as st
 
-from gui_helpers import (BADGE, batch_summary, card_queue_index, classify,
+import client_config
+from client_config import (DEFAULT_CLIENT, ClientConfigError,
+                           available_clients, broken_clients,
+                           load_client, load_env,
+                           resolve_slug, same_store, store_host)
+from gui_helpers import (BADGE, append_events, assemble_pack, batch_summary,
+                         card_queue_index, classify, configure_sku_codes,
+                         clock_elapsed, confirmed_from_state,
+                         coverage_summary,
                          csv_signature, eligible_rows, eta_text,
                          filter_review_df, flag_value, found_status,
                          image_basenames_from_csv, limit_from_flags,
@@ -44,8 +54,11 @@ from gui_helpers import (BADGE, batch_summary, card_queue_index, classify,
                          parse_enricher_log,
                          parse_image_urls, parse_publish_output,
                          parse_specs_cell, raw_sku_for_csv_sku,
+                         render_batch_readme,
+                         review_caption, review_event, review_metrics,
+                         row_fingerprint,
                          run_stage, sanity_issues, select_build_rows,
-                         sheet_combos)
+                         sheet_combos, stale_confirmations)
 
 REPO_ROOT = Path(__file__).parent
 VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
@@ -83,6 +96,160 @@ _SKU_HEADER_LOOKUP = None
 STILL_ACTIVE = 259
 
 
+# ------------------------------------------------------------------ client --
+# One GUI process serves every client, so the selected slug lives in
+# session_state, never in this module. It IS mirrored into os.environ,
+# because that is how app.py / validate_csv.py pick their client up at import
+# time and how every subprocess (sku_enricher.py, wc_publish.py) is told.
+# See docs/CLIENT_CONFIG.md.
+
+CLIENT_KEY = "client_slug"
+_CFG_KEY = "_client_cfg"
+# the slug the selector last OFFERED (so a load failure names the config the
+# operator just picked, not the previous one) and a slug that was resolved
+# but is not selectable, kept across the rerun so the warning survives it
+ATTEMPT_KEY = "_client_attempt"
+IGNORED_KEY = "_client_ignored"
+
+
+def default_slug() -> str:
+    """The slug the selector starts on: $PIPELINE_CLIENT, else DEFAULT_CLIENT.
+
+    argv is deliberately EMPTY - under `streamlit run gui.py` sys.argv holds
+    Streamlit's own arguments, and a stray `--client` there would be
+    Streamlit's, not ours."""
+    return resolve_slug(argv=[])
+
+
+def current_client():
+    """The ClientConfig for the slug the sidebar selector holds.
+
+    Cached in session_state so a re-render does not re-parse client.toml, and
+    os.environ is refreshed on every call: a lazily-imported `import app`
+    deeper in a step must see the right client even if the selector moved in
+    an earlier rerun."""
+    slug = st.session_state.get(CLIENT_KEY) or default_slug()
+    st.session_state[CLIENT_KEY] = slug
+    os.environ[client_config.ENV_VAR] = slug
+    cached = st.session_state.get(_CFG_KEY)
+    if cached is not None and cached.slug == slug:
+        return cached
+    cfg = load_client(slug)
+    st.session_state[_CFG_KEY] = cfg
+    return cfg
+
+
+def switch_client(slug: str):
+    """Point the whole process at another client and rerun.
+
+    Order matters: the environment goes first, so any module imported AFTER
+    this point boots on the new client by itself; the two modules that may
+    already be imported are reconfigured explicitly (they hold the taxonomy
+    and the media base as module state); gui_helpers' SKU codes are rebound;
+    and the category dropdown cache is dropped because it is keyed by slug
+    but its underlying `app` module is a singleton."""
+    cfg = load_client(slug)                      # raises before anything moves
+    os.environ[client_config.ENV_VAR] = slug
+    st.session_state[CLIENT_KEY] = slug
+    st.session_state[_CFG_KEY] = cfg
+    configure_sku_codes(cfg.sku.prefixes)
+    for name in ("app", "validate_csv"):
+        module = sys.modules.get(name)
+        # not imported yet = nothing to reconfigure; the env above is what
+        # its import-time constants will read.
+        if module is not None and hasattr(module, "configure"):
+            module.configure(slug)
+    with contextlib.suppress(Exception):
+        category_options.clear()
+    return cfg
+
+
+def client_selector():
+    """Sidebar Client selectbox, above the run selector. Returns the config.
+
+    A failure here is fatal for the page (no taxonomy, no store URL), so it
+    is reported as an error rather than a traceback."""
+    slugs = available_clients() or [DEFAULT_CLIENT]
+    current = st.session_state.get(CLIENT_KEY) or default_slug()
+    if current not in slugs:
+        # a typo in $PIPELINE_CLIENT used to select slugs[0] in silence -
+        # i.e. somebody ELSE's store, whichever one sorts first - and then
+        # switch_client() to it. The CLI refuses the same typo loudly; so
+        # does this, and the fallback is the DEFAULT client, never [0].
+        st.session_state[IGNORED_KEY] = current
+        current = DEFAULT_CLIENT if DEFAULT_CLIENT in slugs else slugs[0]
+    ignored = st.session_state.get(IGNORED_KEY)
+    if ignored and ignored not in slugs:
+        st.sidebar.warning(
+            f"Unknown client '{ignored}' ignored (${client_config.ENV_VAR} "
+            f"or a stale selection) — using '{current}'.")
+    else:
+        st.session_state.pop(IGNORED_KEY, None)
+    # a client.toml that exists but does not load is not offered at all
+    # (available_clients filters it out), so say why it is missing
+    broken = broken_clients()
+    if broken:
+        st.sidebar.caption(
+            "Not selectable, client.toml does not load: "
+            + "; ".join(f"{slug} ({why})" for slug, why in broken.items()))
+    index = slugs.index(current)
+    chosen = st.sidebar.selectbox(
+        "Client", slugs, index=index, key="client_picker",
+        help="Which store this session builds for — its taxonomy, media "
+             "base, SKU prefixes, credentials and credit ledger all come "
+             "from clients\\<slug>\\.")
+    st.session_state[ATTEMPT_KEY] = chosen
+    if chosen != st.session_state.get(CLIENT_KEY):
+        switch_client(chosen)
+        st.rerun()
+    return current_client()
+
+
+def client_env(cfg) -> dict:
+    """clients/<slug>/.env as a dict; {} (loudly) when it is malformed.
+
+    The GUI never injects it into its OWN os.environ - one process serves
+    every client, so a stray WC_SECRET would outlive the selector. It reads
+    the file for the credential presence check and the store-URL guard;
+    every subprocess loads the same file itself (client_config.apply_env)."""
+    try:
+        return load_env(cfg)
+    except ClientConfigError as exc:
+        st.error(f"clients\\{cfg.slug}\\.env could not be read: {exc}")
+        return {}
+
+
+def run_client_slug(run_dir: Path) -> str:
+    """Which client owns a run. A run created before the selector existed has
+    no `client` key in run_meta.json and belongs to DEFAULT_CLIENT."""
+    meta = load_json(run_paths(run_dir)["meta"])
+    return str(meta.get("client") or "").strip() or DEFAULT_CLIENT
+
+
+def guard_run_client(run_dir: Path, cfg) -> bool:
+    """True when this run may be opened under `cfg`; else render the refusal.
+
+    A run is never re-homed: its CSV, its downloaded images and the taxonomy
+    its categories were snapped to all belong to the client that created it,
+    so opening it under another one would publish one store's catalogue to
+    another. A legacy run is STAMPED with its implied owner on first open, so
+    the next operator cannot claim it by switching the selector."""
+    owner = run_client_slug(run_dir)
+    if owner != cfg.slug:
+        st.error(
+            f"Run `{run_dir.name}` belongs to client `{owner}`, but the "
+            f"sidebar is set to `{cfg.slug}`. Switch the Client selector back "
+            f"to `{owner}` to open it — a run keeps the taxonomy, images and "
+            "store it was built for.")
+        return False
+    meta_path = run_paths(run_dir)["meta"]
+    meta = load_json(meta_path)
+    if not str(meta.get("client") or "").strip():
+        meta["client"] = owner
+        save_json(meta_path, meta)
+    return True
+
+
 # ---------------------------------------------------------------- run files --
 
 def run_paths(run_dir: Path) -> dict:
@@ -102,6 +269,7 @@ def run_paths(run_dir: Path) -> dict:
         "csv": run_dir / "wordpress_ready.csv",
         "issues": run_dir / "validation_issues.csv",
         "review": run_dir / "review_state.json",
+        "metrics": run_dir / "review_metrics.json",
         "meta": run_dir / "run_meta.json",
     }
 
@@ -131,15 +299,156 @@ def update_meta(P, **kv):
 
 
 def confirmed_set(P) -> set:
-    state = load_json(P["review"])
-    return {sku for sku, ok in state.get("confirmed", {}).items() if ok}
+    return confirmed_from_state(load_json(P["review"]))
 
 
-def save_confirmed(P, skus: dict):
+def save_confirmed(P, skus: dict, df=None):
+    """Persist the tick map as {sku: {"confirmed": bool, "fp": <sha1>}}.
+
+    `df` is the sheet as it stands AFTER the edits being saved (P3-53): the
+    fingerprint has to describe the row the reviewer just approved, so a
+    later --retry-incomplete rewriting that row invalidates the tick. Rows
+    absent from `df` keep whatever fingerprint they already had - the card
+    view hands in a single-row frame, and that must not blank the rest."""
     state = load_json(P["review"])
-    state["confirmed"] = skus
+    old = state.get("confirmed", {})
+    fps = {}
+    if df is not None and "sku" in getattr(df, "columns", []):
+        for _, row in df.iterrows():
+            fps.setdefault(str(row["sku"]), row_fingerprint(row))
+    out = {}
+    for sku, ok in skus.items():
+        sku = str(sku)
+        prev = old.get(sku)
+        fp = fps.get(sku, prev.get("fp") if isinstance(prev, dict) else None)
+        out[sku] = {"confirmed": bool(ok), "fp": fp}
+    state["confirmed"] = out
     state["updated"] = datetime.now().isoformat(timespec="seconds")
     save_json(P["review"], state)
+
+
+def reconcile_confirmations(P, df) -> int:
+    """Drop tick marks whose row has been re-enriched since (P3-53).
+
+    'Re-enrich incomplete rows' rewrites title/prices/image_url/status of
+    exactly the suffixed-FOUND bucket a reviewer is most likely to have
+    ticked, and dropped_images is matched by exact URL - so a stale tick
+    builds re-scraped data nobody looked at, rejected images included.
+    Returns how many ticks were dropped."""
+    state = load_json(P["review"])
+    stale = stale_confirmations(state, df)
+    if not stale:
+        return 0
+    conf = state.get("confirmed", {})
+    for sku in stale:
+        conf.pop(sku, None)
+    state["confirmed"] = conf
+    state["updated"] = datetime.now().isoformat(timespec="seconds")
+    save_json(P["review"], state)
+    return len(stale)
+
+
+REVIEW_CLOCK = "review_clock_{run}"
+CARD_SHOWN = "card_shown_{run}"
+
+
+def log_table_save(P, touched, before, flags):
+    """Log one save from the review TABLE.
+
+    `touched` is write_edits_back_detail's {sku: {col: value}}: a row whose
+    url_link changed counts as 'url_pasted' (that is the NEEDS LINK
+    remediation, not a cosmetic edit), any other changed column as 'edit'.
+    A confirmed flag that flipped adds 'approve'/'unapprove'. One save can
+    only be timed as a whole, so its elapsed seconds are split EQUALLY over
+    every event it logs - guessing per-row would be fiction."""
+    events = []
+    for sku, cols in (touched or {}).items():
+        action = "url_pasted" if "url_link" in cols else "edit"
+        events.append((str(sku), action))
+    for sku, ok in (flags or {}).items():
+        sku = str(sku)
+        was = sku in (before or set())
+        if bool(ok) and not was:
+            events.append((sku, "approve"))
+        elif was and not bool(ok):
+            events.append((sku, "unapprove"))
+    if not events:
+        return 0
+    elapsed = clock_elapsed(st.session_state,
+                            REVIEW_CLOCK.format(run=P["run"].name),
+                            time.time())
+    each = elapsed / len(events)
+    return log_review_events(
+        P, [review_event(sku, action, "table", each)
+            for sku, action in events])
+
+
+def review_clock_start(P):
+    """Start Step 2's stopwatch the first time it renders in this session.
+
+    Everything after that is measured from the LAST logged event, so the
+    idle time before a reviewer opened the page is never billed to a SKU."""
+    key = REVIEW_CLOCK.format(run=P["run"].name)
+    if key not in st.session_state:
+        st.session_state[key] = time.time()
+    return key
+
+
+def refresh_review_metrics(P, df) -> bool:
+    """Recompute review_metrics.json from the event log + the sheet AS IT
+    NOW STANDS. Returns True when the file changed.
+
+    log_review_events() is the only other writer, so between two review
+    saves the file could go stale: 'Re-enrich incomplete rows' rewrites
+    statuses, which moves needs_human_pct, and the archive README and the
+    enricher report both read the file. Step 2 calls this on load, so
+    re-opening the review is enough to make it true again.
+
+    It never CREATES the file for a run nobody has reviewed - a zeroed
+    metrics file would make review_caption() print '0 min' where today it
+    prints nothing at all."""
+    try:
+        state = load_json(P["review"])
+        if not (state or {}).get("events") and not P["metrics"].exists():
+            return False
+        fresh = review_metrics(state, df)
+        if load_json(P["metrics"]) == fresh:
+            return False
+        save_json(P["metrics"], fresh)
+        return True
+    except Exception:
+        # instrumentation must never be able to break opening a review
+        return False
+
+
+def log_review_events(P, events):
+    """Append review events to review_state.json and refresh review_metrics.
+
+    The clocks restart here, on the write, so the next event measures from
+    the moment this one landed (Phase 1 item 5). Metrics are recomputed from
+    the WHOLE event log plus the sheet as it now stands, so the file is
+    always a complete picture and never an increment that can drift."""
+    events = [e for e in (events or []) if e]
+    if not events:
+        return 0
+    state = load_json(P["review"])
+    append_events(state, events)
+    state["updated"] = datetime.now().isoformat(timespec="seconds")
+    save_json(P["review"], state)
+    now = time.time()
+    st.session_state[REVIEW_CLOCK.format(run=P["run"].name)] = now
+    st.session_state[CARD_SHOWN.format(run=P["run"].name)] = now
+    try:
+        save_json(P["metrics"], review_metrics(state, load_filled_df(P)))
+    except Exception:
+        # instrumentation must never be able to break a save
+        pass
+    return len(events)
+
+
+STALE_TICK_MSG = ("{n} confirmation(s) dropped: those rows were re-enriched "
+                  "since they were ticked - review them again (rejected "
+                  "images may have returned).")
 
 
 def count_skus(path: Path) -> int:
@@ -269,8 +578,15 @@ def start_enricher(P, extra_flags: list, total: int):
     # `enricher_total` is how many rows THIS launch will actually touch and is
     # the only value the progress bar and the ETA may divide by.
     eligible = eligible_total(P, extra_flags, total)
-    cmd = [str(VENV_PY), "sku_enricher.py", str(P["input"])] + extra_flags
+    # --client on the command line AND PIPELINE_CLIENT in the env: the flag is
+    # what shows up in enricher_cmd and the report header, the env var is what
+    # anything the child imports lazily reads. They can never disagree - both
+    # come from the run's own slug, not from this process's ambient env.
+    slug = run_client_slug(P["run"])
+    cmd = ([str(VENV_PY), "sku_enricher.py", str(P["input"]),
+            "--client", slug] + extra_flags)
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    env[client_config.ENV_VAR] = slug
     with open(P["log"], "w", encoding="utf-8") as log_f:
         proc = subprocess.Popen(
             cmd, stdout=log_f, stderr=subprocess.STDOUT,
@@ -291,8 +607,22 @@ def cancel_enricher(P):
     the row's current sleep/request to return, hence the 15 s grace before the
     hard kill (safe either way: saves are atomic)."""
     proc = st.session_state.get(f"proc_{P['run'].name}")
-    pid = proc.pid if proc is not None else load_meta(P).get("enricher_pid")
+    meta = load_meta(P)
+    # P3-51: every liveness check here carries the launch timestamp, so
+    # pid_alive compares process CREATION TIME and not just "a live pid whose
+    # image name contains python". Without it a stale enricher_pid (GUI
+    # reloaded, second tab, restarted mid-batch) could match a recycled pid
+    # and Stop would CTRL_BREAK + taskkill /T /F an unrelated python - another
+    # Streamlit, a build_csv.py run. When the identity check fails we signal
+    # NOTHING and just clear the stale pid. With a live `proc` handle the
+    # timestamp came from that same launch, so it stays truthful.
+    started = meta.get("enricher_started")
+    pid = proc.pid if proc is not None else meta.get("enricher_pid")
     if not pid:
+        return
+    if not pid_alive(pid, started):
+        update_meta(P, enricher_pid=None)
+        st.session_state[f"running_{P['run'].name}"] = False
         return
     try:
         os.kill(pid, signal.CTRL_BREAK_EVENT)
@@ -305,10 +635,10 @@ def cancel_enricher(P):
         except subprocess.TimeoutExpired:
             pass
     else:
-        while deadline > 0 and pid_alive(pid):
+        while deadline > 0 and pid_alive(pid, started):
             time.sleep(1)
             deadline -= 1
-    if pid_alive(pid):
+    if pid_alive(pid, started):
         subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                        capture_output=True)
     update_meta(P, enricher_pid=None)
@@ -326,10 +656,29 @@ def tail_text(path: Path, max_bytes=20000) -> str:
         return ""
 
 
+def serper_caption(cfg, run_calls: int) -> str:
+    """`Serper: N this run · M/BUDGET this month`, from the credit ledger.
+
+    clients/<slug>/credits.json is written by sku_enricher.Ledger (item 4 of
+    docs/CLIENT_CONFIG.md). It is absent until the first real run, which is
+    the normal state of a fresh client - say so rather than showing 0/2500 as
+    if the month had been measured. A corrupt/half-written file reads the same
+    way: the panel is never the place a JSONDecodeError surfaces."""
+    text = f"Serper: {int(run_calls or 0)} this run"
+    try:
+        data = json.loads(Path(cfg.credits_file).read_text(encoding="utf-8"))
+        month_to_date = int(data.get("serper_calls") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return text + " · no ledger yet"
+    return (text + f" · {month_to_date}/{cfg.serper.monthly_budget} "
+            "this month")
+
+
 def enricher_panel(P):
     """Live progress while the enricher subprocess runs. A fragment so only
     this panel re-renders every 2 s, not the whole page."""
     run_key = f"running_{P['run'].name}"
+    cfg = current_client()
 
     @st.fragment(run_every=2.0)
     def _panel():
@@ -351,9 +700,7 @@ def enricher_panel(P):
         if stats["buckets"]:
             bits.append("  ".join(f"{BADGE[b]} {n}" for b, n in
                                   sorted(stats["buckets"].items())))
-        if stats["serper_calls"]:
-            bits.append(f"{stats['serper_calls']} serper call(s) — free "
-                        "tier 2,500/mo")
+        bits.append(serper_caption(cfg, stats["serper_calls"]))
         replays = stats["cached_searches"] + stats["cached_pages"]
         if replays:
             bits.append(f"{replays} cache replay(s)")
@@ -363,6 +710,10 @@ def enricher_panel(P):
             bits.append(eta)
         if bits:
             st.caption("  ·  ".join(bits))
+        if stats.get("stopped_by_budget"):
+            # exit code 0 and a saved sheet, so nothing else says UNFINISHED
+            st.warning("Stopped at the credit budget — progress saved; raise "
+                       "the budget and re-run to continue.")
         lines = [ln for ln in full.splitlines() if ln.strip()][-25:]
         st.code("\n".join(lines) or "waiting for first output…",
                 language=None)
@@ -380,6 +731,7 @@ def enricher_panel(P):
 # ------------------------------------------------------------------- step 1 --
 
 def step_enrich(P):
+    cfg = current_client()
     st.header("1 · Upload & Enrich")
 
     if not P["input"].exists():
@@ -473,6 +825,12 @@ def step_enrich(P):
         d1, d2 = st.columns(2)
         delay_min = d1.number_input("Delay min (s)", 0.0, 60.0, 3.0)
         delay_max = d2.number_input("Delay max (s)", 0.0, 60.0, 7.0)
+        budget = st.number_input(
+            "Serper credit budget for this run (0 = unlimited)",
+            0, 100000, int(cfg.serper.default_run_budget),
+            help="A hard stop, not a warning: the enricher saves and exits "
+                 "cleanly the moment it has spent this many search credits. "
+                 "Pre-filled from this client's [serper] default_run_budget.")
         with st.expander("Advanced"):
             js = st.checkbox("--js-fallback (headless browser for blocked "
                              "pages; slow)")
@@ -499,11 +857,17 @@ def step_enrich(P):
             flags += ["--min-images", str(int(min_images))]
         if force:
             flags += ["--force"]
+        if budget:
+            # stored in enricher_flags like every other flag, so the Step-2
+            # retry buttons (which reuse base_flags) inherit the same cap
+            flags += ["--budget", str(int(budget))]
         start_enricher(P, flags, total)
         st.rerun()
 
-    if not os.environ.get("SERPER_API_KEY"):
-        st.warning("SERPER_API_KEY is not set — search falls back to "
+    key_env = cfg.serper.api_key_env
+    if not (os.environ.get(key_env) or client_env(cfg).get(key_env)):
+        st.warning(f"{key_env} is set neither in the environment nor in "
+                   f"clients\\{cfg.slug}\\.env — search falls back to "
                    "DuckDuckGo (worse results).")
 
 
@@ -535,11 +899,19 @@ def load_filled_df(P) -> pd.DataFrame:
 
 
 @st.cache_resource
-def category_options() -> list:
-    """Exact category strings from category_map.xlsx, via the same loader
-    app.py snaps against - so anything picked here is a legal snap target."""
+def category_options(slug: str) -> list:
+    """Exact category strings from this client's category_map.xlsx, via the
+    same loader app.py snaps against - so anything picked here is a legal
+    snap target.
+
+    Keyed by slug because the cache outlives a client switch, while `app` is
+    a singleton: the entry for slug X must never be served from an `app` that
+    is currently configured for Y, hence the configure() below."""
     os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ[client_config.ENV_VAR] = slug
     import app
+    if getattr(getattr(app, "CLIENT", None), "slug", slug) != slug:
+        app.configure(slug)
     return sorted(set(app.CATEGORY_COMBOS.values()))
 
 
@@ -585,7 +957,19 @@ def review_editor(df: pd.DataFrame, key: str,
 
 def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
     """Write ONLY changed editable cells back into input_filled.xlsx, matched
-    by SKU, preserving everything else the enricher wrote."""
+    by SKU, preserving everything else the enricher wrote. Returns the number
+    of cells written; write_edits_back_detail also says which SKUs."""
+    return write_edits_back_detail(P, original, edited_parts)[0]
+
+
+def write_edits_back_detail(P, original: pd.DataFrame,
+                            edited_parts: list) -> tuple:
+    """write_edits_back, plus the map of what actually changed.
+
+    Returns (cells_written, {sku: {column: new value}}) covering only the
+    rows the sheet really holds - the review instrumentation needs to know
+    WHICH SKUs a save touched (and whether url_link was one of the columns)
+    to log an event per row, and a count cannot tell it that."""
     edits = {}
     orig_by_sku = original.set_index(original["sku"].astype(str))
     orig_by_sku = orig_by_sku[~orig_by_sku.index.duplicated(keep="first")]
@@ -604,7 +988,7 @@ def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
                 if (pd.isna(new) != pd.isna(old)) or str(new) != str(old):
                     edits.setdefault(sku, {})[col] = None if pd.isna(new) else new
     if not edits:
-        return 0
+        return 0, {}
 
     wb = openpyxl.load_workbook(P["filled"])
     ws = wb.active
@@ -622,15 +1006,17 @@ def write_edits_back(P, original: pd.DataFrame, edited_parts: list) -> int:
         ws.cell(row=1, column=new_c, value=col)
         headers[col] = new_c
     changed = 0
+    written = {}
     for r in range(2, ws.max_row + 1):
         sku = str(ws.cell(row=r, column=sku_c).value or "").strip()
         if sku in edits:
             for col, val in edits[sku].items():
                 if col in headers:
                     ws.cell(row=r, column=headers[col], value=val)
+                    written.setdefault(sku, {})[col] = val
                     changed += 1
     wb.save(P["filled"])
-    return changed
+    return changed, written
 
 
 def validator_flags(P, raw_sku: str, all_raws=None) -> str:
@@ -679,6 +1065,17 @@ def card_review(P, df, cat_opts, all_raws=None):
     st.session_state[ikey] = i
     row = queue.iloc[i]
     sku = str(row["sku"])
+
+    # the per-card stopwatch: restamped whenever a different card comes up
+    # (and by log_review_events after every save), so `secs` is the time
+    # this card was actually on screen, never the whole session
+    shown_key = CARD_SHOWN.format(run=run)
+    if st.session_state.get(f"card_shown_i_{run}") != i             or shown_key not in st.session_state:
+        st.session_state[shown_key] = time.time()
+        st.session_state[f"card_shown_i_{run}"] = i
+
+    def card_secs():
+        return clock_elapsed(st.session_state, shown_key, time.time())
 
     def goto(j):
         st.session_state[ikey] = max(0, min(j, len(queue) - 1))
@@ -736,7 +1133,7 @@ def card_review(P, df, cat_opts, all_raws=None):
         return pd.to_numeric(str(s).replace(",", "").replace("₹", "")
                              .strip(), errors="coerce")
 
-    def save(confirm):
+    def save(confirm, action="edit"):
         part = pd.DataFrame([{
             "sku": sku,
             "confirmed": bool(row["confirmed"]) if confirm is None
@@ -752,15 +1149,27 @@ def card_review(P, df, cat_opts, all_raws=None):
                 u for u in urls if not keeps.get(u, True)),
         }])
         try:
-            write_edits_back(P, df, [part])
+            _, touched = write_edits_back_detail(P, df, [part])
         except PermissionError:
             st.error("The filled .xlsx is open in Excel — close it and "
                      "retry.")
             return False
+        # one primary event carries the card's time; the extras describe
+        # what else the reviewer did to this row and carry 0 s, so a single
+        # card can never bill its minutes twice
+        cols = set(touched.get(sku, {}))
+        events = [review_event(sku, action, "card", card_secs())]
+        if "dropped_images" in cols:
+            events.append(review_event(sku, "drop_image", "card", 0.0))
+        if action != "edit" and (cols - {"dropped_images"}):
+            events.append(review_event(sku, "edit", "card", 0.0))
+        log_review_events(P, events)
         if confirm is not None:
             flags = {s: True for s in confirmed_set(P)}
             flags[sku] = bool(confirm)
-            save_confirmed(P, flags)
+            # `part` holds this row exactly as it was just written back, so
+            # the fingerprint describes what the reviewer approved (P3-53)
+            save_confirmed(P, flags, part)
         return True
 
     b1, b2, b3, b4 = st.columns(4)
@@ -772,7 +1181,7 @@ def card_review(P, df, cat_opts, all_raws=None):
                  help=None if can_approve else "Approve needs a FOUND row — "
                  "paste or fix the URL and press Crawl all info first.",
                  key=f"ap_{run}_{sku}"):
-        if save(True):
+        if save(True, "approve"):
             # the queue sorts unconfirmed rows first, so an approved row
             # leaves position i and the next unconfirmed card slides into
             # it - advancing here would skip that card (P1-9). A row that
@@ -785,6 +1194,8 @@ def card_review(P, df, cat_opts, all_raws=None):
         if save(None):
             goto(i + 1)
     if b3.button("→ Skip", key=f"sk_{run}_{sku}"):
+        # a skipped card still cost the reviewer the time it was on screen
+        log_review_events(P, [review_event(sku, "skip", "card", card_secs())])
         goto(i + 1)
     if b4.button("← Back", disabled=i == 0, key=f"bk_{run}_{sku}"):
         goto(i - 1)
@@ -801,6 +1212,10 @@ def step_review(P):
         return
 
     df = load_filled_df(P)
+    stale = reconcile_confirmations(P, df)
+    # the sheet may have been re-enriched since the last review save, which
+    # moves needs_human_pct - recompute before the caption reads the file
+    refresh_review_metrics(P, df)
     conf = confirmed_set(P)
     df["confirmed"] = df["sku"].astype(str).isin(conf)
     df["_bucket"] = df["status"].map(classify)
@@ -814,10 +1229,20 @@ def step_review(P):
     m4.metric("🔴 No link / failed", int(n.get("failed", 0)))
     m5.metric("✔ Confirmed", int(df["confirmed"].sum()))
 
+    # Step 2's stopwatch starts on the first render of this session; the
+    # caption below is what the last save measured (Phase 1 item 5)
+    review_clock_start(P)
+    cap = review_caption(load_json(P["metrics"]))
+    if cap:
+        st.caption(cap)
+
     # the Save handler reruns immediately, so its outcome is reported here
     for kind, text in st.session_state.pop(
             f"review_msg_{P['run'].name}", []):
         (st.warning if kind == "warning" else st.success)(text)
+
+    if stale:
+        st.warning(STALE_TICK_MSG.format(n=stale))
 
     probs = sanity_issues(
         df, min_price=flag_value(load_meta(P).get("enricher_flags", []),
@@ -840,7 +1265,7 @@ def step_review(P):
     # a SelectboxColumn renders a cell as blank if its current value is not
     # in options - union in whatever the sheet already holds so nothing
     # displays empty
-    cat_opts = category_options()
+    cat_opts = category_options(current_client().slug)
     cat_opts = cat_opts + sorted(
         set(df["categories"].astype(str).str.strip()) - set(cat_opts) - {""})
     if len(fdf) < len(df):
@@ -914,7 +1339,9 @@ def step_review(P):
         """Save the merged ✔ map, then stash the outcome and rerun. The rerun
         throws the page away, so anything printed here would never be seen -
         step_review pops these messages at the top of the next run."""
-        save_confirmed(P, flags)
+        # re-read: write_edits_back has just landed this render's edits, and
+        # the fingerprints stored beside the ticks must describe THAT sheet
+        save_confirmed(P, flags, load_filled_df(P))
         head = "" if changed is None else f"Saved — {changed} cell(s) " \
                                           "updated, "
         msgs = [("success", f"{head}{sum(flags.values())} row(s) confirmed.")]
@@ -930,13 +1357,15 @@ def step_review(P):
 
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
+        before_conf = confirmed_set(P)
         try:
-            changed = write_edits_back(P, df, ordered)
+            changed, touched = write_edits_back_detail(P, df, ordered)
         except PermissionError:
             st.error("The filled .xlsx is open in Excel — close it and save "
                      "again.")
             return
-        flags, rejected = merge_confirm_flags(confirmed_set(P), df, ordered)
+        flags, rejected = merge_confirm_flags(before_conf, df, ordered)
+        log_table_save(P, touched, before_conf, flags)
         persist_flags(flags, rejected, changed)
 
     if b2.button("✅ Confirm all clean FOUND"):
@@ -1093,6 +1522,12 @@ def step_build(P):
 
     df = pd.read_excel(P["filled"])
     df = app.filter_active_inventory_rows(df)
+    # P3-53: the sheet may have been re-enriched since Step 2 was last open,
+    # so drop any tick whose row changed BEFORE the scope is applied
+    n_stale = reconcile_confirmations(P, df)
+    if n_stale:
+        st.warning(STALE_TICK_MSG.format(n=n_stale))
+        conf = confirmed_set(P)
     df, skipped = select_build_rows(df, scope, conf)
     if skipped:
         st.warning(f"{len(skipped)} confirmed row(s) skipped — not FOUND "
@@ -1103,7 +1538,11 @@ def step_build(P):
         return
 
     folder = month.strip().strip("/") or f"{datetime.now():%Y/%m}"
-    media_base = f"https://shreejeeelectronics.in/wp-content/uploads/{folder}"
+    # the store this client publishes to, from the very config app.py was
+    # configured with - never a literal, or a second client's images would be
+    # written under the first one's domain (docs/CLIENT_CONFIG.md item 1)
+    media_base = (getattr(app, "CLIENT", None)
+                  or current_client()).media_base(folder)
 
     buf = io.StringIO()
     with st.spinner(f"Building CSV for {len(df)} product(s) — images are "
@@ -1112,7 +1551,17 @@ def step_build(P):
             result = app.process_inventory(df, media_base=media_base,
                                            estimate_mrp=estimate_mrp,
                                            seo=seo, seo_plugin=seo_plugin)
-        result.to_csv(P["csv"], index=False, quoting=1)
+        try:
+            result.to_csv(P["csv"], index=False, quoting=1)
+        except PermissionError:
+            # P3-50: the build has already downloaded every image by now, but
+            # nothing is recorded - no update_meta, so the run stays at its
+            # previous stage and Build is simply pressed again once the file
+            # is closed (a re-run reuses the .webp files on disk).
+            st.error(f"Could not write {P['csv'].name}: it is open in "
+                     "another program (Excel?). Close it and press Build "
+                     "again.")
+            return
 
     with_images = int((result["Images"].map(app.compact) != "").sum())
     st.success(f"Wrote **{P['csv'].name}** — {len(result)} product(s), "
@@ -1148,10 +1597,18 @@ def step_build(P):
     import validate_csv
     vdf = pd.read_csv(P["csv"], dtype=str).fillna("")
     vbuf = io.StringIO()
-    with st.spinner("Validating the new CSV…"):
-        with contextlib.redirect_stdout(vbuf):
-            v_issues = validate_csv.validate_export(
-                vdf, str(P["csv"]), check_images=True)
+    try:
+        with st.spinner("Validating the new CSV…"):
+            with contextlib.redirect_stdout(vbuf):
+                v_issues = validate_csv.validate_export(
+                    vdf, str(P["csv"]), check_images=True)
+    except PermissionError:
+        # same as above, one file along: validate_export writes the issues
+        # report next to the CSV. Return before update_meta - a run whose
+        # validation never ran must not be stamped validated.
+        st.error(f"Could not write {P['issues'].name}: it is open in "
+                 "another program (Excel?). Close it and press Build again.")
+        return
     update_meta(P, validated=True, issue_count=len(v_issues),
                 built_scope=scope,
                 built_skus=[str(s) for s in result["sku"].tolist()])
@@ -1237,9 +1694,63 @@ def step_validate(P):
 
 # ------------------------------------------------------------------- step 5 --
 
+# Mirrors wc_publish.EXIT_BLOCKED / EXIT_REFUSED. Duplicated rather than
+# imported so this module never has to import wc_publish (which reads store
+# credentials at import time). If either constant moves, these must follow.
+PUBLISH_EXIT_BLOCKED = 3        # an edge challenge; later chunks are pointless
+PUBLISH_EXIT_REFUSED = 4        # a guard tripped and NOTHING was written
+
+
+def signoff_path(P) -> Path:
+    """review_signoff.csv sits NEXT TO the CSV, because that is where
+    wc_publish.py looks for it (docs/CLIENT_CONFIG.md item 3.4)."""
+    return P["csv"].parent / "review_signoff.csv"
+
+
+def write_review_signoff(P, skus) -> Path:
+    """Record who signed off which SKUs, for `--commit --status publish`.
+
+    Overwritten on every arming, never appended: the file must describe THIS
+    commit's scope, and a stale row from an earlier, wider batch would let a
+    SKU nobody looked at go live. Reviewer is the Windows account name - the
+    point is attribution, not authentication."""
+    reviewer = os.environ.get("USERNAME") or getpass.getuser()
+    signed_at = datetime.now().isoformat(timespec="seconds")
+    path = signoff_path(P)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv_module.writer(fh)
+        writer.writerow(["sku", "reviewer", "signed_at"])
+        for sku in sorted(skus):
+            writer.writerow([sku, reviewer, signed_at])
+    return path
+
+
+def unconfirmed_publish_skus(P, publish_skus) -> list:
+    """CSV SKUs with no human tick behind them, in CSV order.
+
+    Step 2 confirms the enricher's RAW sku while the CSV carries
+    app.prefixed_sku's form, so the two are matched through
+    gui_helpers.raw_sku_for_csv_sku; a CSV sku that maps back to nothing has
+    no tick by definition and counts as unconfirmed."""
+    confirmed = confirmed_set(P)
+    try:
+        raws = load_filled_df(P)["sku"].astype(str).tolist()
+    except Exception:
+        raws = []
+    out = []
+    for sku in publish_skus:
+        raw = raw_sku_for_csv_sku(sku, raws)
+        if raw is None or raw not in confirmed:
+            out.append(sku)
+    return out
+
+
 def run_publish(P, extra: list) -> tuple:
-    cmd = [str(VENV_PY), "wc_publish.py", str(P["csv"])] + extra
+    slug = run_client_slug(P["run"])
+    cmd = ([str(VENV_PY), "wc_publish.py", str(P["csv"]),
+            "--client", slug] + extra)
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    env[client_config.ENV_VAR] = slug
     res = subprocess.run(cmd, cwd=str(REPO_ROOT), env=env,
                          capture_output=True, text=True, encoding="utf-8",
                          errors="replace", timeout=3600)
@@ -1261,12 +1772,44 @@ def step_publish(P):
             f"Proceed despite {meta['issue_count']} validation issue(s)"):
         st.stop()
 
+    cfg = current_client()
+    # What wc_publish.py will actually see: client_config.apply_env OVERRIDES
+    # the ambient process env with clients/<slug>/.env, so the client's own
+    # file wins here too. The GUI only READS it - injecting a second client's
+    # WC_SECRET into this long-lived process is exactly the leak item 3 is
+    # about.
+    env = dict(os.environ) | client_env(cfg)
     missing = [v for v in ("WC_URL", "WC_KEY", "WC_SECRET")
-               if not os.environ.get(v)]
+               if not env.get(v)]
     if missing:
-        st.error(f"Missing credentials in environment: {', '.join(missing)}. "
-                 "Set them, then restart the app from that shell.")
+        st.error(f"Missing credentials for client `{cfg.slug}`: "
+                 f"{', '.join(missing)}. Put them in "
+                 f"clients\\{cfg.slug}\\.env (or the environment), then "
+                 "reload.")
         return
+    if not same_store(env["WC_URL"], cfg.store_url):
+        st.error(
+            f"Refusing to publish: WC_URL points at "
+            f"**{store_host(env['WC_URL'])}**, but client `{cfg.slug}` is "
+            f"**{store_host(cfg.store_url)}**. Nothing on this page will run "
+            "until the two name the same store — fix "
+            f"clients\\{cfg.slug}\\.env or switch the Client selector.")
+        return
+
+    pre_key = f"preflight_{P['run'].name}"
+    st.subheader("0 · Preflight")
+    st.caption("Credentials, edge/challenge check, media login and the "
+               "store-URL match — one call, nothing is written.")
+    if st.button("🔎 Preflight"):
+        with st.spinner("Preflight…"):
+            code, out = run_publish(P, ["--preflight"])
+        # csv-independent: preflight says nothing about the CSV, only about
+        # the store, so a rebuild in Step 3 does not invalidate it
+        st.session_state[pre_key] = code == 0
+        st.code(out[-3000:], language=None)
+        (st.success if code == 0 else st.error)(
+            "Preflight passed" if code == 0
+            else "Preflight FAILED — fix the store before publishing")
     if st.button("🔑 Test credentials (--check)"):
         code, out = run_publish(P, ["--check"])
         (st.success if code == 0 else st.error)("Credentials "
@@ -1311,11 +1854,6 @@ def step_publish(P):
         st.warning(f"{len(publish_skus)} products is a large batch — it will "
                    "be sent in chunks of 150 SKUs per wc_publish call.")
 
-    # Mirrors wc_publish.EXIT_BLOCKED. Duplicated rather than imported so this
-    # module never has to import wc_publish (which reads store credentials at
-    # import time). If that constant moves, this must follow.
-    PUBLISH_EXIT_BLOCKED = 3
-
     def run_publish_pinned(extra):
         """Every invocation pins its scope with explicit --sku flags. Past
         ~200 the flags would hit the Windows command-line limit, so the set
@@ -1332,11 +1870,12 @@ def step_publish(P):
             # returning the final chunk's code would let a clean chunk 2 mask a
             # failed chunk 1 and unlock the commit gate after a bad dry run.
             worst = max(worst, code)
-            # Only an edge challenge (EXIT_BLOCKED) makes the later chunks
-            # pointless - every one would be blocked the same way. A row-level
-            # failure must NOT stop them, or the retry panel never sees the SKUs
-            # that come after the first bad row.
-            if code == PUBLISH_EXIT_BLOCKED:
+            # Only an edge challenge (EXIT_BLOCKED) or a tripped guard
+            # (EXIT_REFUSED) makes the later chunks pointless - every one
+            # would stop the same way, and a refusal means nothing was
+            # written at all. A row-level failure must NOT stop them, or the
+            # retry panel never sees the SKUs after the first bad row.
+            if code in (PUBLISH_EXIT_BLOCKED, PUBLISH_EXIT_REFUSED):
                 break
         return worst, "\n".join(outs)
 
@@ -1350,7 +1889,11 @@ def step_publish(P):
     dry_key = f"dryrun_{P['run'].name}"
     dry_sig = st.session_state.get(dry_key)
     st.subheader("Ⅰ · Dry run (nothing is written)")
-    if st.button("🧪 Dry run", type="primary"):
+    pre_ok = bool(st.session_state.get(pre_key))
+    if not pre_ok:
+        st.caption("Run Preflight above first — the dry run unlocks once it "
+                   "passes in this session.")
+    if st.button("🧪 Dry run", type="primary", disabled=not pre_ok):
         with st.spinner("Dry run…"):
             code, out = run_publish_pinned([])
         dry_sig = csv_signature(P["csv"]) if code == 0 else None
@@ -1365,9 +1908,12 @@ def step_publish(P):
                          hide_index=True, width="stretch")
         with st.expander("Raw dry-run output"):
             st.code(out[-8000:], language=None)
-        (st.success if code == 0 else st.error)(
-            "Dry run finished" if code == 0 else "Dry run FAILED — fix before "
-            "committing")
+        if code == 0:
+            st.success("Dry run finished")
+        elif code == PUBLISH_EXIT_REFUSED:
+            st.error("Dry run refused — nothing was written (see the log)")
+        else:
+            st.error("Dry run FAILED — fix before committing")
 
     if dry_sig is None or dry_sig != csv_signature(P["csv"]):
         st.caption(
@@ -1385,12 +1931,32 @@ def step_publish(P):
     if armed:
         go_live = st.checkbox("Also `--status publish` — make products LIVE "
                               "immediately (default: drafts)", value=False)
-    label = ("🚀 Commit — create/update as LIVE products" if go_live
-             else "📝 Commit — create/update as DRAFTS")
+    unconfirmed = set()
+    if go_live:
+        # Live is the one irreversible step, so it is reachable only for rows
+        # a human actually ticked in Step 2 - the same set that then goes into
+        # review_signoff.csv, which wc_publish re-checks on its own side.
+        unconfirmed = unconfirmed_publish_skus(P, publish_skus)
+        if unconfirmed:
+            st.error(
+                f"{len(unconfirmed)} of {len(publish_skus)} product(s) in this "
+                f"CSV are not confirmed in Step 2 — starting with "
+                f"`{unconfirmed[0]}`. Confirm them (or rebuild the CSV from "
+                "confirmed rows only) before publishing LIVE.")
+            go_live = False
+    label = (f"🚀 Commit {len(publish_skus)} products — create/update as LIVE"
+             if go_live
+             else f"📝 Commit {len(publish_skus)} products — create/update "
+                  "as DRAFTS")
     if st.button(label, type="primary", disabled=not armed):
-        extra = ["--commit"]
+        # --max-commit is wc_publish's blast-radius cap; the GUI's own gates
+        # (built_skus match, dry run, typed run name, the tick set) are what
+        # decides the scope, so hand it exactly the scope it just showed.
+        extra = ["--commit", "--max-commit", str(len(publish_skus))]
         if go_live:
             extra += ["--status", "publish"]
+            write_review_signoff(P, [s for s in publish_skus
+                                     if s not in set(unconfirmed)])
         with st.spinner(f"Publishing {len(publish_skus)} product(s)…"):
             code, out = run_publish_pinned(extra)
         rows, totals = parse_publish_output(out)
@@ -1415,8 +1981,12 @@ def step_publish(P):
                        + ("LIVE products." if go_live else "drafts."))
             update_meta(P, published=datetime.now().isoformat(timespec="seconds"),
                         published_live=go_live,
-                        published_count=len(publish_skus))
+                        published_count=len(publish_skus),
+                        published_csv=csv_signature(P["csv"]))
             st.session_state.pop(dry_key, None)
+        elif code == PUBLISH_EXIT_REFUSED:
+            st.error("Publish refused — nothing was written (see the log). "
+                     f"Full output in {P['publish_log'].name}.")
         else:
             st.error("Publish FAILED — see output above; full log in "
                      f"{P['publish_log'].name}")
@@ -1445,62 +2015,109 @@ def step_publish(P):
 
 # --------------------------------------------------------------------- main --
 
+# Where the last archive_run() put its .zip (None when zipping failed or
+# nothing was archived). archive_run still returns the file COUNT the Home
+# page and tests\\test_gui_runmgr.py expect, so the zip path rides here
+# rather than changing that return type.
+LAST_ARCHIVE_ZIP: Path | None = None
+
+
 def archive_run(run_dir: Path, dest: Path) -> int:
     """Copy a run's reviewable outputs into batches\\<name>\\ - filled sheet,
-    CSV, issues, report, plus exactly the images its CSV references - and
-    write a README. Returns the number of files copied. Copies only;
-    the run folder is left untouched."""
+    CSV, issues, report, the client's ORIGINAL list under its own name, plus
+    exactly the images its CSV references - write a README, then zip the
+    folder to batches\\<name>.zip so there is ONE file to hand over.
+
+    Returns the number of files copied (the zip path lands in
+    LAST_ARCHIVE_ZIP). Copies only; the run folder is left untouched."""
+    global LAST_ARCHIVE_ZIP
+    LAST_ARCHIVE_ZIP = None
     Pr = run_paths(run_dir)
-    dest.mkdir(parents=True, exist_ok=True)
-    copied = 0
-    for key in ("filled", "csv", "issues", "report"):
-        f = Pr[key]
-        if f.exists():
-            shutil.copy2(f, dest / f.name)
-            copied += 1
-    csv_note = ""
-    if Pr["csv"].exists():
-        # P2-25: a build killed mid-to_csv leaves a 0-byte (EmptyDataError) or
-        # ragged (ParserError) wordpress_ready.csv - both ValueError, neither
-        # an OSError. Archiving the REST of the run is far more useful than
-        # aborting, so the unreadable CSV only costs the images folder and
-        # earns a line in the README.
-        try:
-            csv_df = pd.read_csv(Pr["csv"], dtype=str).fillna("")
-        except (OSError, ValueError) as e:
-            csv_df = None
-            csv_note = (f"\n- **The CSV could not be read** "
-                        f"({e.__class__.__name__}), so NO images were "
-                        f"archived. Rebuild the CSV and archive again.\n")
-        if csv_df is not None:
-            img_dest = dest / "images"
-            img_dest.mkdir(exist_ok=True)
-            for name in dict.fromkeys(image_basenames_from_csv(csv_df)):
-                src = REPO_ROOT / "product_images_for_upload" / name
-                if src.exists():
-                    shutil.copy2(src, img_dest / name)
-                    copied += 1
+    files = {f.name: f for f in (Pr[k] for k in
+                                 ("filled", "csv", "issues", "report"))}
+    # the list the client actually sent, under the name they sent it under -
+    # "input.xlsx" tells a hand-over reader nothing about where it came from
     meta = load_json(Pr["meta"])
-    (dest / "README.md").write_text(
-        f"# Batch {run_dir.name}\n\n"
-        f"Archived {datetime.now():%Y-%m-%d %H:%M} from "
-        f"runs\\{run_dir.name}.\n\n"
-        f"- Source list: {meta.get('original_name', '?')}\n"
-        f"- Rows enriched: {meta.get('total_rows', '?')}\n"
-        f"- Built scope: {meta.get('built_scope', '?')} "
-        f"({len(meta.get('built_skus') or [])} SKUs)\n"
-        f"- Validation issues: {meta.get('issue_count', '?')}\n"
-        f"- Published: {meta.get('published', 'never')}"
-        + (" (LIVE)" if meta.get("published_live") else "") + "\n"
-        + csv_note,
+    if Pr["input"].exists():
+        src_name = str(meta.get("original_name") or "").strip()
+        files[Path(src_name).name if src_name else Pr["input"].name] = \
+            Pr["input"]
+
+    # P2-25: a build killed mid-to_csv leaves a 0-byte (EmptyDataError) or
+    # ragged (ParserError) wordpress_ready.csv - both ValueError, neither an
+    # OSError. Archiving the REST of the run is far more useful than aborting,
+    # so the unreadable CSV only costs the images folder and earns a README
+    # line. assemble_pack owns that rule for BOTH entry points.
+    pack = assemble_pack(dest, files,
+                         REPO_ROOT / "product_images_for_upload", Pr["csv"])
+    notes = []
+    if pack["csv_error"]:
+        notes.append(f"\n- **The CSV could not be read** "
+                     f"({pack['csv_error']}), so NO images were "
+                     f"archived. Rebuild the CSV and archive again.\n")
+
+    coverage = coverage_summary(read_filled_sheet(Pr["filled"]))
+    # P3-54: "Built scope: all (43 SKUs)" next to "Published: <date> (LIVE)"
+    # read as 43 live products when the publish covered an earlier build.
+    # published_csv is the signature of the CSV that was actually published.
+    meta = dict(meta)
+    meta["published_stale"] = bool(
+        meta.get("published") and meta.get("published_csv")
+        and meta["published_csv"] != csv_signature(Pr["csv"]))
+    meta["archived_from"] = f"runs\\{run_dir.name}"
+    meta["files"] = sorted({p.name for p in dest.iterdir()} | {"README.md"})
+
+    readme = dest / "README.md"
+    readme.write_text(
+        render_batch_readme(
+            run_dir.name, meta, coverage,
+            review_metrics=load_json(Pr["metrics"]) or None,
+            images={"count": pack["images"], "missing": pack["missing"]},
+            notes=notes),
         encoding="utf-8")
-    return copied
+
+    # one file to hand over. A zip that cannot be written (disk full, the
+    # previous .zip open in Explorer) must not lose the folder we just
+    # built, so it costs a README line and nothing else.
+    try:
+        LAST_ARCHIVE_ZIP = Path(shutil.make_archive(str(dest), "zip",
+                                                    root_dir=str(dest)))
+    except (OSError, ValueError) as e:
+        LAST_ARCHIVE_ZIP = None
+        with readme.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n- **The .zip could not be written** "
+                     f"({e.__class__.__name__}: {e}) - the folder above is "
+                     f"complete; zip it by hand.\n")
+    return pack["copied"]
 
 
-def pick_run() -> Path | None:
+def read_filled_sheet(path: Path):
+    """The enriched sheet as a DataFrame, or None. Coverage counting must
+    never be the reason an archive fails, so an .xlsx open in Excel or
+    truncated mid-save costs the Coverage numbers, not the archive."""
+    if not path.exists():
+        return None
+    try:
+        return pd.read_excel(path, dtype=str).fillna("")
+    except Exception as e:      # openpyxl/zipfile raise their own shapes
+        print(f"[archive] could not read {path.name}: "
+              f"{e.__class__.__name__}: {e}")
+        return None
+
+
+def client_runs(cfg) -> list:
+    """This client's run folders, newest first. A run belonging to another
+    client is not listed at all - the wizard's every step (taxonomy, images,
+    store) is that client's, so offering it would only lead to the refusal
+    guard_run_client() raises."""
     RUNS_DIR.mkdir(exist_ok=True)
     runs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()),
                   key=lambda d: d.stat().st_mtime, reverse=True)
+    return [d for d in runs if run_client_slug(d) == cfg.slug]
+
+
+def pick_run(cfg) -> Path | None:
+    runs = client_runs(cfg)
     HOME, NEW = "🏠 All runs", "➕ New run…"
     options = [HOME, NEW] + [d.name for d in runs]
     # land on the latest run as before; Home is one click away. With NO
@@ -1509,7 +2126,7 @@ def pick_run() -> Path | None:
     # NEW, so defaulting to Home would leave a fresh install unable to make
     # its first run (tests	est_gui_ui.py::test_create_run pins this).
     sel = st.sidebar.selectbox("Batch / run", options,
-                               index=2 if runs else 1)
+                               index=2 if runs else 1, key="run_picker")
     if sel == HOME:
         return None
     if sel != NEW:
@@ -1518,9 +2135,25 @@ def pick_run() -> Path | None:
                                  value=f"run_{datetime.now():%Y%m%d}")
     if st.sidebar.button("Create run"):
         safe = re.sub(r"[^\w\-]+", "_", name.strip()).strip("_")
-        if safe:
-            (RUNS_DIR / safe).mkdir(exist_ok=True)
-            st.rerun()
+        if not safe:
+            return None
+        target = RUNS_DIR / safe
+        # A folder that already exists under ANOTHER client must not be
+        # adopted: run_meta.json would be overwritten with this client's slug
+        # and the other store's sheet, images and CSV would come with it.
+        if target.exists() and run_client_slug(target) != cfg.slug:
+            st.sidebar.error(
+                f"runs\\{safe} already belongs to client "
+                f"`{run_client_slug(target)}`, and this session is "
+                f"`{cfg.slug}`. Pick another name.")
+            return None
+        target.mkdir(exist_ok=True)
+        meta_path = run_paths(target)["meta"]
+        meta = load_json(meta_path)
+        meta.setdefault("client", cfg.slug)
+        meta.setdefault("created", datetime.now().isoformat(timespec="seconds"))
+        save_json(meta_path, meta)
+        st.rerun()
     return None
 
 
@@ -1544,34 +2177,42 @@ def save_first_sheet(path, edited):
     wb.save(path)
 
 
-def backup_and_save_category_map(path, edited):
+def backup_and_save_category_map(path, edited, backups_dir=None):
     """Back the taxonomy up, then write the edited first sheet back.
 
     The two steps belong together and are the whole of the editor's save
     path, so they live in one plain function tests\\test_gui_runmgr.py can
     call without a Streamlit session. Returns the backup path; the backup
     is taken BEFORE the write, so a botched edit is always one file copy
-    away from being undone."""
-    backup = (REPO_ROOT / "backups" /
+    away from being undone.
+
+    `backups_dir` is the client's own clients\\<slug>\\backups\\; the
+    REPO_ROOT default is kept only so the plain-function tests can call this
+    with no client at all."""
+    backup = (Path(backups_dir or (REPO_ROOT / "backups")) /
               f"category_map_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
-    backup.parent.mkdir(exist_ok=True)
+    # parents=True: clients\\<slug>\\backups\\ may not exist yet, and the
+    # client dir itself always does - the taxonomy was just read from it
+    backup.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, backup)
     save_first_sheet(path, edited)
     return backup
 
 
-def category_map_editor():
-    """Edit category_map.xlsx in place. app.py snaps categories to these
-    EXACT strings, so removals are loud: they are listed and must be
+def category_map_editor(cfg):
+    """Edit THIS CLIENT's category_map.xlsx in place. app.py snaps categories
+    to these EXACT strings, so removals are loud: they are listed and must be
     acknowledged before the save button arms. Every save backs up the
-    current file to backups\\ first.
+    current file to clients\\<slug>\\backups\\ first.
 
     Only the FIRST sheet is editable here; the other sheets of the workbook
     ('Sub-Category Attributes', 'Filters') are preserved verbatim."""
-    st.header("⚙ Category map — category_map.xlsx")
-    path = REPO_ROOT / "category_map.xlsx"
+    path = Path(cfg.category_map)
+    st.header(f"⚙ Category map — {cfg.name}")
+    st.caption(f"`{path}`")
     if not path.exists():
-        st.error("category_map.xlsx not found next to app.py.")
+        st.error(f"{path} not found — client `{cfg.slug}` has no taxonomy "
+                 "to edit.")
         return
     df = pd.read_excel(path, sheet_name=0, dtype=str).fillna("")
     other = openpyxl.load_workbook(path, read_only=True).sheetnames[1:]
@@ -1593,38 +2234,61 @@ def category_map_editor():
     if st.button("💾 Save category map", type="primary",
                  disabled=not ok):
         try:
-            backup = backup_and_save_category_map(path, edited)
+            backup = backup_and_save_category_map(path, edited,
+                                                  cfg.backups_dir)
         except PermissionError:
-            st.error("category_map.xlsx is open in Excel — close it and "
+            st.error(f"{path.name} is open in Excel — close it and "
                      "save again.")
             return
-        # app.CATEGORY_COMBOS is bound at import; reload so the NEXT build
-        # in this session snaps against the edited map, and clear the
-        # cached dropdown options so review picks it up too
-        import importlib
+        # app.CATEGORY_COMBOS is bound at import; re-run configure() for THIS
+        # client so the NEXT build in this session snaps against the edited
+        # map. A bare importlib.reload would re-read whatever PIPELINE_CLIENT
+        # happens to hold, which after a selector switch is not necessarily
+        # the client whose map was just edited.
         os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+        os.environ[client_config.ENV_VAR] = cfg.slug
         import app
-        importlib.reload(app)
+        app.configure(cfg.slug)
         category_options.clear()
-        st.success(f"Saved. Backup: backups\\{backup.name}. Review "
-                   "dropdowns and the next build now use the edited map.")
+        st.success(f"Saved. Backup: `{backup}`. Review dropdowns and the "
+                   "next build now use the edited map.")
 
 
 def main():
-    st.set_page_config(page_title="Shree Jee pipeline", page_icon="🛒",
-                       layout="wide")
-    st.sidebar.title("🛒 Shree Jee pipeline")
+    # set_page_config has to be the first Streamlit call, so the client is
+    # resolved before it - current_client() only reads session_state and the
+    # environment, it renders nothing. A broken config falls back to a
+    # generic tab title and is reported by the selector below.
+    try:
+        page_title = f"{current_client().name} pipeline"
+    except ClientConfigError:
+        page_title = "Catalogue pipeline"
+    st.set_page_config(page_title=page_title, page_icon="🛒", layout="wide")
+    try:
+        cfg = client_selector()
+    except ClientConfigError as exc:
+        # every page below needs the taxonomy and the store URL, so this is
+        # fatal - but a readable sentence, not a traceback
+        st.sidebar.error(str(exc))
+        # the slug the selector was pointing AT - naming the previous one
+        # sent the operator to a client.toml that is perfectly fine
+        attempted = (st.session_state.get(ATTEMPT_KEY)
+                     or st.session_state.get(CLIENT_KEY))
+        st.error("No usable client configuration — fix "
+                 f"clients\\{attempted}\\client.toml "
+                 "and reload.")
+        return
+    st.sidebar.title(f"🛒 {cfg.name}")
     if st.sidebar.checkbox("⚙ Category map editor",
                            help="Edit the taxonomy the builds snap to. "
                                 "Closes the wizard while open."):
-        category_map_editor()
+        category_map_editor(cfg)
         return
 
-    run_dir = pick_run()
+    run_dir = pick_run(cfg)
     if run_dir is None:
-        st.title("Shree Jee catalogue pipeline")
-        run_dirs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()),
-                          key=lambda d: d.stat().st_mtime, reverse=True)
+        st.title(f"{cfg.name} catalogue pipeline")
+        run_dirs = client_runs(cfg)
         if not run_dirs:
             st.info("Create a run in the sidebar to begin — each run keeps "
                     "its input, enriched sheet, CSV and logs together under "
@@ -1638,7 +2302,8 @@ def main():
                 "run": d.name,
                 "stage": run_stage(m, {"input": Pd["input"].exists(),
                                        "filled": Pd["filled"].exists(),
-                                       "csv": Pd["csv"].exists()}),
+                                       "csv": Pd["csv"].exists()},
+                                   csv_signature(Pd["csv"])),
                 "rows": m.get("total_rows", ""),
                 "issues": m.get("issue_count", ""),
                 "published": m.get("published", ""),
@@ -1682,6 +2347,19 @@ def main():
                     else:
                         st.success(f"Archived {n} file(s) to batches\\{target}."
                                    " The run folder itself is untouched.")
+                        # one file to hand the client - say so, or say why
+                        # there isn't one (archive_run never raises on a
+                        # failed zip; the folder is complete either way)
+                        zip_path = LAST_ARCHIVE_ZIP
+                        if zip_path and zip_path.exists():
+                            st.caption(
+                                f"📦 {zip_path.name} "
+                                f"({zip_path.stat().st_size / 1e6:.1f} MB) — "
+                                f"one file to hand over.")
+                        else:
+                            st.caption("The .zip could not be written — see "
+                                       "the note at the end of the "
+                                       "batch README.")
             # key MUST carry the target: a static key keeps the tick alive
             # when the selectbox moves to another run, so the next run could
             # be deleted with one click and no confirmation (P2-25)
@@ -1703,6 +2381,8 @@ def main():
                              "removed.")
                 else:
                     st.rerun()
+        return
+    if not guard_run_client(run_dir, cfg):
         return
     P = run_paths(run_dir)
 

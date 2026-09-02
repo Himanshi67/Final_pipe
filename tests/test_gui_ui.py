@@ -14,6 +14,7 @@ step renders against seeded artifacts without raising.
 """
 
 import json
+import shutil
 import sys
 import tempfile
 import traceback
@@ -65,6 +66,16 @@ def boot(runs_dir, timeout=60):
 
 def assert_no_exception(at):
     assert not at.exception, f"page raised: {[e.value for e in at.exception]}"
+
+
+def run_picker(at):
+    """The sidebar's 'Batch / run' selectbox, BY KEY - the Client selector
+    sits above it, so index 0 is no longer the run list."""
+    return at.sidebar.selectbox(key="run_picker")
+
+
+def client_picker(at):
+    return at.sidebar.selectbox(key="client_picker")
 
 
 def seeded_run(base: Path, name: str, with_csv=False) -> Path:
@@ -328,7 +339,7 @@ def home(runs_dir):
     """The '🏠 All runs' page, where the run manager lives (the sidebar
     lands on the newest run, so it has to be selected)."""
     at = boot(runs_dir)
-    at.sidebar.selectbox[0].set_value("🏠 All runs").run(timeout=60)
+    run_picker(at).set_value("🏠 All runs").run(timeout=60)
     return at
 
 
@@ -460,6 +471,63 @@ def test_archive_reports_a_copy_failure_instead_of_a_traceback(tmp):
     assert_no_exception(at)
     assert any("Could not finish archiving" in str(e.value)
                for e in at.error), [str(e.value) for e in at.error]
+
+
+def test_archive_success_points_at_the_zip_to_hand_over(tmp):
+    """Item 6: the deliverable is ONE file. The success message has to say
+    which one, or the operator hands over the folder path again."""
+    import gui
+    runs = tmp / "runs"
+    seeded_run(runs, "arch2")
+    made = {}
+
+    def fake_archive(run_dir, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "README.md").write_text("# Batch arch2", encoding="utf-8")
+        zip_path = dest.with_suffix(".zip")
+        zip_path.write_text("stub zip", encoding="utf-8")
+        gui.LAST_ARCHIVE_ZIP = made["zip"] = zip_path
+        return 4
+
+    real_root, real_arch = gui.REPO_ROOT, gui.archive_run
+    gui.REPO_ROOT = tmp / "repo"          # never the real batches folder
+    gui.archive_run = fake_archive
+    try:
+        at = home(runs)
+        manage_buttons(at)["archive"].click().run(timeout=60)
+    finally:
+        gui.REPO_ROOT, gui.archive_run = real_root, real_arch
+        gui.LAST_ARCHIVE_ZIP = None
+    assert_no_exception(at)
+    captions = [str(c.value) for c in at.caption]
+    assert any("arch2.zip" in c and "one file to hand over" in c
+               for c in captions), captions
+    assert made["zip"].exists()
+
+
+def test_archive_success_says_so_when_there_is_no_zip(tmp):
+    """A zip that could not be written must not leave the operator hunting
+    for a file that is not there."""
+    import gui
+    runs = tmp / "runs"
+    seeded_run(runs, "arch3")
+
+    def fake_archive(run_dir, dest):
+        dest.mkdir(parents=True, exist_ok=True)
+        gui.LAST_ARCHIVE_ZIP = None
+        return 4
+
+    real_root, real_arch = gui.REPO_ROOT, gui.archive_run
+    gui.REPO_ROOT = tmp / "repo"
+    gui.archive_run = fake_archive
+    try:
+        at = home(runs)
+        manage_buttons(at)["archive"].click().run(timeout=60)
+    finally:
+        gui.REPO_ROOT, gui.archive_run = real_root, real_arch
+    assert_no_exception(at)
+    captions = [str(c.value) for c in at.caption]
+    assert any("could not be written" in c for c in captions), captions
 
 
 # ------------------------------------------------------------------ P2-28 --
@@ -594,13 +662,21 @@ def publish_wizard(runs_dir, calls):
     gui.main()
 
 
-def _open_step5(runs, calls, timeout=60):
+def _open_step5(runs, calls, timeout=60, preflight=True):
     at = AppTest.from_function(publish_wizard, args=(runs, calls))
     at.run(timeout=timeout)
     labels = [str(o) for o in at.sidebar.radio[0].options]
     assert "🔒" not in labels[4], labels
     at.sidebar.radio[0].set_value(labels[4]).run(timeout=timeout)
+    if preflight:
+        # the dry run is disabled until preflight passes in this session
+        _click(at, "Preflight", timeout=timeout)
     return at
+
+
+# what the client's store URL has to be for Step 5 to render at all: a
+# WC_URL naming another host is refused before any button (item 3.2)
+STORE_URL = "https://shreejeeelectronics.in"
 
 
 def _click(at, needle, timeout=60):
@@ -649,7 +725,7 @@ def test_dry_run_unlock_does_not_survive_a_rebuild(tmp):
     calls = []
     real_run_publish = gui.run_publish
     saved = {k: os.environ.get(k) for k in ("WC_URL", "WC_KEY", "WC_SECRET")}
-    os.environ.update({"WC_URL": "https://example.invalid",
+    os.environ.update({"WC_URL": STORE_URL,
                        "WC_KEY": "ck_test", "WC_SECRET": "cs_test"})
     try:
         at = _open_step5(runs, calls)
@@ -683,7 +759,1149 @@ def test_dry_run_unlock_does_not_survive_a_rebuild(tmp):
             os.environ.pop(k, None) if v is None else os.environ.update({k: v})
 
 
+# ------------------------------------------------------------------ P3-50 --
+
+
+def _lock_share_read(path: Path):
+    """Open `path` the way Excel does - readable by others, NOT writable.
+
+    Plain open() would not do: Python opens with FILE_SHARE_WRITE, so
+    to_csv succeeds and the bug cannot be reproduced."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = ctypes.c_void_p
+    h = k32.CreateFileW(str(path), ctypes.c_uint(0x80000000),   # GENERIC_READ
+                        ctypes.c_uint(0x00000001),              # SHARE_READ
+                        None, ctypes.c_uint(3),                 # OPEN_EXISTING
+                        ctypes.c_uint(0x80), None)
+    assert h and h != 2 ** 64 - 1, "could not lock the scratch CSV"
+    return h
+
+
+def _unlock(h):
+    import ctypes
+    ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(h))
+
+
+def build_wizard(runs_dir):
+    """AppTest entry: the wizard with app.process_inventory stubbed, so Build
+    writes a tiny frame and downloads nothing."""
+    import os
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    import pandas as pd
+    import app
+    import gui
+    gui.RUNS_DIR = runs_dir
+    real = app.process_inventory
+    app.process_inventory = lambda df, **kw: pd.DataFrame(
+        [{"sku": "WM-SKU-A", "post_title": "Samsung 7 kg Washer",
+          "Images": "", "_spec_gaps": "", "regular price": "25000",
+          "sale price": "22599", "Brands": "Samsung", "categories": ""}])
+    try:
+        gui.main()
+    finally:
+        app.process_inventory = real
+
+
+def _step3(runs, timeout=90):
+    at = AppTest.from_function(build_wizard, args=(runs,))
+    at.run(timeout=timeout)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[2]).run(timeout=timeout)
+    return at
+
+
+def test_build_says_so_when_the_csv_is_open_elsewhere(tmp):
+    """P3-50: wordpress_ready.csv open in Excel made to_csv raise a raw
+    PermissionError traceback AFTER every image had been downloaded, and
+    update_meta never ran - so the run silently stayed at its old stage with
+    no explanation on the page."""
+    runs = tmp / "runs"
+    run = seeded_run(runs, "locked", with_csv=True)
+    at = _step3(runs)
+    assert_no_exception(at)
+
+    h = _lock_share_read(run / "wordpress_ready.csv")
+    try:
+        build = next(b for b in at.button if "Build CSV" in str(b.label))
+        at = build.click().run(timeout=90)
+    finally:
+        _unlock(h)
+
+    assert_no_exception(at)
+    assert any("Could not write wordpress_ready.csv" in str(e.value)
+               and "Excel" in str(e.value) for e in at.error), \
+        [str(e.value) for e in at.error]
+    meta_path = run / "run_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8")) \
+        if meta_path.exists() else {}
+    assert "built_skus" not in meta and not meta.get("validated"), meta
+
+
+def test_build_writes_the_csv_when_nothing_holds_it(tmp):
+    """The other half of the guard: the same path with no lock must still
+    build, validate and stamp the meta."""
+    runs = tmp / "runs"
+    run = seeded_run(runs, "unlocked")
+    at = _step3(runs)
+    build = next(b for b in at.button if "Build CSV" in str(b.label))
+    at = build.click().run(timeout=90)
+    assert_no_exception(at)
+    assert not [str(e.value) for e in at.error], [str(e.value)
+                                                  for e in at.error]
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["built_skus"] == ["WM-SKU-A"] and meta["validated"] is True
+
+
+# ------------------------------------------------------------------ P3-51 --
+
+
+def cancel_entry(run_dir_str, calls, pid, started):
+    """AppTest entry: gui.cancel_enricher with os.kill, subprocess.run and
+    time.sleep stubbed - nothing is ever signalled for real."""
+    import os
+    import subprocess
+    import time
+    from pathlib import Path as _P
+    import gui
+
+    P = gui.run_paths(_P(run_dir_str))
+    gui.update_meta(P, enricher_pid=pid, enricher_started=started)
+    real = (os.kill, subprocess.run, time.sleep)
+    os.kill = lambda *a, **k: calls.append(("kill",) + a)
+    subprocess.run = lambda *a, **k: calls.append(("run",) + a)
+    time.sleep = lambda *a, **k: None
+    try:
+        gui.cancel_enricher(P)
+    finally:
+        os.kill, subprocess.run, time.sleep = real
+
+
+def _cancel(tmp, name, started_delta=None):
+    """Run Stop against THIS process's pid. started_delta None => the true
+    creation time (we are 'our own' enricher); a number => that many seconds
+    off, i.e. a recycled pid."""
+    import os
+    import gui
+    run = tmp / "runs" / name
+    run.mkdir(parents=True)
+    created = gui._pid_created(os.getpid())
+    assert created, "GetProcessTimes unavailable - cannot test the identity check"
+    started = created if started_delta is None else created - started_delta
+    calls = []
+    at = AppTest.from_function(cancel_entry,
+                               args=(str(run), calls, os.getpid(), started))
+    at.run(timeout=60)
+    assert not at.exception, [e.value for e in at.exception]
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    return calls, meta
+
+
+def test_stop_never_signals_a_recycled_pid(tmp):
+    """P3-51: cancel_enricher checked pid_alive WITHOUT enricher_started, so
+    a stale pid in run_meta.json (GUI reloaded, second tab, restarted
+    mid-batch) that Windows had handed to some other python - another
+    Streamlit, a build_csv.py run - was CTRL_BREAKed and then taskkill /T /F
+    with its whole tree."""
+    calls, meta = _cancel(tmp, "recycled", started_delta=100000)
+    assert calls == [], calls
+    assert meta["enricher_pid"] is None, meta
+
+
+def test_stop_still_breaks_our_own_enricher(tmp):
+    """The identity check must not disarm Stop on the real child."""
+    import os
+    import signal
+    calls, meta = _cancel(tmp, "ours")
+    assert calls and calls[0] == ("kill", os.getpid(),
+                                  signal.CTRL_BREAK_EVENT), calls
+    # the stubbed CTRL_BREAK cannot end this process, so the 15 s grace
+    # expires and the hard kill follows - both are recorded, never run
+    assert any(c[0] == "run" and "taskkill" in c[1] for c in calls), calls
+    assert meta["enricher_pid"] is None, meta
+
+
+# ------------------------------------------------------------------ P3-53 --
+
+
+def _tick(P, sku):
+    """Confirm one SKU exactly as Step 2's save path does - flags merged from
+    the sheet as it stands, fingerprints hashed from that same frame."""
+    import gui
+    flags = {s: True for s in gui.confirmed_set(P)}
+    flags[str(sku)] = True
+    gui.save_confirmed(P, flags, gui.load_filled_df(P))
+
+
+def _re_enrich_row(path: Path, sku: str):
+    """What --retry-incomplete does to a 'FOUND - only 1 image(s)' row: fills
+    the price and replaces the gallery, in place."""
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    head = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+    for row in ws.iter_rows(min_row=2):
+        if str(row[head.index("sku")].value) == sku:
+            row[head.index("sale price")].value = 17499
+            row[head.index("image_url")].value = \
+                "https://example.com/new1.jpg,https://example.com/new2.jpg"
+    wb.save(path)
+
+
+def test_a_re_enriched_row_loses_its_tick(tmp):
+    """P3-53: a tick on a suffixed-FOUND row survived 'Re-enrich incomplete
+    rows', which rewrites exactly that bucket in place - so 'Confirmed rows
+    only' built re-scraped data nobody reviewed, rejected images included."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "retried")
+    P = gui.run_paths(run)
+    _tick(P, "SKU-B")                      # FOUND (flipkart) - only 1 image(s)
+    assert gui.confirmed_set(P) == {"SKU-B"}
+    _re_enrich_row(P["filled"], "SKU-B")
+
+    at = boot(runs)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[1]).run(timeout=60)   # Step 2
+    assert_no_exception(at)
+    assert any("confirmation(s) dropped" in str(w.value) for w in at.warning), \
+        [str(w.value) for w in at.warning]
+    assert gui.confirmed_set(P) == set(), \
+        json.loads(P["review"].read_text(encoding="utf-8"))
+
+    at.sidebar.radio[0].set_value(labels[2]).run(timeout=60)   # Step 3
+    assert_no_exception(at)
+    scope = next(r for r in at.radio
+                 if any("Confirmed rows only" in str(o) for o in r.options))
+    assert any("Confirmed rows only (0)" in str(o) for o in scope.options), \
+        [str(o) for o in scope.options]
+
+
+def test_an_untouched_tick_survives_a_reload(tmp):
+    """The guard may not fire on a sheet nobody re-enriched."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "stable")
+    P = gui.run_paths(run)
+    _tick(P, "SKU-B")
+    at = boot(runs)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[1]).run(timeout=60)
+    assert_no_exception(at)
+    assert not any("confirmation(s) dropped" in str(w.value)
+                   for w in at.warning), [str(w.value) for w in at.warning]
+    assert gui.confirmed_set(P) == {"SKU-B"}
+
+
+def test_step_3_reader_agrees_with_step_2_on_the_fingerprint(tmp):
+    """Step 2 reads the sheet dtype=str + to_numeric, Step 3 with a plain
+    read_excel, and the reconcile runs on BOTH - so a price cell must hash
+    the same either way, or every tick would be dropped at build time."""
+    import pandas as pd
+    import gui
+    run = seeded_run(tmp / "runs", "readers")
+    P = gui.run_paths(run)
+    _tick(P, "SKU-B")
+    # the step-3 reader, unchanged sheet: nothing may be dropped
+    assert gui.reconcile_confirmations(P, pd.read_excel(P["filled"])) == 0
+    assert gui.confirmed_set(P) == {"SKU-B"}
+    _re_enrich_row(P["filled"], "SKU-B")
+    assert gui.reconcile_confirmations(P, pd.read_excel(P["filled"])) == 1
+    assert gui.confirmed_set(P) == set()
+
+
+def test_legacy_bool_review_state_still_counts_and_is_never_stale(tmp):
+    """review_state.json written before P3-53 holds bare bools. They keep
+    their tick (there is no fingerprint to compare) and must not be dropped
+    on the next render."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "legacy")
+    P = gui.run_paths(run)
+    P["review"].write_text(json.dumps({"confirmed": {"SKU-B": True,
+                                                     "SKU-A": False}}),
+                           encoding="utf-8")
+    assert gui.confirmed_set(P) == {"SKU-B"}
+    _re_enrich_row(P["filled"], "SKU-B")
+    at = boot(runs)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[1]).run(timeout=60)
+    assert_no_exception(at)
+    assert gui.confirmed_set(P) == {"SKU-B"}
+
+
+# ------------------------------------- Phase 1 item 5: review telemetry --
+
+def wizard_edited(runs_dir, sku=None, edits=None, confirm=None):
+    """AppTest cannot type into a data_editor, so the editors are wrapped:
+    every frame they hand back gets the edit/tick applied to one SKU, which
+    is exactly the state the Save button reads."""
+    import gui
+    gui.RUNS_DIR = runs_dir
+    real = gui.review_editor
+
+    def patched(df, key, cat_options=None, allow_confirm=True):
+        out = real(df, key, cat_options, allow_confirm)
+        if sku is None or out is None or "sku" not in out.columns:
+            return out
+        out = out.copy()
+        hit = out["sku"].astype(str) == str(sku)
+        for col, val in (edits or {}).items():
+            if col in out.columns:
+                out.loc[hit, col] = val
+        if confirm is not None and allow_confirm:
+            out.loc[hit, "confirmed"] = bool(confirm)
+        return out
+
+    gui.review_editor = patched
+    try:
+        gui.main()
+    finally:
+        gui.review_editor = real
+
+
+def step2(at, timeout=60):
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[1]).run(timeout=timeout)
+    return at
+
+
+def events_of(P):
+    return json.loads(P["review"].read_text(encoding="utf-8")).get("events", [])
+
+
+def test_table_save_logs_an_edit_and_a_tick(tmp):
+    """One save that changes a title and ticks the row logs two table
+    events and lands review_metrics.json beside review_state.json."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "telemetry")
+    P = gui.run_paths(run)
+    at = AppTest.from_function(
+        wizard_edited,
+        args=(runs, "SKU-A", {"title": "Samsung 7 kg Washer (edited)"}, True))
+    at.run(timeout=60)
+    step2(at)
+    assert_no_exception(at)
+    save = next(b for b in at.button
+                if "Save edits & confirmations" in str(b.label))
+    save.click().run(timeout=60)
+    assert_no_exception(at)
+
+    evs = events_of(P)
+    assert len(evs) == 2, evs
+    assert {e["action"] for e in evs} == {"edit", "approve"}, evs
+    assert all(e["mode"] == "table" and e["sku"] == "SKU-A" for e in evs), evs
+    assert all(e["secs"] >= 0 for e in evs), evs
+    assert gui.confirmed_set(P) == {"SKU-A"}
+    assert P["metrics"].exists(), "review_metrics.json was not written"
+    m = json.loads(P["metrics"].read_text(encoding="utf-8"))
+    assert m["rows_touched"] == 1 and m["actions"]["edit"] == 1
+
+
+def test_a_pasted_url_is_logged_as_url_pasted(tmp):
+    """A url_link filled in on a failed row is the NEEDS LINK remediation,
+    not a cosmetic edit - the metrics have to tell them apart."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "pasted")
+    P = gui.run_paths(run)
+    at = AppTest.from_function(
+        wizard_edited,
+        args=(runs, "SKU-C", {"url_link": "https://example.com/c"}, None))
+    at.run(timeout=60)
+    step2(at)
+    next(b for b in at.button
+         if "Save edits & confirmations" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    evs = events_of(P)
+    assert [e["action"] for e in evs] == ["url_pasted"], evs
+    assert evs[0]["sku"] == "SKU-C" and evs[0]["mode"] == "table"
+
+
+def test_card_approve_and_skip_log_card_events(tmp):
+    """Card mode times each card on its own: Approve books the seconds the
+    card was on screen, Skip still costs the reviewer that time."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "cards")
+    P = gui.run_paths(run)
+    at = boot(runs)
+    step2(at)
+    view = next(r for r in at.radio if "View" in str(r.label))
+    view.set_value("Card review").run(timeout=60)
+    assert_no_exception(at)
+
+    approve = next(b for b in at.button if "Approve" in str(b.label))
+    assert not approve.disabled, "the first card is a FOUND row"
+    approve.click().run(timeout=60)
+    assert_no_exception(at)
+    evs = events_of(P)
+    assert evs and evs[0]["action"] == "approve", evs
+    assert evs[0]["mode"] == "card" and evs[0]["sku"] == "SKU-B", evs
+    assert evs[0]["secs"] >= 0, evs             # review bucket sorts first
+    # a card that also rewrote a field logs the extra action at 0 s: the
+    # card's time is billed once, to the primary event
+    assert all(e["secs"] == 0 for e in evs[1:]), evs
+    assert {e["sku"] for e in evs} == {"SKU-B"}, evs
+    assert gui.confirmed_set(P) == {"SKU-B"}
+
+    n_before = len(evs)
+    next(b for b in at.button if "Skip" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    evs = events_of(P)
+    assert len(evs) == n_before + 1, evs
+    assert evs[-1]["action"] == "skip" and evs[-1]["mode"] == "card", evs
+    assert evs[-1]["secs"] >= 0, evs
+    m = json.loads(P["metrics"].read_text(encoding="utf-8"))
+    assert m["actions"]["approve"] == 1 and m["actions"]["skip"] == 1, m
+
+
+def test_step2_shows_the_review_caption_on_reload(tmp):
+    """The caption is read back from review_metrics.json, so a fresh browser
+    session (or another operator) sees the time already spent."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "caption")
+    P = gui.run_paths(run)
+    state = {"confirmed": {}, "events": [
+        {"sku": "SKU-A", "action": "edit", "mode": "table",
+         "at": "2026-09-02T10:00:00", "secs": 120.0},
+        {"sku": "SKU-B", "action": "approve", "mode": "card",
+         "at": "2026-09-02T10:02:00", "secs": 60.0}]}
+    P["review"].write_text(json.dumps(state), encoding="utf-8")
+    gui.save_json(P["metrics"],
+                  gui.review_metrics(state, gui.load_filled_df(P)))
+    at = boot(runs)
+    step2(at)
+    assert_no_exception(at)
+    caps = [str(c.value) for c in at.caption]
+    assert any("Review so far:" in c and "min/SKU" in c and "needs-human" in c
+               for c in caps), caps
+
+
+def test_a_legacy_review_state_still_renders_step_2(tmp):
+    """review_state.json from before item 5 has no events key and no metrics
+    file; step 2 must render, and the first save must grow one."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "legacyevents")
+    P = gui.run_paths(run)
+    P["review"].write_text(json.dumps({"confirmed": {"SKU-A": True}}),
+                           encoding="utf-8")
+    at = AppTest.from_function(
+        wizard_edited, args=(runs, "SKU-A", {"title": "Retitled"}, None))
+    at.run(timeout=60)
+    step2(at)
+    assert_no_exception(at)
+    assert not any("Review so far:" in str(c.value) for c in at.caption)
+    next(b for b in at.button
+         if "Save edits & confirmations" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    assert [e["action"] for e in events_of(P)] == ["edit"], events_of(P)
+    # the legacy tick survived the new key landing beside it
+    assert gui.confirmed_set(P) == {"SKU-A"}
+
+
+# ------------------------------------------------- per-client wiring (P1) --
+# docs/CLIENT_CONFIG.md items 1-4. Everything here is offline: no subprocess
+# (Popen / gui.run_publish are stubbed), no store, no network, and every
+# global that is rebound is restored - the rest of the suite runs as
+# 'shreejee' and would fail against another client's prefixes or taxonomy.
+
+ACME_TOML = """\
+[client]
+slug = "acme"
+name = "Acme Appliances"
+
+[store]
+url = "https://acme.example"
+media_base = "{url}/wp-content/uploads/{yyyy}/{mm}"
+seo_site_name = "Acme Appliances"
+
+[taxonomy]
+category_map = "category_map.xlsx"
+
+[sku]
+fallback_prefix = "AP"
+never_rename = ["WM"]
+strip_codes = ["DW"]
+
+[sku.prefix_by_parent]
+"Washing Machines" = "WM"
+"Kitchen Appliances" = "KA"
+
+[sku.input_codes]
+WM = ["Washing Machines", ""]
+"""
+
+
+def make_clients_dir(tmp: Path) -> Path:
+    """A scratch clients\\ holding the real shreejee config plus a synthetic
+    second client, so a two-client test never touches the repo's own
+    clients\\ directory.
+
+    Both clients get a REAL category_map.xlsx - shreejee's, copied - because
+    load_client() refuses a client whose taxonomy file is missing and
+    app.configure() reads it for real."""
+    src = ROOT / "clients" / "shreejee"
+    dest = tmp / "clients"
+    (dest / "shreejee").mkdir(parents=True)
+    shutil.copy2(src / "client.toml", dest / "shreejee" / "client.toml")
+    shutil.copy2(src / "category_map.xlsx",
+                 dest / "shreejee" / "category_map.xlsx")
+    (dest / "acme").mkdir()
+    (dest / "acme" / "client.toml").write_text(ACME_TOML, encoding="utf-8")
+    shutil.copy2(src / "category_map.xlsx",
+                 dest / "acme" / "category_map.xlsx")
+    return dest
+
+
+def seed_run_for(runs: Path, name: str, slug: str) -> Path:
+    run = runs / name
+    run.mkdir(parents=True)
+    (run / "run_meta.json").write_text(json.dumps({"client": slug}),
+                                       encoding="utf-8")
+    return run
+
+
+def client_wizard(runs_dir, clients_dir):
+    import client_config
+    import gui
+    gui.RUNS_DIR = runs_dir
+    client_config.CLIENTS_DIR = clients_dir
+    gui.main()
+
+
+def guard_wizard(runs_dir, clients_dir, run_name):
+    """Open ONE named run under whatever client the selector resolves to -
+    the code path the run list deliberately hides, so it still needs a
+    test of its own."""
+    import client_config
+    import gui
+    gui.RUNS_DIR = runs_dir
+    client_config.CLIENTS_DIR = clients_dir
+    cfg = gui.current_client()
+    gui.guard_run_client(runs_dir / run_name, cfg)
+
+
+def _errors(at) -> str:
+    return " ".join(str(e.value) for e in at.error)
+
+
+def test_client_selector_defaults_to_shreejee_and_titles_the_page(tmp):
+    """Item 1: the selector is a sidebar control, starts on the default
+    client, and its NAME (not a hard-coded 'Shree Jee') is the heading."""
+    runs = tmp / "runs"
+    runs.mkdir()
+    at = boot(runs)
+    assert_no_exception(at)
+    picker = client_picker(at)
+    assert str(picker.label) == "Client"
+    assert picker.value == "shreejee", picker.value
+    assert "shreejee" in [str(o) for o in picker.options]
+    assert any("Shree Jee Electronics" in str(t.value) for t in at.title), \
+        [str(t.value) for t in at.title]
+
+
+def test_a_run_of_another_client_is_hidden_from_the_list(tmp):
+    """Item 1: the run list is scoped to the selected client. A legacy run
+    with no `client` key counts as the default client and stays visible."""
+    import client_config
+
+    runs = tmp / "runs"
+    clients = make_clients_dir(tmp)
+    seed_run_for(runs, "acme_batch", "acme")
+    seed_run_for(runs, "sj_batch", "shreejee")
+    (runs / "legacy_batch").mkdir()            # no run_meta.json at all
+
+    old_dir = client_config.CLIENTS_DIR
+    try:
+        at = AppTest.from_function(client_wizard, args=(runs, clients))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        options = [str(o) for o in run_picker(at).options]
+        assert "sj_batch" in options and "legacy_batch" in options, options
+        assert "acme_batch" not in options, options
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+
+
+def test_opening_another_clients_run_is_refused_naming_both_slugs(tmp):
+    """Item 1: and if one is reached anyway, the refusal names BOTH slugs -
+    the run's owner and the session's - because the fix is to switch back,
+    never to re-home the run."""
+    import client_config
+
+    runs = tmp / "runs"
+    clients = make_clients_dir(tmp)
+    seed_run_for(runs, "acme_batch", "acme")
+
+    old_dir = client_config.CLIENTS_DIR
+    try:
+        at = AppTest.from_function(guard_wizard,
+                                   args=(runs, clients, "acme_batch"))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        text = _errors(at)
+        assert "acme" in text and "shreejee" in text, text
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+
+
+def test_switching_client_retitles_the_page_and_rebinds_the_sku_codes(tmp):
+    """Item 1 + item 2: moving the selector reconfigures the whole process -
+    the heading, app.py's taxonomy and media base, and gui_helpers' SKU
+    prefixes - not just a label. Everything is restored: the rest of the
+    suite runs as shreejee."""
+    import client_config
+    import gui_helpers
+
+    runs = tmp / "runs"
+    runs.mkdir()
+    clients = make_clients_dir(tmp)
+
+    import os
+
+    # both of the modules switch_client() reconfigures, imported here so the
+    # restore below is unconditional - leaving validate_csv on 'acme' breaks
+    # tests/test_client_config.py two files later
+    import app                                  # noqa: E402 (lazy on purpose)
+    import validate_csv                         # noqa: E402
+    old_dir = client_config.CLIENTS_DIR
+    old_codes = tuple(gui_helpers.SKU_CODES)
+    # switch_client mirrors the slug into the process env (that is how a
+    # lazily-imported app / a subprocess is told) - restore it too, or the
+    # NEXT test boots as 'acme'
+    old_env = os.environ.get(client_config.ENV_VAR)
+    try:
+        at = AppTest.from_function(client_wizard, args=(runs, clients))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        client_picker(at).set_value("acme").run(timeout=60)
+        assert_no_exception(at)
+        assert any("Acme Appliances" in str(t.value) for t in at.title), \
+            [str(t.value) for t in at.title]
+        assert app.CLIENT.slug == "acme"
+        assert validate_csv.CLIENT.slug == "acme"
+        assert app.MEDIA_BASE.startswith("https://acme.example"), \
+            app.MEDIA_BASE
+        # acme's [sku] table has three codes, not shreejee's ten
+        assert tuple(gui_helpers.SKU_CODES) == ("WM", "KA", "AP"), \
+            gui_helpers.SKU_CODES
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+        if old_env is None:
+            os.environ.pop(client_config.ENV_VAR, None)
+        else:
+            os.environ[client_config.ENV_VAR] = old_env
+        app.configure("shreejee")
+        validate_csv.configure("shreejee")
+        gui_helpers.configure_sku_codes(old_codes)
+
+
+def test_a_legacy_run_is_stamped_with_the_default_client_on_first_open(tmp):
+    """Item 1: a run created before the selector existed is claimed ONCE, so
+    the next operator cannot adopt it by moving the selector."""
+    import client_config
+    import gui
+
+    runs = tmp / "runs"
+    clients = make_clients_dir(tmp)
+    (runs / "legacy_batch").mkdir(parents=True)
+
+    old_dir = client_config.CLIENTS_DIR
+    try:
+        at = AppTest.from_function(guard_wizard,
+                                   args=(runs, clients, "legacy_batch"))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        assert not _errors(at), _errors(at)
+        meta = json.loads((runs / "legacy_batch" / "run_meta.json")
+                          .read_text(encoding="utf-8"))
+        assert meta["client"] == gui.DEFAULT_CLIENT, meta
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+
+
+# --------------------------------------------------------- item 4: budget --
+
+def enrich_wizard(runs_dir, calls):
+    """AppTest entry with gui.subprocess replaced by a recorder - nothing is
+    launched, the argv and the child's env are just captured.
+
+    AppTest.from_function re-executes only THIS function's source, so the
+    stand-in has to be built inside it; module-level names are not in scope
+    there."""
+    import subprocess as _sp
+    import types as _types
+
+    import gui
+    gui.RUNS_DIR = runs_dir
+
+    class _FakeSubprocess:
+        STDOUT = _sp.STDOUT
+        CREATE_NEW_PROCESS_GROUP = getattr(
+            _sp, "CREATE_NEW_PROCESS_GROUP", 0)
+
+        @staticmethod
+        def Popen(cmd, **kw):
+            calls.append({"cmd": list(cmd),
+                          "env": dict(kw.get("env") or {})})
+            # pid 0 and a poll() that reports "exited": the panel then
+            # renders the finished state instead of polling a live child
+            return _types.SimpleNamespace(pid=0, poll=lambda: 0)
+
+    gui.subprocess = _FakeSubprocess
+    gui.main()
+
+
+def test_enricher_launch_carries_the_client_and_the_budget(tmp):
+    """Items 1 + 4: --client on the argv, PIPELINE_CLIENT in the child's
+    env, and the Step-1 budget box becomes `--budget N` - stored in
+    enricher_flags, so the Step-2 retry buttons inherit the same cap."""
+    import gui
+
+    runs = tmp / "runs"
+    run = seeded_run(runs, "enrich")
+    calls = []
+    real_subprocess = gui.subprocess
+    try:
+        at = AppTest.from_function(enrich_wizard, args=(runs, calls))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        box = next(n for n in at.number_input
+                   if "Serper credit budget" in str(n.label))
+        box.set_value(5)
+        next(b for b in at.button
+             if "▶" in str(b.label)).click().run(timeout=60)
+        assert_no_exception(at)
+    finally:
+        gui.subprocess = real_subprocess
+
+    assert len(calls) == 1, calls
+    cmd, env = calls[0]["cmd"], calls[0]["env"]
+    assert "--client" in cmd and cmd[cmd.index("--client") + 1] == "shreejee"
+    assert "--budget" in cmd and cmd[cmd.index("--budget") + 1] == "5", cmd
+    assert env.get("PIPELINE_CLIENT") == "shreejee", env.get("PIPELINE_CLIENT")
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert "--budget" in meta["enricher_flags"], meta["enricher_flags"]
+
+
+# ------------------------------------------------- item 3: publish guards --
+
+def publish_wizard_codes(runs_dir, calls, codes):
+    """publish_wizard whose stub returns the exit codes in `codes`, one per
+    wc_publish call, then 0.
+
+    A list, not one code, and the wizard body owns the patch: AppTest
+    re-executes this function on EVERY rerun, so a gui.run_publish swapped in
+    from the test would be overwritten again on the next click."""
+    import gui
+    gui.RUNS_DIR = runs_dir
+
+    def _fake(P, extra):
+        calls.append(list(extra))
+        code = codes.pop(0) if codes else 0
+        return code, ("REFUSED\n" if code else "DRY RUN\n")
+
+    gui.run_publish = _fake
+    gui.main()
+
+
+def _open_step5_codes(runs, calls, codes, timeout=60):
+    at = AppTest.from_function(publish_wizard_codes, args=(runs, calls, codes))
+    at.run(timeout=timeout)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[4]).run(timeout=timeout)
+    return at
+
+
+def _publish_run(tmp, name="pub", scope="confirmed", confirm=True):
+    runs = tmp / "runs"
+    run = seeded_run(runs, name)
+    rows = [("WM-SKU-A", "Samsung 7 kg Washer"), ("RF-SKU-B", "LG 190 L")]
+    _write_publish_state(run, rows, scope)
+    if confirm:
+        (run / "review_state.json").write_text(json.dumps({"confirmed": {
+            "SKU-A": {"confirmed": True}, "SKU-B": {"confirmed": True}}}),
+            encoding="utf-8")
+    return runs, run
+
+
+def _with_creds(fn, url=None):
+    """Run fn() with WC_* set (and restored afterwards) - Step 5 renders
+    nothing at all without them."""
+    import os
+    keys = ("WC_URL", "WC_KEY", "WC_SECRET")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ.update({"WC_URL": url or STORE_URL,
+                       "WC_KEY": "ck_test", "WC_SECRET": "cs_test"})
+    try:
+        return fn()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_publish_refuses_a_wc_url_on_another_host(tmp):
+    """Item 3.2: WC_URL and the client's own store must name one host. The
+    refusal names BOTH and lands BEFORE any button - a stale shell export is
+    exactly how one client's catalogue reaches another's store."""
+    import gui
+
+    runs, _ = _publish_run(tmp)
+    calls = []
+    real = gui.run_publish
+    try:
+        at = _with_creds(lambda: _open_step5(runs, calls, preflight=False),
+                         url="https://someone-elses-store.example")
+    finally:
+        gui.run_publish = real
+    assert_no_exception(at)
+    text = _errors(at)
+    assert "someone-elses-store.example" in text, text
+    assert "shreejeeelectronics.in" in text, text
+    assert not [b for b in at.button if "Dry run" in str(b.label)]
+    assert not calls, calls
+
+
+def test_preflight_must_pass_before_the_dry_run(tmp):
+    """Item 3.6: the dry-run button is locked until preflight passes in this
+    session, and preflight itself is a bare --preflight (no --sku)."""
+    import gui
+
+    runs, _ = _publish_run(tmp)
+    calls = []
+    real = gui.run_publish
+    try:
+        at = _with_creds(lambda: _open_step5(runs, calls, preflight=False))
+        assert_no_exception(at)
+        dry = next(b for b in at.button if "Dry run" in str(b.label))
+        assert dry.disabled, "dry run must be locked before preflight"
+        assert any("Run Preflight" in str(c.value) for c in at.caption)
+
+        _click(at, "Preflight")
+        assert_no_exception(at)
+        assert calls == [["--preflight"]], calls
+        _click(at, "Dry run")
+        assert_no_exception(at)
+    finally:
+        gui.run_publish = real
+    assert len(calls) == 2, calls
+    assert "--preflight" not in calls[1] and "--commit" not in calls[1], calls
+
+
+def test_exit_4_reports_that_nothing_was_written(tmp):
+    """Item 3: exit 4 means 'a guard tripped and NOTHING was written',
+    distinct from a run that failed part-way - and the page must say so."""
+    import gui
+
+    runs, _ = _publish_run(tmp)
+    calls = []
+    real = gui.run_publish
+    try:
+        at = _with_creds(lambda: _open_step5_codes(runs, calls, [4]))
+        assert_no_exception(at)
+        _click(at, "Preflight")
+        assert any("Preflight FAILED" in str(e.value) for e in at.error), \
+            _errors(at)
+        # preflight refused -> the dry run stays locked, nothing is offered
+        assert next(b for b in at.button
+                    if "Dry run" in str(b.label)).disabled
+    finally:
+        gui.run_publish = real
+
+
+def test_a_refused_dry_run_says_nothing_was_written(tmp):
+    """The same exit code, on the button that has a three-way outcome:
+    finished / refused / failed."""
+    import gui
+
+    runs, _ = _publish_run(tmp)
+    calls = []
+    real = gui.run_publish
+    try:
+        # preflight passes; the dry run behind it is refused
+        at = _with_creds(lambda: _open_step5_codes(runs, calls, [0, 4]))
+        assert_no_exception(at)
+        _click(at, "Preflight")
+        _click(at, "Dry run")
+        assert_no_exception(at)
+        assert any("refused" in str(e.value) and "nothing was written"
+                   in str(e.value) for e in at.error), _errors(at)
+    finally:
+        gui.run_publish = real
+
+
+def test_go_live_commit_writes_the_signoff_and_caps_the_blast_radius(tmp):
+    """Items 3.3 + 3.4: a go-live commit passes --max-commit for exactly the
+    scope the page showed, and leaves review_signoff.csv beside the CSV
+    naming every SKU a human ticked."""
+    import gui
+
+    runs, run = _publish_run(tmp)
+    calls = []
+    real = gui.run_publish
+    try:
+        at = _with_creds(lambda: _open_step5(runs, calls))
+        assert_no_exception(at)
+        _click(at, "Dry run")
+        next(c for c in at.checkbox
+             if "I reviewed the dry-run output" in str(c.label)) \
+            .check().run(timeout=60)
+        at.text_input[0].set_value("pub").run(timeout=60)
+        next(c for c in at.checkbox
+             if "status publish" in str(c.label)).check().run(timeout=60)
+        assert_no_exception(at)
+        commit = next(b for b in at.button
+                      if "Commit 2 products" in str(b.label))
+        assert "LIVE" in str(commit.label), commit.label
+        commit.click().run(timeout=60)
+        assert_no_exception(at)
+    finally:
+        gui.run_publish = real
+
+    commits = [c for c in calls if "--commit" in c]
+    assert commits, calls
+    assert "--max-commit" in commits[0], commits[0]
+    assert commits[0][commits[0].index("--max-commit") + 1] == "2", commits[0]
+    assert "--status" in commits[0] and "publish" in commits[0], commits[0]
+
+    signoff = run / "review_signoff.csv"
+    assert signoff.exists(), "go-live commit wrote no review_signoff.csv"
+    lines = [ln for ln in signoff.read_text(encoding="utf-8").splitlines()
+             if ln.strip()]
+    assert lines[0].startswith("sku,reviewer,signed_at"), lines[0]
+    assert sorted(ln.split(",")[0] for ln in lines[1:]) == ["RF-SKU-B",
+                                                            "WM-SKU-A"], lines
+
+
+def test_go_live_is_refused_while_any_row_is_unconfirmed(tmp):
+    """Item 3.4: LIVE is the irreversible step, so an unticked row blocks it
+    and is NAMED - and what remains offered is a DRAFT commit."""
+    import gui
+
+    runs, run = _publish_run(tmp, scope="all_found", confirm=False)
+    calls = []
+    real = gui.run_publish
+    try:
+        at = _with_creds(lambda: _open_step5(runs, calls))
+        _click(at, "Dry run")
+        next(c for c in at.checkbox
+             if "I reviewed the dry-run output" in str(c.label)) \
+            .check().run(timeout=60)
+        at.text_input[0].set_value("pub").run(timeout=60)
+        next(c for c in at.checkbox
+             if "status publish" in str(c.label)).check().run(timeout=60)
+        assert_no_exception(at)
+        text = _errors(at)
+        assert "not confirmed in Step 2" in text, text
+        assert "RF-SKU-B" in text, text
+        assert any("DRAFTS" in str(b.label) for b in at.button), \
+            [str(b.label) for b in at.button]
+    finally:
+        gui.run_publish = real
+    assert not (run / "review_signoff.csv").exists()
+
+
 # ------------------------------------------------------------------ main --
+
+
+
+# ------------------------------- item 1: an unusable client is never silent
+
+def texts(at, kind):
+    """Element text from the WHOLE page - these live in the sidebar, and the
+    root getters and the sidebar getters do not overlap in every version."""
+    seen, out = set(), []
+    for block in (at, at.sidebar):
+        for el in getattr(block, kind):
+            v = str(el.value)
+            if v not in seen:
+                seen.add(v)
+                out.append(v)
+    return out
+
+
+def add_broken_client(clients_dir, slug="nosku"):
+    bad = Path(clients_dir) / slug
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "client.toml").write_text("this is not = = toml\n",
+                                     encoding="utf-8")
+    return bad
+
+
+def bad_env_wizard(runs_dir, clients_dir):
+    """The GUI booted with a TYPO in $PIPELINE_CLIENT."""
+    import os
+    import client_config
+    import gui
+    gui.RUNS_DIR = runs_dir
+    client_config.CLIENTS_DIR = clients_dir
+    os.environ[client_config.ENV_VAR] = "shreejeee"
+    gui.main()
+
+
+def failing_switch_wizard(runs_dir, clients_dir):
+    """Selecting 'acme' fails to load - the config broke after the scan."""
+    import client_config
+    import gui
+    gui.RUNS_DIR = runs_dir
+    client_config.CLIENTS_DIR = clients_dir
+    real = client_config.load_client
+
+    def fake(slug=None, argv=None):
+        if slug == "acme":
+            raise client_config.ClientConfigError(
+                "clients\\acme\\client.toml: [store] url is empty")
+        return real(slug, argv)
+
+    gui.load_client = fake              # gui imported it by name
+    try:
+        gui.main()
+    finally:
+        gui.load_client = real
+
+
+def test_an_unknown_pipeline_client_falls_back_to_default_with_a_warning(tmp):
+    """Item 1: a typo in $PIPELINE_CLIENT used to select whichever client
+    sorted FIRST ('acme') and switch to it in silence - i.e. build for
+    somebody else's store. It falls back to the DEFAULT client and says so."""
+    import os
+    import client_config
+
+    runs = tmp / "runs"
+    runs.mkdir()
+    clients = make_clients_dir(tmp)
+    old_dir = client_config.CLIENTS_DIR
+    old_env = os.environ.get(client_config.ENV_VAR)
+    try:
+        at = AppTest.from_function(bad_env_wizard, args=(runs, clients))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        assert client_picker(at).value == gui_default_client(), \
+            client_picker(at).value
+        warned = " ".join(texts(at, "warning"))
+        assert "'shreejeee'" in warned, warned
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+        if old_env is None:
+            os.environ.pop(client_config.ENV_VAR, None)
+        else:
+            os.environ[client_config.ENV_VAR] = old_env
+
+
+def test_a_broken_client_toml_is_not_offered_and_is_named_in_a_caption(tmp):
+    """Item 1: an unloadable client.toml is not a choice - offering it just
+    moves the failure to after the click. It is reported under the picker."""
+    import client_config
+
+    runs = tmp / "runs"
+    runs.mkdir()
+    clients = make_clients_dir(tmp)
+    add_broken_client(clients)
+    old_dir = client_config.CLIENTS_DIR
+    try:
+        at = AppTest.from_function(client_wizard, args=(runs, clients))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        options = [str(o) for o in client_picker(at).options]
+        assert "nosku" not in options, options
+        caption = " ".join(texts(at, "caption"))
+        assert "nosku" in caption, caption
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+
+
+def test_a_failed_switch_names_the_client_being_switched_to(tmp):
+    """Item 1: switch_client() raises BEFORE it moves CLIENT_KEY, so the
+    page used to send the operator to the PREVIOUS client's client.toml -
+    a file that is perfectly fine."""
+    import client_config
+
+    runs = tmp / "runs"
+    runs.mkdir()
+    clients = make_clients_dir(tmp)
+    old_dir = client_config.CLIENTS_DIR
+    try:
+        at = AppTest.from_function(failing_switch_wizard,
+                                   args=(runs, clients))
+        at.run(timeout=60)
+        assert_no_exception(at)
+        client_picker(at).set_value("acme").run(timeout=60)
+        assert_no_exception(at)
+        text = _errors(at)
+        assert "clients\\acme\\client.toml" in text, text
+        assert "clients\\shreejee\\client.toml" not in text, text
+    finally:
+        client_config.CLIENTS_DIR = old_dir
+
+
+def gui_default_client():
+    import gui
+    return gui.DEFAULT_CLIENT
+
+
+# ------------------------- item 5: the metrics file cannot go stale in place
+
+def set_status(path, sku, status):
+    wb = openpyxl.load_workbook(path)
+    ws = wb.active
+    headers = [str(c.value) for c in ws[1]]
+    si, ti = headers.index("sku"), headers.index("status")
+    for row in ws.iter_rows(min_row=2):
+        if str(row[si].value) == sku:
+            row[ti].value = status
+    wb.save(path)
+
+
+def test_step_2_refreshes_stale_review_metrics_on_load(tmp):
+    """Item 5: review_metrics.json used to be written ONLY on a review save,
+    so a re-enrichment that rewrote statuses left the README and the enricher
+    report quoting a needs-human percentage for a sheet that no longer
+    existed. Opening step 2 recomputes it."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "stalemetrics")
+    P = gui.run_paths(run)
+    P["review"].write_text(json.dumps({"confirmed": {}, "events": [
+        {"sku": "SKU-A", "action": "edit", "mode": "table",
+         "at": "2026-09-01T10:00:00", "secs": 30}]}), encoding="utf-8")
+    # true when that edit was saved: A hands-on, B in the review bucket,
+    # C failed - 3 of 3 rows needed a human
+    P["metrics"].write_text(json.dumps({
+        "review_minutes": 0.5, "rows_touched": 1, "min_per_sku": 0.5,
+        "needs_human_pct": 100.0, "actions": {"edit": 1}}), encoding="utf-8")
+    # ... then a re-enrichment completed SKU-B
+    set_status(P["filled"], "SKU-B", "FOUND (flipkart)")
+
+    at = boot(runs)
+    step2(at)
+    assert_no_exception(at)
+    m = json.loads(P["metrics"].read_text(encoding="utf-8"))
+    assert m["needs_human_pct"] == 66.7, m
+    # the event log is untouched, so the time half must not move
+    assert m["review_minutes"] == 0.5 and m["rows_touched"] == 1, m
+
+
+def test_a_run_with_no_review_events_gets_no_metrics_file(tmp):
+    """The refresh must not CREATE the file: a zeroed metrics file would make
+    the caption print '0 min' where today it prints nothing at all."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "nometrics")
+    P = gui.run_paths(run)
+    at = boot(runs)
+    step2(at)
+    assert_no_exception(at)
+    assert not P["metrics"].exists(), "metrics file created for an unreviewed run"
+    assert not any("Review so far:" in c for c in texts(at, "caption"))
 
 
 def main():

@@ -15,6 +15,7 @@ the Streamlit-only version could not be asserted on by any script.
 
 import argparse
 import os
+import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -22,7 +23,14 @@ from pathlib import Path
 import pandas as pd
 
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
-import app                                     # noqa: E402  (after the env var)
+
+# --client has to be resolved BEFORE `import app`: app.py reads its taxonomy,
+# media base and SEO site name at import time. argparse has not run yet, so
+# scan argv here and hand the answer to app through the environment.
+import client_config                            # noqa: E402
+os.environ["PIPELINE_CLIENT"] = client_config.resolve_slug()
+
+import app                                      # noqa: E402  (after the env vars)
 
 
 def read_inventory(path):
@@ -80,7 +88,17 @@ def main():
     ap.add_argument("--no-validate", action="store_true",
                     help="Skip the QA pass that normally runs on the file this "
                          "writes")
+    ap.add_argument("--pack", action="store_true",
+                    help="Also write <out stem>_pack\\ (CSV, validation "
+                         "issues, the images the CSV references, the input "
+                         "list and a README) and zip it - one file to hand "
+                         "to the client. Same pack the GUI's Archive button "
+                         "builds.")
+    # Declared so --client shows in --help and is not an "unrecognized
+    # argument"; it was already applied above, before `import app`.
+    client_config.cli_client(ap)
     args = ap.parse_args()
+    print(f"Client: {app.CLIENT.name} ({app.CLIENT.slug})")
 
     src = Path(args.input)
     if not src.exists():
@@ -88,7 +106,8 @@ def main():
     out = Path(args.out) if args.out else Path("wordpress_ready_clean_repaired.csv")
 
     df = read_inventory(src)
-    total = len(df)
+    sheet_df = df                    # every row as delivered - the pack's
+    total = len(df)                  # Coverage table counts the WHOLE list
     df = app.filter_active_inventory_rows(df)
     print(f"Loaded {len(df)} active rows from {total} total rows")
 
@@ -107,7 +126,7 @@ def main():
         sys.exit("Nothing to build: no rows left after filtering.")
 
     folder = args.month.strip().strip("/") or f"{datetime.now():%Y/%m}"
-    media_base = f"https://shreejeeelectronics.in/wp-content/uploads/{folder}"
+    media_base = app.CLIENT.media_base(folder)
 
     result = app.process_inventory(df, media_base=media_base,
                                    estimate_mrp=args.estimate_mrp,
@@ -128,12 +147,14 @@ def main():
               "'slug' column is used on the wc_publish.py (API) route only.")
 
     # The QA gate is part of generating the file, not a step to remember.
+    issue_count = None
     if not args.no_validate:
         print("\n" + "-" * 60)
         try:
             import validate_csv
             issues = validate_csv.validate_export(
                 pd.read_csv(out, dtype=str).fillna(""), out.name)
+            issue_count = len(issues)
             if issues:
                 print(f"\n[warn] {len(issues)} row(s) need a look before "
                       f"publishing - see validation_issues.csv "
@@ -142,6 +163,58 @@ def main():
             # a QA pass that fails must not invalidate a CSV already on disk
             print(f"[warn] validation pass failed ({type(exc).__name__}: {exc}). "
                   f"The CSV was written; run validate_csv.py by hand.")
+
+    if args.pack:
+        write_pack(out, src, sheet_df, df, args, issue_count)
+
+
+def write_pack(out: Path, src: Path, sheet_df, built_df, args, issue_count):
+    """--pack: the same deliverable the GUI's Archive button builds, from the
+    headless route. gui_helpers owns BOTH the copy routine (assemble_pack)
+    and the README renderer, so the two entry points cannot drift."""
+    import gui_helpers
+
+    dest = out.parent / f"{out.stem}_pack"
+    files = {out.name: out, src.name: src}
+    issues_csv = out.parent / "validation_issues.csv"
+    if issues_csv.exists():
+        files[issues_csv.name] = issues_csv
+
+    pack = gui_helpers.assemble_pack(dest, files, app.IMAGE_DIR, out)
+    coverage = gui_helpers.coverage_summary(sheet_df)
+    meta = {"total_rows": len(sheet_df),
+            "built_scope": "all rows" if args.all_rows else "FOUND rows only",
+            "built_skus": list(built_df["sku"]) if "sku" in built_df.columns
+            else [],
+            "issue_count": "not run" if issue_count is None else issue_count,
+            "files": sorted({p.name for p in dest.iterdir()} | {"README.md"})}
+    notes = []
+    if pack["csv_error"]:
+        notes.append(f"\n- **The CSV could not be read** "
+                     f"({pack['csv_error']}), so NO images were packed.\n")
+    readme = dest / "README.md"
+    readme.write_text(
+        gui_helpers.render_batch_readme(
+            out.stem, meta, coverage,
+            images={"count": pack["images"], "missing": pack["missing"]},
+            source_name=src.name, notes=notes),
+        encoding="utf-8")
+    print(f"\nPack: {dest}  ({pack['copied']} file(s), "
+          f"{pack['images']} image(s)"
+          + (f", {pack['missing']} image(s) MISSING" if pack["missing"]
+             else "") + ")")
+
+    # a zip that cannot be written must not lose the folder just built
+    try:
+        zip_path = shutil.make_archive(str(dest), "zip", root_dir=str(dest))
+        print(f"Zip:  {zip_path}")
+    except (OSError, ValueError) as exc:
+        with readme.open("a", encoding="utf-8") as fh:
+            fh.write(f"\n- **The .zip could not be written** "
+                     f"({type(exc).__name__}: {exc}) - the folder above is "
+                     f"complete; zip it by hand.\n")
+        print(f"[warn] could not zip the pack ({type(exc).__name__}: {exc}). "
+              f"The folder is complete: {dest}")
 
 
 if __name__ == "__main__":
