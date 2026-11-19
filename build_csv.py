@@ -15,6 +15,7 @@ the Streamlit-only version could not be asserted on by any script.
 
 import argparse
 import os
+import re
 import shutil
 import sys
 from datetime import datetime
@@ -90,10 +91,11 @@ def main():
                          "writes")
     ap.add_argument("--pack", action="store_true",
                     help="Also write <out stem>_pack\\ (CSV, validation "
-                         "issues, the images the CSV references, the input "
-                         "list and a README) and zip it - one file to hand "
-                         "to the client. Same pack the GUI's Archive button "
-                         "builds.")
+                         "issues, the images the CSV references and a "
+                         "README - never the _filled.xlsx, the enricher "
+                         "report or a log) and zip it - one file to hand "
+                         "to the client. Same client pack the GUI's Archive "
+                         "button zips.")
     # Declared so --client shows in --help and is not an "unrecognized
     # argument"; it was already applied above, before `import app`.
     client_config.cli_client(ap)
@@ -153,7 +155,7 @@ def main():
         try:
             import validate_csv
             issues = validate_csv.validate_export(
-                pd.read_csv(out, dtype=str).fillna(""), out.name)
+                pd.read_csv(out, dtype=str).fillna(""), str(out))
             issue_count = len(issues)
             if issues:
                 print(f"\n[warn] {len(issues)} row(s) need a look before "
@@ -174,13 +176,18 @@ def write_pack(out: Path, src: Path, sheet_df, built_df, args, issue_count):
     and the README renderer, so the two entry points cannot drift."""
     import gui_helpers
 
+    # Owner rule 2026-11-19: the pack goes to the CLIENT, so it holds only the
+    # import CSV, the images the CSV references and the README (since the
+    # fifth round of 2026-11-19 validation_issues.csv is INTERNAL: it stays
+    # next to the CSV and is not packed). NEVER the source list: it is the _filled.xlsx (source page URLs,
+    # maker image URLs, statuses naming the source site). assemble_pack's
+    # guard refuses such members a second time.
     dest = out.parent / f"{out.stem}_pack"
-    files = {out.name: out, src.name: src}
-    issues_csv = out.parent / "validation_issues.csv"
-    if issues_csv.exists():
-        files[issues_csv.name] = issues_csv
+    hosts = gui_helpers.client_hosts(app.CLIENT)
+    files = {out.name: out}
 
-    pack = gui_helpers.assemble_pack(dest, files, app.IMAGE_DIR, out)
+    pack = gui_helpers.assemble_pack(dest, files, app.IMAGE_DIR, out,
+                                     allowed_hosts=hosts)
     coverage = gui_helpers.coverage_summary(sheet_df)
     meta = {"total_rows": len(sheet_df),
             "built_scope": "all rows" if args.all_rows else "FOUND rows only",
@@ -192,13 +199,20 @@ def write_pack(out: Path, src: Path, sheet_df, built_df, args, issue_count):
     if pack["csv_error"]:
         notes.append(f"\n- **The CSV could not be read** "
                      f"({pack['csv_error']}), so NO images were packed.\n")
+    for item in pack["refused"]:
+        notes.append(f"not packed (internal or links to a source site): "
+                     f"{item.split(': ', 1)[0]}")
     readme = dest / "README.md"
+    # the client's list name, not the enriched sheet's ('LIST_filled.xlsx')
+    source_name = re.sub(r"_filled(?=\.[^.]+$)", "", src.name)
     readme.write_text(
         gui_helpers.render_batch_readme(
             out.stem, meta, coverage,
             images={"count": pack["images"], "missing": pack["missing"]},
-            source_name=src.name, notes=notes),
+            source_name=source_name, notes=notes),
         encoding="utf-8")
+    # last check on the finished folder (README included) before the zip
+    gui_helpers.remove_refused(dest, hosts)
     print(f"\nPack: {dest}  ({pack['copied']} file(s), "
           f"{pack['images']} image(s)"
           + (f", {pack['missing']} image(s) MISSING" if pack["missing"]

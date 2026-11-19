@@ -278,6 +278,10 @@ def test_step3_seo_preview_matches_the_build(tmp):
     at = boot(runs)
     labels = [str(o) for o in at.sidebar.radio[0].options]
     at.sidebar.radio[0].set_value(labels[2]).run(timeout=60)
+    # nothing is approved, and the default scope is now always 'Confirmed
+    # rows only' (which previews nothing) - pick the FOUND scope explicitly
+    next(r for r in at.radio if "Rows to include" in str(r.label)) \
+        .set_value("all_found").run(timeout=60)
     boxes = [c for c in at.checkbox if "SEO meta" in str(c.label)]
     assert boxes, [str(c.label) for c in at.checkbox]
     boxes[0].check().run(timeout=60)
@@ -816,8 +820,11 @@ def test_build_says_so_when_the_csv_is_open_elsewhere(tmp):
     PermissionError traceback AFTER every image had been downloaded, and
     update_meta never ran - so the run silently stayed at its old stage with
     no explanation on the page."""
+    import gui
     runs = tmp / "runs"
     run = seeded_run(runs, "locked", with_csv=True)
+    # the build is approved-only by default: approve one row first
+    _tick(gui.run_paths(run), "SKU-A")
     at = _step3(runs)
     assert_no_exception(at)
 
@@ -841,8 +848,11 @@ def test_build_says_so_when_the_csv_is_open_elsewhere(tmp):
 def test_build_writes_the_csv_when_nothing_holds_it(tmp):
     """The other half of the guard: the same path with no lock must still
     build, validate and stamp the meta."""
+    import gui
     runs = tmp / "runs"
     run = seeded_run(runs, "unlocked")
+    # the build is approved-only by default: approve one row first
+    _tick(gui.run_paths(run), "SKU-A")
     at = _step3(runs)
     build = next(b for b in at.button if "Build CSV" in str(b.label))
     at = build.click().run(timeout=90)
@@ -851,6 +861,139 @@ def test_build_writes_the_csv_when_nothing_holds_it(tmp):
                                                   for e in at.error]
     meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
     assert meta["built_skus"] == ["WM-SKU-A"] and meta["validated"] is True
+
+
+# --------------------------------------- approved-only build + skip state --
+
+
+def spy_build_wizard(runs_dir, calls):
+    """build_wizard, but process_inventory RECORDS the raw skus it was handed
+    - that frame is exactly what the build turns into CSV rows and images."""
+    import os
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    import pandas as pd
+    import app
+    import gui
+    gui.RUNS_DIR = runs_dir
+    real = app.process_inventory
+
+    def _spy(df, **kw):
+        calls.append([str(s) for s in df["sku"].tolist()])
+        return pd.DataFrame(
+            [{"sku": "WM-" + str(s), "post_title": "x", "Images": "",
+              "_spec_gaps": "", "regular price": "25000",
+              "sale price": "22599", "Brands": "Samsung", "categories": ""}
+             for s in df["sku"]])
+
+    app.process_inventory = _spy
+    try:
+        gui.main()
+    finally:
+        app.process_inventory = real
+
+
+def _spy_step3(runs, calls, timeout=90):
+    at = AppTest.from_function(spy_build_wizard, args=(runs, calls))
+    at.run(timeout=timeout)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[2]).run(timeout=timeout)
+    return at
+
+
+def _scope_radio(at):
+    return next(r for r in at.radio if "Rows to include" in str(r.label))
+
+
+def _build_button(at):
+    return next(b for b in at.button if "Build CSV" in str(b.label))
+
+
+def test_zero_approvals_defaults_to_confirmed_and_blocks_the_build(tmp):
+    """The owner's design: only approved rows go on. With nothing approved
+    the default used to flip to 'All FOUND rows' and build every FOUND row
+    unseen; now the default stays 'Confirmed rows only' and Build is off."""
+    runs = tmp / "runs"
+    seeded_run(runs, "noapprovals")
+    calls = []
+    at = _spy_step3(runs, calls)
+    assert_no_exception(at)
+    assert _scope_radio(at).value == "confirmed"
+    assert any("Approve at least one row in step 2 - Review" in str(e.value)
+               for e in at.error), [str(e.value) for e in at.error]
+    assert _build_button(at).disabled, "Build must be off with 0 approvals"
+    assert any("Approved 0 · Skipped 0 · Not reviewed 2 · Not FOUND 1"
+               in str(i.value) for i in at.info), [str(i.value)
+                                                   for i in at.info]
+    assert calls == []
+
+
+def test_default_build_sends_only_the_approved_row(tmp):
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "approvedonly")
+    P = gui.run_paths(run)
+    gui.save_confirmed(P, {"SKU-A": True}, gui.load_filled_df(P),
+                       {"SKU-B": "duplicate photos"})
+    calls = []
+    at = _spy_step3(runs, calls)
+    assert_no_exception(at)
+    assert _scope_radio(at).value == "confirmed"
+    assert any("Approved 1 · Skipped 1 · Not reviewed 0 · Not FOUND 1"
+               in str(i.value) for i in at.info), [str(i.value)
+                                                   for i in at.info]
+    assert any("Skipped rows (1)" in str(e.label) for e in at.expander)
+    at = _build_button(at).click().run(timeout=90)
+    assert_no_exception(at)
+    assert calls == [["SKU-A"]], calls
+    assert any("from the 1 approved row(s) only" in str(i.value)
+               for i in at.info), [str(i.value) for i in at.info]
+    meta = json.loads((run / "run_meta.json").read_text(encoding="utf-8"))
+    assert meta["built_scope"] == "confirmed"
+
+
+def test_all_found_scope_still_excludes_the_skipped_row(tmp):
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "allfound")
+    P = gui.run_paths(run)
+    gui.save_confirmed(P, {"SKU-A": True}, gui.load_filled_df(P),
+                       {"SKU-B": ""})
+    calls = []
+    at = _spy_step3(runs, calls)
+    _scope_radio(at).set_value("all_found").run(timeout=90)
+    assert_no_exception(at)
+    assert any("includes rows nobody approved" in str(w.value)
+               for w in at.warning), [str(w.value) for w in at.warning]
+    assert not _build_button(at).disabled
+    at = _build_button(at).click().run(timeout=90)
+    assert_no_exception(at)
+    assert calls == [["SKU-A"]], calls
+    assert any("all FOUND rows minus 1 skipped" in str(i.value)
+               for i in at.info), [str(i.value) for i in at.info]
+
+
+def test_card_skip_stores_the_skip_with_its_reason(tmp):
+    """Card mode: Skip is a stored decision, not just 'next card'."""
+    import gui
+    runs = tmp / "runs"
+    run = seeded_run(runs, "cardskip")
+    P = gui.run_paths(run)
+    at = boot(runs)
+    step2(at)
+    next(r for r in at.radio if "View" in str(r.label)).set_value(
+        "Card review").run(timeout=60)
+    assert_no_exception(at)
+    # first card is SKU-B (review bucket sorts first)
+    reason = next(t for t in at.text_input if "Reason to skip" in str(t.label))
+    reason.set_value("gallery is another model").run(timeout=60)
+    next(b for b in at.button if "Skip" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    assert gui.skipped_map(P) == {"SKU-B": "gallery is another model"}
+    assert gui.confirmed_set(P) == set()
+    # approving it later clears the skip (three-state rule)
+    gui.save_confirmed(P, {"SKU-B": True}, None, {})
+    assert gui.skipped_map(P) == {} and gui.confirmed_set(P) == {"SKU-B"}
 
 
 # ------------------------------------------------------------------ P3-51 --

@@ -12,9 +12,13 @@ Checks per row:
   - image URLs whose .webp file is NOT present locally in
     product_images_for_upload (phantom links = broken images after import)
   - image files that are too small or the wrong shape to be product photos
+  - WARNING (never fails the check): flags app.py wrote to `_image_flags`,
+    e.g. no white-background photo, so the featured image is a lifestyle shot
   - duplicate SKUs (would collide in WooCommerce)
   - price problems: both prices missing, regular price <= sale price, or a
-    price outside the plausible band for the category
+    price outside the plausible band for the category. With [pricing]
+    single_price the one price is 'regular price' and any 'sale price' is
+    `sale_price_in_single_price_mode` (blocking)
   - attributes the product's own sub-category requires but nothing filled
   - attribute names whose WooCommerce slug is over 28 characters or is a
     reserved WordPress term - either one makes the importer reject the ROW
@@ -138,11 +142,16 @@ PLACEHOLDER = CLIENT.placeholder_html
 # on a product page and terrible in a lightbox.
 MIN_IMAGE_PX = 400
 # Below this it is usable but not good. WooCommerce re-encodes its own sizes
-# from whatever master it is given, so a soft master compounds. app.py now
-# fetches each CDN's largest rendition, which puts real product shots well
-# above this - a row that trips it usually means the source only had a
-# thumbnail, and the listing is worth a second look.
+# from whatever master it is given, so a soft master compounds. This is the
+# SOURCE floor (= app.MIN_IMAGE_EDGE): app.py refuses any source under it and
+# finishes every survivor on the fixed CANVAS_EDGE square below, so a final
+# file under it means a stale or hand-made image, not a pipeline output.
 GOOD_IMAGE_PX = 1000
+# Every final image app.py writes is exactly CANVAS_EDGE x CANVAS_EDGE (owner
+# rule: one fixed layout for every photo). Must equal app.CANVAS_EDGE -
+# tests/test_hd_images.py pins it; it is copied, not imported, because this
+# script stays import-free of app.py (app.py drags in streamlit).
+CANVAS_EDGE = 1500          # owner decision 2026-11-19 (was 1200)
 # Beyond this the file is a banner, a size chart or a sliver of one - not a
 # photo of the appliance. 1:3 either way is already generous for a product shot.
 MAX_IMAGE_ASPECT = 3.0
@@ -253,6 +262,46 @@ def remove_stale_report(source_path):
     return True
 
 
+# Reasons that start with this are WARNINGS: they land in validation_issues.csv
+# for a human to review, but a row that carries only warnings does not fail the
+# gate (the CLI still exits 0). Everything else stays an error.
+WARNING_PREFIX = 'warning_'
+
+# app.py writes these exact strings into the `_image_flags` column (see
+# app.FLAG_MAIN_NOT_WHITE); each becomes the warning reason on the right.
+IMAGE_FLAG_REASONS = {
+    'main image background not white':
+        'warning_main_image_not_white (no photo has a white background, so '
+        'the featured image is a lifestyle shot - review, does not block '
+        'the import)',
+}
+
+
+def image_flag_reasons(cell):
+    """Warning reasons for one `_image_flags` cell ('; '-separated flags).
+    An unknown flag is still reported, so a new app.py flag is never lost."""
+    text = str(cell or '').strip()
+    if not text or text.lower() == 'nan':
+        return []
+    out = []
+    for flag in (f.strip() for f in text.split(';')):
+        if flag:
+            out.append(IMAGE_FLAG_REASONS.get(
+                flag, f'{WARNING_PREFIX}image_flag ({flag})'))
+    return out
+
+
+def is_blocking_issue(issue):
+    """True when an issue row has at least one reason that is not a warning.
+    `reasons` is a '; '-joined string (validate_export) or a list
+    (validate_filled)."""
+    reasons = issue.get('reasons', [])
+    if isinstance(reasons, str):
+        reasons = reasons.split('; ')
+    return any(str(r).strip() and not str(r).startswith(WARNING_PREFIX)
+               for r in reasons)
+
+
 def summary_key(reason):
     """The reason with its per-row detail stripped, so the summary counts
     kinds of problem rather than instances. Everything after '(' is detail,
@@ -322,6 +371,144 @@ def image_dimension_problems(filenames, root=None):
         if min(width, height) and max(width, height) / min(width, height) > MAX_IMAGE_ASPECT:
             problems.append(f'{name} is {width}x{height} (banner shape)')
     return problems
+
+
+def image_canvas_problems(filenames, root=None):
+    """Final image files that are not on the house canvas: every file app.py
+    writes is exactly CANVAS_EDGE x CANVAS_EDGE, so a product whose gallery
+    mixes sizes (a stale file, a hand-dropped image, an old tiered build) is
+    reported. Missing or unreadable files are left to the other checks.
+    Silent when Pillow is absent, like image_dimension_problems."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return []
+    root = IMAGE_DIR if root is None else root
+    problems = []
+    for name in filenames:
+        path = os.path.join(root, name)
+        if not os.path.exists(path):
+            continue
+        try:
+            with Image.open(path) as img:
+                size = img.size
+        except Exception:
+            continue
+        if size != (CANVAS_EDGE, CANVAS_EDGE):
+            problems.append(f'{name} is {size[0]}x{size[1]}')
+    return problems
+
+
+_CONTENT_HITS = []
+
+
+def _content_hits_fn():
+    """sku_enricher.content_hits, imported on first use. The content firewall
+    has ONE definition (sku_enricher.py); importing it lazily keeps this
+    module import-free at load time, the same way Pillow is lazy above.
+    Returns None (and the check is skipped with a note) when the scraper's
+    dependencies are not installed."""
+    if not _CONTENT_HITS:
+        try:
+            from sku_enricher import content_hits
+        except (ImportError, SystemExit) as exc:
+            print(f'Note: content firewall check skipped - cannot import '
+                  f'sku_enricher ({exc}).')
+            content_hits = None
+        _CONTENT_HITS.append(content_hits)
+    return _CONTENT_HITS[0]
+
+
+_TAG_RE = re.compile(r'<[^>]+>')
+
+_FILTER_APP = []
+
+
+def _filter_app():
+    """app.py, imported on first use, for the filter-group lists
+    (app.filter_allowed_for). Lazy for the same reason as _content_hits_fn:
+    this module stays import-free at load time. None (the check is skipped
+    with a note) when app cannot be imported or is configured for another
+    client than this module."""
+    if not _FILTER_APP:
+        try:
+            import app as _app
+        except Exception as exc:              # streamlit missing, bad config
+            print(f'Note: filter-value check skipped - cannot import app '
+                  f'({exc}).')
+            _app = None
+        _FILTER_APP.append(_app)
+    found = _FILTER_APP[0]
+    if found is not None and getattr(found.CLIENT, 'slug', None) != CLIENT.slug:
+        print(f'Note: filter-value check skipped - app.py is configured for '
+              f'{found.CLIENT.slug}, this validator for {CLIENT.slug}.')
+        return None
+    return found
+
+
+def filter_value_problems(row, attr_name_cols, categories, unmatched=''):
+    """WARNINGS (non-blocking) for filter-group attributes whose value is not
+    in the allowed lists (the filter sheet's group or the product's
+    sub-category row). Owner decision 2026-11-19: app.py WRITES such a value
+    as scraped, so this is a reminder to add it to the sheet
+    (`warning_filter_value_not_in_sheet`), never a block. `unmatched` is
+    kept for callers; every written value is reported."""
+    app_mod = _filter_app()
+    if app_mod is None or not categories:
+        return []
+    parent, sub = app_mod.split_hierarchy(categories)
+    allowed = {name.lower(): values for name, values
+               in app_mod.filter_allowed_for(sub, parent).items()}
+    problems = []
+    for col in attr_name_cols:
+        name = str(row.get(col, '') or '').strip()
+        values = allowed.get(name.lower())
+        if not name or values is None:
+            continue
+        if str(row.get(col.replace(' name', ' global'), '1')).strip() in (
+                '0', '0.0'):
+            continue                      # a spec that only shares the name
+        cell = str(row.get(col.replace(' name', ' value(s)'), '') or '')
+        bad = [v.strip() for v in cell.split(',')
+               if v.strip() and v.strip().lower() != 'nan'
+               and v.strip().lower() not in values]
+        for value in bad:
+            problems.append(f'{WARNING_PREFIX}filter_value_not_in_sheet '
+                            f'({name}: {value!r} is a new value, add it to '
+                            f'the filter sheet)')
+    return problems
+
+
+def content_firewall_problems(row, columns, brand=''):
+    """Retailer-owned text (retailer names, offers, EMI, delivery/returns,
+    seller lines, badges, ratings, customer care, URLs, phones, e-mails) in
+    any field the pipeline writes: name, descriptions, key features, tags,
+    SEO meta and attribute names/values. One reason per offending field,
+    naming the field and the first matched term. HTML tags are stripped
+    first so markup is never judged."""
+    hits_of = _content_hits_fn()
+    if hits_of is None:
+        return []
+    problems = []
+    for col in columns:
+        raw = row.get(col, '')
+        text = '' if raw is None else str(raw)
+        if not text.strip() or text.strip().lower() == 'nan':
+            continue
+        hits = hits_of(_TAG_RE.sub(' ', text), brand=brand)
+        if hits:
+            problems.append(f'retailer_content_in_field ({col}: "{hits[0]}")')
+    return problems
+
+
+def content_firewall_columns(df):
+    """The written-content columns of an export, in sheet order."""
+    named = {'title', 'name', 'description', 'short description',
+             'configuration', 'tags'}
+    return [c for c in df.columns
+            if str(c).strip().lower() in named
+            or str(c).startswith('Meta:')
+            or re.fullmatch(r'Attribute \d+ (?:name|value\(s\))', str(c))]
 
 
 def duplicate_image_content(records, root=None):
@@ -529,7 +716,15 @@ def validate_filled(df, path):
         if verified:
             sale = to_number(row.get(c_sale, ''))
             reg = to_number(row.get(c_reg, ''))
-            if sale is None:
+            # [pricing] single_price: the build writes the HIGHER of the two,
+            # so an MRP alone is a price, and the TV price check reads the
+            # number that will ship. The MRP-ratio checks stay: a wrong MRP
+            # in this mode BECOMES the price.
+            shipped = sale
+            if single_price_mode():
+                both = [v for v in (reg, sale) if v is not None]
+                shipped = max(both) if both else None
+            if shipped is None:
                 reasons.append('verified_but_no_price')
             if len(images) < MIN_IMAGES:
                 reasons.append(f'verified_but_images<{MIN_IMAGES} (has {len(images)})')
@@ -540,9 +735,9 @@ def validate_filled(df, path):
                 elif reg > sale * limit:
                     reasons.append(f'mrp_implausible ({reg:g} is '
                                    f'{reg / sale:.1f}x, limit {limit:g}x)')
-            over = implausible_tv_price(title, sale)
+            over = implausible_tv_price(title, shipped)
             if over:
-                reasons.append(f'{over} ({sale:g})')
+                reasons.append(f'{over} ({shipped:g})')
             if title and mostly_non_latin(title):
                 reasons.append('title_not_in_english (wrong locale page)')
             brand = re.split(r'[-\s]', sku)[0].lower()
@@ -608,6 +803,12 @@ Usage:
                  'shreejee'.
 
 Writes validation_issues.csv next to the file being checked."""
+
+
+def single_price_mode(client=None):
+    """True when the client's client.toml sets [pricing] single_price."""
+    cfg = client or CLIENT
+    return bool(getattr(getattr(cfg, 'pricing', None), 'single_price', False))
 
 
 def configure(slug):
@@ -719,6 +920,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
     reg_col = find_col(df, 'regular price', 'regular_price')
     sale_col = find_col(df, 'sale price', 'sale_price')
     gaps_col = find_col(df, '_spec_gaps')
+    unmatched_col = find_col(df, '_filter_unmatched')
+    image_flags_col = find_col(df, '_image_flags')
 
     local_images_available = os.path.isdir(IMAGE_DIR)
     if not local_images_available:
@@ -733,6 +936,8 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
 
     attr_name_cols = [c for c in df.columns
                       if re.fullmatch(r'Attribute \d+ name', str(c))]
+    content_cols = content_firewall_columns(df)
+    brand_col = find_col(df, 'Brands', 'brands', 'Brand')
 
     issues = []
     seen_skus = {}
@@ -784,8 +989,20 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
                     reasons.append(f'image_not_a_product_photo ({bad_size[0]}'
                                    + (f' +{len(bad_size) - 1} more' if len(bad_size) > 1 else '')
                                    + ')')
+                off_canvas = image_canvas_problems(
+                    [os.path.basename(u) for u in image_urls])
+                if off_canvas:
+                    reasons.append(
+                        f'{WARNING_PREFIX}image_not_house_canvas ('
+                        f'expected {CANVAS_EDGE}x{CANVAS_EDGE}: {off_canvas[0]}'
+                        + (f' +{len(off_canvas) - 1} more'
+                           if len(off_canvas) > 1 else '') + ')')
 
-        desc = str(row.get(desc_col, '')).strip() if desc_col else ''
+        # flags app.py recorded while it laid out the images (a WARNING each)
+        if image_flags_col:
+            reasons.extend(image_flag_reasons(row.get(image_flags_col, '')))
+
+        desc =str(row.get(desc_col, '')).strip() if desc_col else ''
         if not desc or desc == PLACEHOLDER:
             reasons.append('missing_description')
 
@@ -803,10 +1020,29 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
             reasons.append(f'unescaped_comma_in_category ({cats})')
 
         reasons.extend(attribute_name_problems(row, attr_name_cols))
+        # the content firewall: nothing of the source retailer's may ship
+        # (BLOCKING - app.py should have removed it; a hit means a stale CSV
+        # or a hole in sku_enricher's firewall lists)
+        brand = str(row.get(brand_col, '') or '').strip() if brand_col else ''
+        reasons.extend(content_firewall_problems(
+            row, content_cols, brand='' if brand.lower() == 'nan' else brand))
 
         reg = to_number(row.get(reg_col, '')) if reg_col else None
         sale = to_number(row.get(sale_col, '')) if sale_col else None
-        if reg is None and sale is None:
+        if single_price_mode():
+            # [pricing] single_price: the ONE price is in 'regular price' and
+            # 'sale price' must be empty. A sale price here is a CSV built
+            # before the switch (or edited by hand): it would show a
+            # struck-through MRP and a saving on the store. BLOCKING.
+            if sale is not None:
+                reasons.append(f'sale_price_in_single_price_mode ({sale:g})')
+            # the floor / ceiling / TV checks below read 'sale' as "the price
+            # the shopper pays"; in this mode that is the one price, and the
+            # MRP-ratio checks have no pair to compare
+            sale, reg = (sale if sale is not None else reg), None
+            if sale is None:
+                reasons.append('missing_price')
+        elif reg is None and sale is None:
             reasons.append('missing_price')
         elif reg is not None and sale is not None and reg <= sale:
             reasons.append(f'regular_price<=sale_price ({reg:g} <= {sale:g})')
@@ -836,6 +1072,23 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
         gaps = str(row.get(gaps_col, '')).strip() if gaps_col else ''
         if gaps:
             reasons.append(f'missing_required_attribute ({gaps})')
+        # a filter value the page/title states but the filter sheet does not
+        # list. Since the owner decision of 2026-11-19 app.py WRITES it (note
+        # "... is a new value, add it to the sheet"); filter_value_problems
+        # reports those as warning_filter_value_not_in_sheet. The other notes
+        # (a value that could not be written) stay filter_value_unmatched.
+        # Both are WARNINGS - the fix is adding the value to the master.
+        unmatched = str(row.get(unmatched_col, '')).strip() if unmatched_col else ''
+        if unmatched.lower() == 'nan':
+            unmatched = ''
+        other_notes = [n.strip() for n in unmatched.split(';')
+                       if n.strip() and not n.strip().endswith(
+                           'is a new value, add it to the sheet')]
+        if other_notes:
+            reasons.append(f'{WARNING_PREFIX}filter_value_unmatched '
+                           f'({" | ".join(other_notes)})')   # '; ' splits reasons
+        reasons.extend(filter_value_problems(row, attr_name_cols, cats_plain,
+                                             unmatched))
 
         if title and mostly_non_latin(title):
             reasons.append('title_not_in_english (wrong locale page)')
@@ -971,10 +1224,15 @@ def main():
     # It used to always exit 0, which made "clean" and "16 rows are wrong"
     # indistinguishable to anything calling it. --warn-only keeps the old
     # behaviour for a chain that wants the report without the gate.
-    if issues and '--warn-only' not in sys.argv:
-        print(f'\nExiting 1: {len(issues)} row(s) flagged. '
+    # Rows that carry only warning_* reasons are reported but never fail it.
+    blocking = [i for i in issues if is_blocking_issue(i)]
+    if blocking and '--warn-only' not in sys.argv:
+        print(f'\nExiting 1: {len(blocking)} row(s) flagged. '
               f'Pass --warn-only to report without failing.')
         sys.exit(1)
+    if len(issues) > len(blocking):
+        print(f'\n{len(issues) - len(blocking)} row(s) carry warnings only - '
+              f'review them; they do not fail this check.')
     sys.exit(0)
 
 

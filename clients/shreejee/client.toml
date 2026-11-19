@@ -58,8 +58,37 @@ DF = ["Cooling & Freezing", "Deep Freezers"]
 AC = ["Air Conditioner", ""]
 TV = ["LED", ""]
 
+# How the build output states the price (owner decision, 2026-11-19):
+# single_price = true writes ONE price: 'regular price' = the higher of the
+# MRP and the selling price, 'sale price' = empty, and no "save" / "% off"
+# text. _filled.xlsx still records both values. Code default: false.
+[pricing]
+single_price = true
+
 [serper]
 api_key_env = "SERPER_API_KEY"   # BYOK: the env var (in the client's .env) that holds the key
 monthly_budget = 2500            # informational (free tier); the GUI shows month-to-date against it
 default_run_budget = 0           # 0 = unlimited; the GUI pre-fills --budget with it
+# "incremental" (default): a tier's uncached queries go out one at a time and
+# stop once a complete listing is verified. "batch": every query of a tier
+# goes out before any page is checked (the pre-2026-11-19 behaviour, more
+# credits). Owner set "incremental" on 2026-11-19; go back to "batch" if more
+# rows end NOT FOUND.
+query_mode = "incremental"
+# "paid_first" (default): serper.dev, DuckDuckGo only when serper fails.
+# "free_first": DuckDuckGo first, serper only when DuckDuckGo gives nothing.
+# The --search-order flag overrides this for one run.
+search_order = "paid_first"
 
+# Tier 0 of the URL search (url_index.py): the local sitemap index and the
+# retailers' own search, tried BEFORE any paid serper.dev search. Shared
+# sources live in url_sources.toml; see docs/CLIENT_CONFIG.md.
+[url_index]
+enabled = true                   # false = straight to serper/DuckDuckGo, as before
+max_age_days = 7                 # sources older than this refresh at enricher start
+disable = []                     # source / site-search names to switch off for this client
+# extra sources for this client only, same keys as [[source]] in url_sources.toml:
+# [[url_index.extra_sources]]
+# name = "mydealer"
+# root = "https://www.example.com/sitemap.xml"
+# url_pattern = '/product/'

@@ -55,7 +55,9 @@ def sample_row(**over):
                    "https://x.test/AC-SAMPLE-15TC5_2.webp,"
                    "https://x.test/AC-SAMPLE-15TC5_3.webp"),
         "regular price": 45990,
-        "sale price": 38990,
+        # a CLEAN row for the active client: with [pricing] single_price the
+        # one price is 'regular price' and a sale price is itself an issue
+        "sale price": "" if V.single_price_mode() else 38990,
     }
     row.update(over)
     return row

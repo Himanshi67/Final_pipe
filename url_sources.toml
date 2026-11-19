@@ -1,0 +1,224 @@
+# url_sources.toml - tier 0 of the URL search (url_index.py).
+#
+# [[source]]       a sitemap that feeds the local URL index (url_index\index.sqlite)
+#   name           unique id (also what clients\<slug>\client.toml [url_index] disable names)
+#   root           root sitemap URL. '' = use the Sitemap: lines of robots.txt
+#   domain         defaults to the root's host
+#   child_pattern  regex: sitemap-index children to follow ('' = all)
+#   child_exclude  regex: children never followed
+#   url_pattern    regex: product URLs to keep ('' = all)
+#   exclude_pattern regex: URLs to drop
+#   brand          set on a brand's OWN site: short model codes then match there
+#                  without the brand in the slug
+#   enabled        false = never refreshed, never looked up
+#
+# [[site_search]]  a retailer's own search endpoint (asked only when the index
+#                  verified nothing for the row)
+#   url_template   '{q}' is replaced by the URL-encoded model code
+#   extract        json | regex | css
+#   items / url_field / url_prefix / name_field / model_field   (json)
+#   pattern (named groups url, title)                           (regex)
+#   selector / attr                                             (css)
+#
+# Live check of every entry: 2026-11-19. "codes in slug" = share of product
+# URLs whose slug carries the retail model code.
+
+# ---------------------------------------------------------------- enabled
+[[source]]
+name = "lg"                      # flat urlset, ~1,800 products, 96% codes in slug
+root = "https://www.lg.com/in/sitemap.xml"
+url_pattern = '^https://www\.lg\.com/in/[^/?#]+/[^/?#]+/[^/?#]+/?$'
+exclude_pattern = '/in/(?:support|business|lg-experience|about-lg|promotions?|offers?|search|my-lg|brand|campaign|stories|magazine)/'
+brand = "lg"
+enabled = true
+
+[[source]]
+name = "bosch"                   # 2,027 URLs, 95%, code UPPERCASE exact
+root = "https://www.bosch-home.in/sitemap.xml"
+child_exclude = 'sherpa'         # do NOT use the sherpa-sitemap
+url_pattern = '/en/product/'
+brand = "bosch"
+enabled = true
+
+[[source]]
+name = "voltasbeko"              # 198 product pages, 100%
+root = "https://www.voltasbeko.com/sitemap.xml"
+url_pattern = '\.html$'
+brand = "voltas"
+enabled = true
+
+[[source]]
+name = "samsung"                 # b2c -> da (appliances, 438) + vd (TV); 89%, code = last slug token
+root = "https://www.samsung.com/in/sitemap.xml"
+child_pattern = '(?:b2c|da|vd)-sitemap\.xml'   # skip im- (mobile)
+url_pattern = '^https://www\.samsung\.com/in/'
+brand = "samsung"
+enabled = true
+
+[[source]]
+name = "haier"                   # 2,986 URLs, 86%. haierindia.com sits behind an AppTrana WAF (503) - not used
+root = "https://www.haier.com/in/sitemap.xml"
+url_pattern = '\.shtml$'
+brand = "haier"
+enabled = true
+
+[[source]]
+name = "godrej"                  # b2c-products only, 1,304 /p/ URLs, no lastmod
+root = "https://www.godrejenterprises.com/sitemap.xml"
+child_pattern = '/sitemap/b2c-products\.xml'
+url_pattern = '/p/'
+brand = "godrej"
+enabled = true
+
+[[source]]
+name = "panasonic"               # 926, 74%. /in/sitemap.xml has an EMPTY body - use /in/en/
+root = "https://www.panasonic.com/in/en/sitemap.xml"
+url_pattern = '^https://www\.panasonic\.com/in/'
+brand = "panasonic"
+enabled = true
+
+[[source]]
+name = "poorvika"                # single urlset, 7,878, 76%
+root = "https://www.poorvika.com/sitemap_product.xml"
+url_pattern = '/p/?$'
+enabled = true
+
+[[source]]
+name = "vijaysales"              # one products child, 6,035, 62%
+root = "https://www.vijaysales.com/sitemap-index.xml"
+child_pattern = 'products-sitemap\.xml'
+url_pattern = '/p/'
+enabled = true
+
+[[source]]
+name = "reliancedigital"         # /sitemap/products/{1..18}/page.sitemap.xml, ~9,000, 61%
+root = "https://www.reliancedigital.in/sitemap.xml"
+child_pattern = '/sitemap/products/'
+url_pattern = '/product/'
+enabled = true
+
+# ------------------------------------------------- present but disabled
+[[source]]
+name = "croma"                   # sitemap has NO product child - croma is covered by site search
+root = "https://www.croma.com/sitemap.xml"
+enabled = false
+
+[[source]]
+name = "flipkart"                # children 28 MB gz each, ~270M URLs total, slugs are titles not codes
+root = "https://www.flipkart.com/sitemap.xml"
+enabled = false
+
+[[source]]
+name = "tatacliq"                # appliance children hold ~1 URL each; mostly fashion
+root = "https://www.tatacliq.com/sitemap.xml"
+enabled = false
+
+[[source]]
+name = "amazon"                  # no sitemap
+domain = "amazon.in"
+enabled = false
+
+[[source]]
+name = "ifb"                     # slug is often a series name, not the model code
+domain = "ifbappliances.com"
+brand = "ifb"
+enabled = false
+
+[[source]]
+name = "bajaj"                   # Shopify handles are names, 3-8% codes
+domain = "bajajelectricals.com"
+brand = "bajaj"
+enabled = false
+
+[[source]]
+name = "crompton"                # Shopify handles are names, 3-8% codes
+domain = "crompton.co.in"
+brand = "crompton"
+enabled = false
+
+[[source]]
+name = "sony"                    # thin: 45 URLs, partial codes, Crawl-delay 5
+domain = "sony.co.in"
+brand = "sony"
+enabled = false
+
+[[source]]
+name = "havells"                 # slugs carry internal Havells item codes, not retail model codes.
+domain = "havells.com"           # robots Sitemap: lines are wrapped in a Barracuda
+brand = "havells"                # linkprotect.cudasvc.com?a= link and filenames are dated -
+enabled = false                  # if ever enabled, decode the a= param from robots, never hardcode
+
+[[source]]
+name = "lloyd"                   # same Havells platform and the same problems as above
+domain = "lloyd.in"
+brand = "lloyd"
+enabled = false
+
+[[source]]
+name = "whirlpool"               # whirlpoolindia.com robots/sitemap return a parked "RedirHub" page
+domain = "whirlpoolindia.com"
+brand = "whirlpool"
+enabled = false
+
+[[source]]
+name = "usha"                    # no sitemap (404)
+domain = "usha.com"
+brand = "usha"
+enabled = false
+
+# ------------------------------------------------------------ site search
+# Order matters: reliance first, then croma.
+
+[[site_search]]
+name = "reliancedigital"         # zero items is a normal miss (codes Reliance does not stock)
+url_template = "https://www.reliancedigital.in/ext/raven-api/catalog/v1.0/products?q={q}&page_size=12"
+extract = "json"
+items = "items"
+url_field = "slug"
+url_prefix = "https://www.reliancedigital.in/product/"
+name_field = "name"
+model_field = "attributes.model" # exact model field: accepted on equality, else code-in-name
+enabled = true
+
+[[site_search]]
+name = "croma"                   # the ':relevance' suffix (%3Arelevance) is REQUIRED - 400 without it
+url_template = "https://api.croma.com/searchservices/v1/search?currentPage=0&query={q}%3Arelevance&fields=FULL&channel=WEB&channelCode=400049&spellOpt=DEFAULT"
+extract = "json"
+items = "products"
+url_field = "url"                # relative
+url_prefix = "https://www.croma.com"
+name_field = "name"              # model code sits in parentheses: "(GL-N292DDSY, Dazzle Steel)"
+enabled = true
+
+[[site_search]]
+name = "flipkart"                # robots disallows /search?, and code results were wrong (ink for a washer)
+url_template = "https://www.flipkart.com/search?q={q}"
+extract = "regex"
+pattern = 'href="(?P<url>/[^"]+/p/[^"]+)"'
+url_prefix = "https://www.flipkart.com"
+enabled = false
+
+[[site_search]]
+# Third and last fallback (owner decision, 2026-11-19). Results come from the
+# Unbxd API the search-listing page calls in the browser. Its keys sit in the
+# page's hidden inputs: they are read at run time, once per run, kept in memory
+# only - never hardcoded here, never cached, logged or reported.
+# DISABLED: the endpoint below is INFERRED and has not been confirmed live.
+# The live probe (one page fetch + one search) was refused by the agent's
+# permission system on 2026-11-19, so the response shape is unverified. The
+# fields are best guesses with fallbacks ('a|b' = first non-empty). Confirm
+# with one manual run, then set enabled = true.
+name = "vijaysales"
+key_page = "https://www.vijaysales.com/search-listing?q=tv"
+key_inputs = ["unbxd-apiKey", "unbxd-siteKey"]
+url_template = "https://search.unbxd.io/{key:unbxd-apiKey}/{key:unbxd-siteKey}/search?q={q}&rows=12&format=json"
+extract = "json"
+items = "response.products"
+url_field = "productUrl|url|uniqueId"
+url_prefix = "https://www.vijaysales.com/"
+url_must_match = '^https://www\.vijaysales\.com/(?:.+/)?p/'   # only real /p/ product pages
+name_field = "title|name"
+model_field = "modelNumber|model|sku"
+enabled = false
+
+# tatacliq: no usable endpoint.

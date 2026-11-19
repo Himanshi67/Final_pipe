@@ -231,6 +231,9 @@ and the only source of the `WM ` names — is gone.
 and a title with nothing readable (which now yields Brand only, not a table of
 placeholders), plus a check that no banned wording appears in any generated field.
 **Accept:** a TV row exports no `WM *` attribute and no `Standard …` placeholder value.
+**Follow-up fixed (2026-11-19):** `build_descriptions` still wrote one invented row
+into every long description, `Standard Operational Grid: 230 V / 50 Hz`. It is removed;
+`tests\test_content_firewall.py::test_invented_mains_row_is_gone` pins it.
 
 ## KI-15 · HIGH · open — infrastructure, not code
 **What:** `https://shreejeeelectronics.in` sits behind Hostinger's CDN JS challenge

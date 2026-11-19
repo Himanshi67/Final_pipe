@@ -32,6 +32,9 @@ from pathlib import Path
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+# these suites drive the real main() with no network: keep tier 0 (the
+# sitemap refresh + site search, url_index.py) off - also when run standalone
+os.environ.setdefault("PIPELINE_URL_INDEX", "off")
 
 import client_config                                          # noqa: E402
 import sku_enricher as E                                      # noqa: E402

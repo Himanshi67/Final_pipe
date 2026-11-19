@@ -26,7 +26,8 @@ Public API:
     ClientConfigError
     ClientConfig(slug, name, dir, store_url, media_base_template,
                  seo_site_name, placeholder_html, category_map, category_seo,
-                 attributes_master, image_dir, backups_dir, sku, serper)
+                 attributes_master, image_dir, backups_dir, sku, serper,
+                 url_index)
         .media_base(month=None) -> str
         .credits_file -> Path            clients/<slug>/credits.json
         .env_file     -> Path            clients/<slug>/.env
@@ -34,8 +35,11 @@ Public API:
               strip_codes)                          [sku]    - item 2
         .prefixes        -> tuple  parent codes in TOML order + fallback
         .enricher_codes  -> tuple  input_codes + prefixes + strip_codes
-    SerperConfig(api_key_env, monthly_budget, default_run_budget)
-                                                    [serper] - item 4
+    SerperConfig(api_key_env, monthly_budget, default_run_budget,
+                 query_mode, search_order)          [serper] - item 4
+    UrlIndexConfig(enabled, max_age_days, extra_sources, disable)
+                                                    [url_index] - tier 0
+    PricingConfig(single_price)                     [pricing] - one price only
     available_clients() · broken_clients() · resolve_slug(argv, explicit)
     load_client(slug, argv)
     load_env(cfg) -> dict                           clients/<slug>/.env
@@ -49,7 +53,7 @@ from __future__ import annotations
 import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -118,6 +122,40 @@ class SerperConfig:
     api_key_env: str = "SERPER_API_KEY"
     monthly_budget: int = 2500          # informational (free tier)
     default_run_budget: int = 0         # 0 = unlimited
+    # "incremental": send a tier's uncached queries one at a time and stop
+    # once a complete listing is verified; "batch": send the whole tier first
+    query_mode: str = "incremental"
+    # "paid_first": serper, DuckDuckGo only as a fallback; "free_first":
+    # DuckDuckGo first, serper only when DuckDuckGo gives nothing
+    search_order: str = "paid_first"
+
+
+SERPER_QUERY_MODES = ("incremental", "batch")
+SERPER_SEARCH_ORDERS = ("paid_first", "free_first")
+
+
+@dataclass(frozen=True)
+class UrlIndexConfig:
+    """[url_index] - tier 0 of the URL search (url_index.py): the sitemap
+    index and retailer site search that run before any paid search."""
+    enabled: bool = True
+    max_age_days: float = 7.0          # auto-refresh sources older than this
+    extra_sources: tuple = ()          # [[url_index.extra_sources]] tables (dicts)
+    disable: tuple = ()                # source / site-search names switched off
+
+
+@dataclass(frozen=True)
+class PricingConfig:
+    """[pricing] - how the build output states a product's price.
+
+    single_price = false (default): 'regular price' is the MRP (struck
+    through) and 'sale price' the selling price, as scraped.
+    single_price = true: ONE price only. 'regular price' = the HIGHER of the
+    row's MRP and selling price (whichever exist), 'sale price' = empty. No
+    discount, "save" or "% off" text is written. The enricher's _filled.xlsx
+    still records both values; only the build output is single-price.
+    """
+    single_price: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +174,8 @@ class ClientConfig:
     backups_dir: Path
     sku: SkuScheme
     serper: SerperConfig
+    url_index: UrlIndexConfig = field(default_factory=UrlIndexConfig)
+    pricing: PricingConfig = field(default_factory=PricingConfig)
 
     @property
     def credits_file(self) -> Path:
@@ -394,13 +434,78 @@ def _load_serper(data, where) -> SerperConfig:
                 f"{where}: [serper] {key} must not be negative, got {value}")
         return value
 
+    def _choice(key, default, allowed):
+        raw = str(table.get(key, default) or default).strip().lower()
+        if raw not in allowed:
+            raise ClientConfigError(
+                f"{where}: [serper] {key} must be one of "
+                f"{', '.join(allowed)}, got {table.get(key)!r}")
+        return raw
+
     return SerperConfig(
         api_key_env=(str(table.get("api_key_env") or "").strip()
                      or defaults.api_key_env),
         monthly_budget=_int("monthly_budget", defaults.monthly_budget),
         default_run_budget=_int("default_run_budget",
                                 defaults.default_run_budget),
+        query_mode=_choice("query_mode", defaults.query_mode,
+                           SERPER_QUERY_MODES),
+        search_order=_choice("search_order", defaults.search_order,
+                             SERPER_SEARCH_ORDERS),
     )
+
+
+def _load_url_index(data, where) -> UrlIndexConfig:
+    """Parse the optional [url_index] table; every key has a working default.
+    Source entries are only shape-checked here - url_index.load_config()
+    validates their keys when it builds the source list."""
+    table = data.get("url_index") or {}
+    if not isinstance(table, dict):
+        raise ClientConfigError(f"{where}: [url_index] must be a table.")
+    defaults = UrlIndexConfig()
+    enabled = table.get("enabled", defaults.enabled)
+    if not isinstance(enabled, bool):
+        raise ClientConfigError(
+            f"{where}: [url_index] enabled must be true or false, got {enabled!r}")
+    raw_age = table.get("max_age_days", defaults.max_age_days)
+    try:
+        max_age = float(raw_age)
+    except (TypeError, ValueError):
+        raise ClientConfigError(
+            f"{where}: [url_index] max_age_days must be a number, "
+            f"got {raw_age!r}") from None
+    if max_age < 0:
+        raise ClientConfigError(
+            f"{where}: [url_index] max_age_days must not be negative, got {max_age}")
+    extra = table.get("extra_sources", [])
+    if not isinstance(extra, list) or not all(
+            isinstance(e, dict) and str(e.get("name") or "").strip() for e in extra):
+        raise ClientConfigError(
+            f"{where}: [url_index] extra_sources must be a list of tables, "
+            f"each with a name.")
+    disable = table.get("disable", [])
+    if not isinstance(disable, list) or not all(isinstance(d, str) for d in disable):
+        raise ClientConfigError(
+            f"{where}: [url_index] disable must be a list of source names.")
+    return UrlIndexConfig(
+        enabled=enabled,
+        max_age_days=max_age,
+        extra_sources=tuple(dict(e) for e in extra),
+        disable=tuple(d.strip() for d in disable if d.strip()),
+    )
+
+
+def _load_pricing(data, where) -> PricingConfig:
+    """Parse the optional [pricing] table; every key has a working default."""
+    table = data.get("pricing") or {}
+    if not isinstance(table, dict):
+        raise ClientConfigError(f"{where}: [pricing] must be a table.")
+    single = table.get("single_price", PricingConfig().single_price)
+    if not isinstance(single, bool):
+        raise ClientConfigError(
+            f"{where}: [pricing] single_price must be true or false, "
+            f"got {single!r}")
+    return PricingConfig(single_price=single)
 
 
 def load_client(slug=None, argv=None) -> ClientConfig:
@@ -465,6 +570,8 @@ def load_client(slug=None, argv=None) -> ClientConfig:
         backups_dir=client_dir / "backups",
         sku=_load_sku_scheme(data, where),
         serper=_load_serper(data, where),
+        url_index=_load_url_index(data, where),
+        pricing=_load_pricing(data, where),
     )
 
 

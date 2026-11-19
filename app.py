@@ -3,13 +3,22 @@ import pandas as pd
 import re
 import io
 import os
+import shutil
 import sys
+from collections import namedtuple
 from datetime import datetime
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from PIL import Image
+from PIL import Image, ImageChops
 
 import client_config
+# The content firewall (owner rule 2026-11-19: nothing that belongs to the
+# source retailer reaches a field we write) and the key-point cap live in
+# sku_enricher.py - ONE source of truth for the scraper and this builder.
+# Applied here too so already-enriched *_filled.xlsx sheets are cleaned at
+# build time without a re-scrape.
+from sku_enricher import (KEY_POINTS_MAX, content_clean, content_ok,
+                          spec_row_ok)
 
 # Which store this process is building for (PRODUCT_PLAN Phase 1 item 1).
 # Resolved from --client / $PIPELINE_CLIENT / DEFAULT_CLIENT, so a caller that
@@ -94,18 +103,16 @@ def _ui():
 
 
 REQUIRED_INPUT_COLUMNS = ['sku', 'title', 'categories', 'Brands', 'regular price', 'sale price', 'url_link', 'image_url']
-EXPORTED_OUTPUT_COLUMNS = ['sku', 'cross reference tag', 'configuration', 'short description', 'description', 'title', 'categories', 'Tags', 'regular price', 'sale price', 'Brands', '_consolidated_sku', 'Images', '_spec_gaps']
+EXPORTED_OUTPUT_COLUMNS = ['sku', 'cross reference tag', 'configuration', 'short description', 'description', 'title', 'categories', 'Tags', 'regular price', 'sale price', 'Brands', '_consolidated_sku', 'Images', '_spec_gaps', '_filter_unmatched', '_image_flags']
 IMAGE_ROOT = 'product_images_for_upload'   # folder NAME (kept for compatibility)
 # Where images are actually written: <repo>/product_images_for_upload/<slug>.
 # Absolute and per-client, so two clients cannot overwrite each other's
 # SKU_n.webp and a run no longer depends on the process's cwd (P3-57).
 IMAGE_DIR = CLIENT.image_dir
 MAX_ATTRIBUTES = 15   # each one costs 4 CSV columns, so the sheet stays usable
-# The short description renders right under the price; a 15-row table there
-# pushes the buy button off the screen. The essentials (brand, capacity,
-# screen, resolution, rating...) always rank first in product_specs, so the
-# cap keeps the best rows. The LONG description still carries everything.
-SHORT_DESC_MAX_SPECS = 6
+# The key-features paragraph, the short description and the long description
+# each show at most sku_enricher.KEY_POINTS_MAX relevant spec points, chosen
+# by key_points() (owner rule 2026-11-19). The attributes are NOT capped by it.
 
 # ---- image quality ---------------------------------------------------------
 # 90 was visibly soft on a 1500px product shot once WooCommerce re-encoded its
@@ -122,15 +129,9 @@ WEBP_QUALITY = 95
 WEBP_METHOD = 4
 # Long edge to keep. WooCommerce generates its own thumbnails, so the master
 # only has to be big enough for the zoom/lightbox; past this it is bandwidth.
-# Only governs the non-square path: squared catalogue masters are finished at
-# CATALOG_EDGE below, which supersedes this cap.
+# Only governs the non-square path: squared catalogue masters are finished on
+# the fixed CANVAS_EDGE below, which supersedes this cap.
 MAX_IMAGE_EDGE = 2400
-# Main product images ship at ONE of two fixed square renditions - 1200x1200
-# when the source square is big enough, 1000x1000 otherwise - because the
-# catalogue grid only lines up when every tile is the same shape and scale.
-# The fallback IS MIN_IMAGE_EDGE by construction: anything that passed the
-# floor can always be finished at 1000x1000 without upscaling.
-CATALOG_EDGE = 1200
 # Below this a photo is a thumbnail, not a product image. Skipped outright -
 # one image fewer beats a blurry one on the storefront. Raised from 500 to an
 # HD floor: 500px filled a product tile but went soft the moment a customer
@@ -144,6 +145,45 @@ MIN_IMAGE_EDGE = 1000
 # products (TVs, front-load washers) whole; a centre-crop cut their edges off.
 SQUARE_IMAGES = True
 SQUARE_BACKGROUND = (255, 255, 255)
+
+# ---- house layout (applies only while SQUARE_IMAGES is True) ---------------
+# Owner rule (2026-11-19): ONE fixed layout for every photo of every product -
+# a CANVAS_EDGE x CANVAS_EDGE WebP canvas, pure white, the product centred with
+# MARGIN_PCT of white on its LIMITING side (the axis that fills first); the
+# other axis takes what is left, so a 16:9 TV gets wide white bands top and
+# bottom. Never cropped. (This replaced the per-product 1500/1200/1000 tiers,
+# which gave one product's gallery three different canvas sizes.)
+#
+# Owner decision (2026-11-19, fifth round): the canvas is 1500 x 1500 (it was
+# 1200). The layout rule did not change. A source needs inner/long-edge to
+# fill the canvas, where inner = 1500 x (1 - 2 x MARGIN_PCT%) = 1380 for a
+# white-background photo and 1500 for a lifestyle shot. MAX_UPSCALE caps the
+# growth at 15%, so a source with a long edge under 1200 (white) / 1305
+# (lifestyle) does NOT fill the canvas: it grows by 1.15x and sits centred,
+# smaller, with more white around it. A 1000px source (the MIN_IMAGE_EDGE
+# floor) becomes a 1150px product on the 1500 canvas. It is never dropped and
+# never upscaled past 15%.
+CANVAS_EDGE = 1500
+MAX_UPSCALE = 1.15
+# White space on each side of a white-background product, as a percentage of
+# the canvas edge, measured on the limiting axis.
+MARGIN_PCT = 4
+# A background is "white" when at least WHITE_SHARE of the pixels in the outer
+# BORDER_PCT strip on all four sides have EVERY channel >= WHITE_MIN.
+# Transparent pixels count as white (they are composited onto white first).
+BORDER_PCT = 2
+WHITE_MIN = 245
+WHITE_SHARE = 0.95
+# Product pixels for the trim: any channel more than BBOX_TOL below 255. JPEG
+# noise in a white backdrop stays under it.
+BBOX_TOL = 12
+# A trim box narrower or shorter than this percentage of the source is a speck
+# of dust or noise, not a product: the layout then uses the untrimmed image.
+BBOX_MIN_PCT = 2
+# The reason written to _image_flags when no gallery image has a white
+# background, so the featured image is a lifestyle shot. validate_csv.py turns
+# it into a WARNING - it never blocks the import.
+FLAG_MAIN_NOT_WHITE = 'main image background not white'
 BROWSER_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
               '(KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36')
 
@@ -820,85 +860,223 @@ def configuration_text(title, category):
     return ''                                   # KI-14: was 'Appliance Utility Core'
 
 
-def load_subcategory_attributes(client=None):
-    """Read the 'Sub-Category Attributes' sheet of the taxonomy file, if it has
-    one. Returns {normalised sub-category: {axis: [allowed values]}}.
+# ------------- the attribute workbooks (owner rule 2026-11-19) ---------------
+# The client's attributes master (client.toml `attributes_master`) is the
+# SOURCE the owner builds the storefront filter groups from: its
+# 'Sub-Category Attributes' sheet lists the attribute values each sub-category
+# needs, and its filter sheet (header 'Filter Group | Filter Values') lists the
+# store's filter groups. category_map.xlsx carries copies of both sheets
+# ('Sub-Category Attributes', 'Filters') and is the FALLBACK when the master is
+# missing or lacks the sheet. tools\check_filter_sheet.py reports any drift
+# between the two copies; the build warns about it too.
+SUBCAT_SHEET = 'Sub-Category Attributes'
+SUBCAT_AXES = ('Type', 'Size', 'Star Rating', 'Ton', 'Capacity', 'Storage')
+# The sheet's SECOND, lower-case 'type' column (Fans: 'non BLDC, BLDC'; Water
+# Purifiers: 'Under Sink, Wall Mounted'). Carried as its own axis; it is an
+# OPTIONAL axis - it never creates a `_spec_gaps` entry.
+SUB_TYPE_AXIS = 'Sub Type'
+OPTIONAL_AXES = frozenset((SUB_TYPE_AXIS,))
+FILTER_GROUP_HEADER = 'filter group'
+FILTERS_SHEET_FALLBACK = 'Filters'
+# a cell that went through a wrong code page ('â€”', 'Ã©', U+FFFD) is dropped,
+# never matched against
+_MOJIBAKE_RE = re.compile('�|â€|â‚|Ã[\u0080-¿]'
+                          '|Â[\u0080-¿]')
 
-    Cells come in two flavours: an enumerable vocabulary ('1.0 Ton, 1.5 Ton,
-    2.0 Ton') and a free-text hint ('Dry Clothes Wash Load Weight in kg (e.g.
-    7.0kg)'). Only the first is usable as a value list; a hint just means the
-    axis applies to this sub-category and the value must be read off the title.
-    """
-    global SUBCATEGORY_ATTRIBUTES_WARNING
-    SUBCATEGORY_ATTRIBUTES_WARNING = ''
-    out = {}
+
+def attributes_master_path(client=None):
+    """The client's attributes master workbook, or '' when it does not exist."""
+    client = client or CLIENT
+    path = getattr(client, 'attributes_master', None)
+    return str(path) if path and os.path.exists(str(path)) else ''
+
+
+def attribute_workbooks(client=None):
+    """The workbooks the attribute sheets are read from, in priority order:
+    the attributes master first, then category_map.xlsx."""
+    out = []
+    for path in (attributes_master_path(client), category_map_path(client)):
+        if path and not path.lower().endswith('.csv') and path not in out:
+            out.append(path)
+    return out
+
+
+def _workbook_rows(path):
+    """{sheet name: [row tuples of str]} for one .xlsx (raises when unreadable)."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+    try:
+        return {ws.title: [tuple('' if c is None else str(c) for c in row)
+                           for row in ws.iter_rows(values_only=True)]
+                for ws in wb.worksheets}
+    finally:
+        wb.close()
+
+
+def _first_row(rows):
+    return next((r for r in rows if any(compact(c) for c in r)), ())
+
+
+def find_subcategory_sheet(sheets):
+    """(sheet name, rows) of the 'Sub-Category Attributes' sheet, by name, else
+    by its header (a 'Parent Category' and a 'Sub-Category' column)."""
+    for title, rows in sheets.items():
+        if _cat_norm(title) == _cat_norm(SUBCAT_SHEET):
+            return title, rows
+    for title, rows in sheets.items():
+        head = {_cat_norm(c) for c in _first_row(rows)}
+        if 'parent category' in head and 'sub-category' in head:
+            return title, rows
+    return None, None
+
+
+def find_filter_sheet(sheets):
+    """(sheet name, rows, group column) of the filter sheet. Found by HEADER -
+    a column whose header starts with 'Filter Group' - so 'Sheet2' in the
+    master and 'Filters' in category_map.xlsx are both found. A sheet named
+    'Filters' with another header is accepted last, column A."""
+    for title, rows in sheets.items():
+        for col, cell in enumerate(_first_row(rows)):
+            if _cat_norm(cell).startswith(FILTER_GROUP_HEADER):
+                return title, rows, col
+    for title, rows in sheets.items():
+        if _cat_norm(title) == _cat_norm(FILTERS_SHEET_FALLBACK):
+            return title, rows, 0
+    return None, None, None
+
+
+def subcategory_records(rows):
+    """Data rows of a 'Sub-Category Attributes' sheet as dicts keyed by
+    'Parent Category', 'Sub-Category', each axis in SUBCAT_AXES and
+    SUB_TYPE_AXIS (the second 'type' column). Cells are compacted strings."""
+    head = _first_row(rows)
+    if not head:
+        return []
+    start = rows.index(head) + 1
+    columns = {}
+    for col, cell in enumerate(head):
+        name = compact(cell)
+        low = name.lower()
+        if low == 'type':
+            key = 'Type' if 'Type' not in columns.values() else SUB_TYPE_AXIS
+        else:
+            key = next((k for k in ('Parent Category', 'Sub-Category') + SUBCAT_AXES
+                        if k.lower() == low), None)
+        if key and key not in columns.values():
+            columns[col] = key
+    out = []
+    for row in rows[start:]:
+        record = {key: compact(row[col]) if col < len(row) else ''
+                  for col, key in columns.items()}
+        if any(record.values()):
+            out.append(record)
+    return out
+
+
+def _subcategory_sheet(client=None):
+    """(records, source path, problems) from the first workbook that has the
+    'Sub-Category Attributes' sheet - the master first."""
     problems = []
-    for path in ([category_map_path(client)] if category_map_path(client) else []):
+    for path in attribute_workbooks(client):
         name = os.path.basename(path)
-        if path.lower().endswith('.csv'):
-            continue
         try:
-            table = pd.read_excel(path, sheet_name='Sub-Category Attributes',
-                                  dtype=str).fillna('')
+            sheets = _workbook_rows(path)
         except Exception as exc:
+            problems.append(f'{name}: {type(exc).__name__}: {exc}')
+            continue
+        _title, rows = find_subcategory_sheet(sheets)
+        if rows is None:
             # NEVER swallow this silently: with no axes, missing_spec_axes()
             # returns [] for every product, so `_spec_gaps` is blank and
             # validate_csv reports no missing_required_attribute - a build
             # that looks perfect while checking nothing. The usual cause is
             # the workbook having been rewritten as a single sheet; restore
             # it from backups\category_map_<ts>.xlsx.
-            problems.append(f'{name}: {type(exc).__name__}: {exc}')
+            problems.append(f"{name}: no '{SUBCAT_SHEET}' sheet")
             continue
-        # A parent is only safe to inherit from when it declares exactly ONE
-        # attribute row (the LED shape: one row listing every sub-category).
-        # 'Home Appliances' has 12 heterogeneous rows and Fans is the first, so
-        # inheriting "whichever row came first" gave every bare-parent product
-        # the ceiling-fan axes - build_tags shipped the tag 'Table' on a
-        # dishwasher and 'Wall' on a water softener, and missing_spec_axes
-        # invented gaps ('Type, Size, Star Rating, Capacity') that validate_csv
-        # then reported as missing_required_attribute.
-        parent_rows = {}
-        for _, row in table.iterrows():
-            if not compact(row.get('Sub-Category')):
-                continue
-            key = _cat_norm(compact(row.get('Parent Category')))
+        return subcategory_records(rows), path, problems
+    return [], '', problems
+
+
+def _index_subcategories(records, cell_fn):
+    """{normalised sub-category: {axis: cell_fn(axis, cell)}} with the keying
+    rules below. Axes for which cell_fn returns None are left out."""
+    out = {}
+    # A parent is only safe to inherit from when it declares exactly ONE
+    # attribute row (the LED shape: one row listing every sub-category).
+    # 'Home Appliances' has 12 heterogeneous rows and Fans is the first, so
+    # inheriting "whichever row came first" gave every bare-parent product
+    # the ceiling-fan axes - build_tags shipped the tag 'Table' on a
+    # dishwasher and 'Wall' on a water softener, and missing_spec_axes
+    # invented gaps ('Type, Size, Star Rating, Capacity') that validate_csv
+    # then reported as missing_required_attribute.
+    parent_rows = {}
+    for row in records:
+        if row.get('Sub-Category'):
+            key = _cat_norm(row.get('Parent Category'))
             parent_rows[key] = parent_rows.get(key, 0) + 1
-        for _, row in table.iterrows():
-            sub = compact(row.get('Sub-Category'))
-            if not sub:
-                continue
-            axes = {}
-            for axis in ('Type', 'Size', 'Star Rating', 'Ton', 'Capacity', 'Storage'):
-                cell = compact(row.get(axis))
-                if not cell or cell.upper() == 'N/A':
-                    continue
-                looks_like_hint = ('e.g' in cell.lower() or '(' in cell
-                                   or len(cell) > 60)
-                values = [] if looks_like_hint else [
-                    compact(v) for v in cell.split(',') if compact(v)]
-                axes[axis] = values
-            # P1-17: the merged cell as written ('Juicers, Mixers & Grinders')
-            # is itself a taxonomy sub-category, and a product filed under the
-            # whole string used to find nothing here
-            out[_cat_norm(sub)] = axes
-            # the LED row lists several sub-categories in one cell
-            for one in re.split(r',', sub):
-                one = compact(one)
-                if one:
-                    out[_cat_norm(one)] = axes
-            # a product filed under the bare parent (split_hierarchy turns
-            # 'LED' into ('LED', 'LED')) keeps the same required axes as the
-            # parent's sub-categories - but ONLY when the parent has a single
-            # attribute row, so "the parent's axes" is not ambiguous.
-            # setdefault so a real sub named like a parent still wins.
-            parent_name = compact(row.get('Parent Category'))
-            if parent_name and parent_rows.get(_cat_norm(parent_name)) == 1:
-                out.setdefault(_cat_norm(parent_name), axes)
-        break
+    for row in records:
+        sub = row.get('Sub-Category', '')
+        if not sub:
+            continue
+        axes = {}
+        for axis in SUBCAT_AXES + (SUB_TYPE_AXIS,):
+            value = cell_fn(axis, row.get(axis, ''))
+            if value is not None:
+                axes[axis] = value
+        # P1-17: the merged cell as written ('Juicers, Mixers & Grinders')
+        # is itself a taxonomy sub-category, and a product filed under the
+        # whole string used to find nothing here
+        out[_cat_norm(sub)] = axes
+        # the LED row lists several sub-categories in one cell
+        for one in re.split(r',', sub):
+            one = compact(one)
+            if one:
+                out[_cat_norm(one)] = axes
+        # a product filed under the bare parent (split_hierarchy turns
+        # 'LED' into ('LED', 'LED')) keeps the same required axes as the
+        # parent's sub-categories - but ONLY when the parent has a single
+        # attribute row, so "the parent's axes" is not ambiguous.
+        # setdefault so a real sub named like a parent still wins.
+        parent_name = row.get('Parent Category', '')
+        if parent_name and parent_rows.get(_cat_norm(parent_name)) == 1:
+            out.setdefault(_cat_norm(parent_name), axes)
+    return out
+
+
+def _legacy_axis_values(_axis, cell):
+    """The vocabulary shape attribute_axes() has always returned: a listed
+    cell -> its comma parts; a free-text hint -> [] (the axis applies, the
+    value must come from elsewhere); empty / N/A -> None (axis absent)."""
+    cell = compact(cell)
+    if not cell or cell.upper() == 'N/A':
+        return None
+    looks_like_hint = 'e.g' in cell.lower() or '(' in cell or len(cell) > 60
+    return [] if looks_like_hint else [
+        compact(v) for v in cell.split(',') if compact(v)]
+
+
+def load_subcategory_attributes(client=None):
+    """Read the 'Sub-Category Attributes' sheet - from the client's attributes
+    master when it has one, else from category_map.xlsx. Returns
+    {normalised sub-category: {axis: [allowed values]}}; the second 'type'
+    column is the SUB_TYPE_AXIS axis.
+
+    Cells come in two flavours: an enumerable vocabulary ('1.0 Ton, 1.5 Ton,
+    2.0 Ton') and a free-text hint ('Dry Clothes Wash Load Weight in kg (e.g.
+    7.0kg)'). Only the first is usable as a value list here; a hint just means
+    the axis applies to this sub-category. (The filter-group code reads the
+    same cells more deeply - see parse_axis_cell.)
+    """
+    global SUBCATEGORY_ATTRIBUTES_WARNING
+    SUBCATEGORY_ATTRIBUTES_WARNING = ''
+    records, _source, problems = _subcategory_sheet(client)
+    out = _index_subcategories(records, _legacy_axis_values)
     if not out:
         SUBCATEGORY_ATTRIBUTES_WARNING = (
             "No 'Sub-Category Attributes' sheet could be read from the "
-            "taxonomy file, so NO required attribute axes are known: "
+            "attributes master or the taxonomy file, so NO required "
+            "attribute axes (and no filter axes) are known: "
             "`_spec_gaps` will be blank for every product and validate_csv "
             "will report no missing_required_attribute. Restore "
             "category_map.xlsx from backups\\category_map_<timestamp>.xlsx."
@@ -971,8 +1149,32 @@ SMART_OS_PATTERNS = (
     (r'\bwebos\b', 'WebOS'),
     (r'\btizen\b', 'Tizen'),
     (r'fire\s*tv', 'Fire TV'),
-    (r'\bsmart\b', 'Smart TV'),
+    (r'\bvidaa\b', 'VIDAA'),
 )
+# A bare "Smart" in a title is NOT a platform (owner decision 2026-11-19:
+# write the platform when the page names one, else nothing). spec_tags()
+# keeps it under its own key 'smart', which only feeds the tag "Smart TV".
+SMART_WORD_RE = re.compile(r'\bsmart\b', re.IGNORECASE)
+
+# Labels that name a TV's platform / operating system, in any wording, and the
+# bare values that say "it is smart" without naming one. Such a row is never
+# written - not as an attribute, not in the description spec table, not in
+# the key features (see bare_platform_row).
+PLATFORM_LABEL_RE = re.compile(
+    r'(?:smart\s*(?:tv\s*)?platform|tv\s+smart\s+features?|'
+    r'(?:smart\s*(?:tv\s*)?|tv\s+)?(?:operating\s+system|os)|platform|'
+    r'smart\s*tv\s*(?:operating\s+system|os|platform|type))',
+    re.IGNORECASE)
+BARE_PLATFORM_VALUES = frozenset((
+    'smart tv', 'smart', 'yes', 'no', 'na', 'n/a', 'none', 'not available'))
+
+
+def bare_platform_row(label, value):
+    """True for a platform/OS-style label whose value names no platform
+    ('Smart Platform = Smart TV', 'Operating System = Yes')."""
+    lab = compact(label).strip(': ')
+    val = compact(value).lower().strip(' .')
+    return bool(PLATFORM_LABEL_RE.fullmatch(lab)) and val in BARE_PLATFORM_VALUES
 PRICE_BANDS = ((10000, 'Under 10000'), (20000, '10000 to 20000'),
                (30000, '20000 to 30000'), (50000, '30000 to 50000'),
                (100000, '50000 to 100000'), (float('inf'), 'Above 100000'))
@@ -1007,6 +1209,8 @@ def spec_tags(title):
         if re.search(pattern, t, re.IGNORECASE):
             found['platform'] = label
             break
+    if SMART_WORD_RE.search(t):
+        found['smart'] = 'Smart TV'      # a tag only, never a platform value
     return found
 
 
@@ -1072,9 +1276,13 @@ def configure(slug):
     global SUBCATEGORY_ATTRIBUTES, CATEGORY_SEO
     global SKU_PREFIX_BY_PARENT, SKU_PREFIXES, SKU_PREFIX_CATEGORY
     global SKU_NEVER_RENAME, SKU_FALLBACK_PREFIX
+    global FILTER_GROUPS, SUBCATEGORY_FILTER_AXES, FILTER_SHEET_WARNING
     incoming = client_config.load_client(slug)
     combos, parents, map_file = load_category_map(incoming)
     attributes = load_subcategory_attributes(incoming)
+    filter_groups = load_filter_groups(incoming)
+    filter_axes_table = load_subcategory_filter_axes(incoming)
+    sheet_warning = filter_sheet_warning(incoming)
     seo_table = load_category_seo(incoming)
 
     CLIENT = incoming
@@ -1084,6 +1292,9 @@ def configure(slug):
     CATEGORY_SEO_FILE = incoming.category_seo.name
     CATEGORY_COMBOS, CATEGORY_PARENTS, CATEGORY_MAP_FILE = combos, parents, map_file
     SUBCATEGORY_ATTRIBUTES = attributes
+    FILTER_GROUPS = filter_groups
+    SUBCATEGORY_FILTER_AXES = filter_axes_table
+    FILTER_SHEET_WARNING = sheet_warning
     CATEGORY_SEO = seo_table
     SKU_PREFIX_BY_PARENT = dict(incoming.sku.prefix_by_parent)
     SKU_PREFIXES = incoming.sku.prefixes
@@ -1126,6 +1337,8 @@ def build_tags(brand, parent, sub, title, sale_price, category_family):
                     'Size': 'screen', 'Storage': 'volume'}
 
     for axis, allowed in axes.items():
+        if axis in OPTIONAL_AXES:        # tags stay as they were before it
+            continue
         if axis == 'Capacity':
             # 'Capacity' means kg for washers, litres for fridges, inches for TVs
             for key in ('weight', 'volume', 'screen'):
@@ -1141,7 +1354,9 @@ def build_tags(brand, parent, sub, title, sale_price, category_family):
 
     # specs worth tagging whether or not the sheet mentions them
     add(specs.get('resolution'))
-    add(specs.get('platform'))
+    # the named platform, else the plain "Smart TV" tag (tags are search
+    # groupings, not a platform claim - unchanged by the platform decision)
+    add(specs.get('platform') or specs.get('smart'))
     if 'screen' in specs and _cat_norm(parent) in ('led', 'electronicscomputing'):
         add(specs['screen'])
     add(configuration_text(title, category_family))
@@ -1200,6 +1415,8 @@ def missing_spec_axes(sub, title, category_family, scraped=(), parent=''):
     text = compact(title)
     missing = []
     for axis, allowed in axes.items():
+        if axis in OPTIONAL_AXES:        # the sheet's second 'type' column
+            continue
         # 1. the sheet's own vocabulary ('Inverter, Fixed Speed') is in the title
         if any(v and re.search(r'\b' + re.escape(v) + r'\b', text, re.IGNORECASE)
                for v in allowed):
@@ -1255,35 +1472,1105 @@ SPEC_LABEL_CANON = {
     'product warranty': 'Warranty', 'refresh rate': 'Refresh Rate',
 }
 
-# facts that belong on an invoice, not a product page
-SPEC_LABEL_DROP = {
-    'price', 'mrp', 'discount', 'offer', 'seller', 'delivery', 'availability',
-    'stock', 'sku', 'asin', 'ean', 'upc', 'hsn', 'gst', 'tax', 'rating',
-    'ratings', 'reviews', 'best sellers rank', 'date first available',
-    'in the box', 'sales package',
-}
+# Invoice facts, seller lines and offers dressed as spec rows ('SuperDost
+# Cashback: 100 for new SuperDost Users* + 3% or 250 Cashback') are refused by
+# the content firewall imported from sku_enricher (spec_row_ok: the merged
+# label deny list + content_ok on label AND value), so an already-enriched
+# sheet carrying the junk is cleaned here without a re-scrape.
 
-# an offer dressed as a spec row ('SuperDost Cashback: 100 for new SuperDost
-# Users* + 3% or 250 Cashback'). Checked against the label AND the value, so
-# already-enriched sheets carrying the junk are cleaned here without a
-# re-scrape. Mirrors sku_enricher.SPEC_PROMO_RE - kept in both places for the
-# same reason parse_scraped_specs itself is (see its docstring).
-PROMO_SPEC_RE = re.compile(
-    r"cash\s?back|coupon|voucher|promo|superdost|super\s?coin|bank offer|"
-    r"exchange offer|no.?cost emi|instant discount|%\s*off\b|flat\s*off|"
-    r"free gift|t&c|terms apply", re.I)
+
+# The product's own size and weight, in every retailer wording, get ONE
+# catalogue name each (owner decision 2026-11-19). The box's size and weight
+# ('Package Dimensions', 'Shipping Weight') never get here: the firewall's
+# label deny list refuses them on the raw label first.
+_DIMENSIONS_LABEL_RE = re.compile(
+    r'(?:product|item|unit|overall)?\s*dimensions?'
+    r'(?:\s*[(\[]?\s*(?:in\s+)?(?:[lwhdx×*/\s]|cm|mm|inch(?:es)?|in)*[)\]]?)?',
+    re.IGNORECASE)
+_WEIGHT_LABEL_RE = re.compile(
+    r'(?:item|product|net|unit)?\s*weight'
+    r'(?:\s*[(\[]?\s*(?:in\s+)?(?:kgs?|g|grams?)[)\]]?)?', re.IGNORECASE)
 
 
 def canon_spec_label(label):
     text = compact(label).strip(': ')
-    return SPEC_LABEL_CANON.get(text.lower(), text)
+    low = text.lower()
+    if low in SPEC_LABEL_CANON:
+        return SPEC_LABEL_CANON[low]
+    if _DIMENSIONS_LABEL_RE.fullmatch(low):
+        return 'Dimensions'
+    if _WEIGHT_LABEL_RE.fullmatch(low):
+        return 'Weight'
+    return text
 
 
-def parse_scraped_specs(cell):
+# ----------------- filter groups (owner rule 2026-11-19) ---------------------
+# "The sub-category attribute sheet is what we use to make the filter groups.
+# If anything scraped matches these filter groups, we include our attribute
+# value." So a product's filter attributes are NAMED by the filter group and
+# carry the SHEET's spelling of the value, never the retailer's.
+#
+# Nothing is invented: a value is only written when the scraped spec table or
+# the title states it. A stated value that snaps to an allowed value is
+# written in the sheet's spelling.
+#
+# Owner decision 2026-11-19: a scraped value is never replaced, rounded or
+# dropped because the list does not hold it; only its spelling is made
+# regular. So a stated value that does not snap is WRITTEN as the filter
+# attribute (global, first in order) and `_filter_unmatched` gets the note
+# "<Group>: '<value>' is a new value, add it to the sheet":
+#   - numeric group: a number in the axis unit (scraped label first, else the
+#     title) as number + the list's own suffix ('1.8 T' -> '1.8 Ton', '24
+#     inch' -> '24"'). A value inside a band writes the band label, and the
+#     exact source row stays as its own attribute (_repeats_filter);
+#   - text group: a value under a label DEDICATED to the group (never the
+#     title, never a general feature list) as scraped, when it passes the
+#     content firewall and is at most NEW_TEXT_VALUE_MAX characters.
+# Never a value: 'yes', 'no', 'n/a', 'not available', negatives ('without
+# heater'), and for TV Smart Features a bare 'Smart TV' (the platform is
+# written only when the page names one). No value is ever rounded to the
+# nearest allowed one.
+
+# unit -> regex of its spellings (order matters: longer spellings first)
+_UNIT_SPELLINGS = (
+    ('m3h', r'm\s*(?:³|3)\s*/\s*h(?:r|our)?|cmh'),
+    ('kva', r'kva'),
+    ('tb', r'tb'),
+    ('gb', r'gb'),
+    ('ton', r'tonnes?|tons?|tr|t'),
+    ('l', r'litres?|liters?|ltrs?|ltr|lt|l'),
+    ('kg', r'kilograms?|kgs?'),
+    ('inch', r'inches|inch|in(?!\s*\d)|"|″|”|\'\''),
+    ('star', r'stars?'),
+    ('w', r'watts?|w'),
+    ('mm', r'mm'),
+    ('cm', r'cm'),
+    ('spm', r'spm'),
+    ('rpm', r'rpm'),
+    ('hz', r'hertz|hz'),
+)
+_NUMBER = r'(\d+(?:\.\d+)?)'
+_QUANTITY_RE = re.compile(
+    _NUMBER + r'\s*-?\s*(?:' + '|'.join(f'(?P<{unit}>{spelling})'
+                                        for unit, spelling in _UNIT_SPELLINGS)
+    + r')(?![a-z0-9])', re.IGNORECASE)
+# how a free-form value is written: number + this suffix
+UNIT_DISPLAY = {
+    'm3h': ' m³/h', 'kva': ' kVA', 'gb': 'GB', 'ton': ' Ton', 'l': 'L',
+    'kg': ' kg', 'inch': ' Inch', 'star': ' Star', 'w': 'W', 'mm': 'mm',
+    'cm': ' cm', 'spm': ' SPM', 'rpm': ' RPM', 'hz': 'Hz',
+}
+_STAR_WORDS = {'one': '1', 'two': '2', 'three': '3', 'four': '4', 'five': '5'}
+
+# Wording that unambiguously means an allowed value (normalised spelling of
+# the allowed value -> extra phrases). Kept SHORT on purpose: an alias is a
+# claim that two wordings mean the same thing.
+FILTER_VALUE_ALIASES = {
+    'non inverter': ('fixed speed',),
+    'fully automatic front load': ('front load', 'front loading',
+                                   'front loader', 'front opener'),
+    'fully automatic top load': ('top load', 'top loading', 'top loader',
+                                 'top opener'),
+    'non electrical (gravity)': ('gravity', 'non electric'),
+    'semi automatic': ('semi auto', 'twin tub'),
+    'front load': ('front loading', 'front loader'),
+    'top load': ('top loading', 'top loader'),
+    # directly-fed groups (DIRECT_FILTER_GROUPS); '3840 x 2160' is folded to
+    # '3840x2160' by _norm_filter_text
+    '4k uhd': ('4k', '4k ultra hd', 'ultra hd', 'uhd', '3840x2160'),
+    'full hd': ('fhd', '1920x1080'),
+    'hd ready': ('1366x768',),
+    'built in heater': ('inbuilt heater', 'in built heater'),
+    'inverter tech': ('inverter', 'digital inverter', 'smart inverter',
+                      'inverter motor', 'inverter technology'),
+    'steam wash': ('steam', 'hygiene steam'),
+    'smart wi fi': ('wifi', 'wi fi', 'wi fi enabled'),
+    'direct drive': ('inverter direct drive',),
+    'grey': ('gray',),
+    'frost free': ('no frost',),
+}
+
+
+def _quantities(text):
+    """[(number, unit, matched text)] for every number + unit in `text`, in
+    order. TB is folded into GB (1 TB = 1024 GB) so storage lists compare."""
+    text = compact(text)
+    text = re.sub(r'\b(one|two|three|four|five)\b(?=\s*-?\s*stars?\b)',
+                  lambda m: _STAR_WORDS[m.group(1).lower()], text,
+                  flags=re.IGNORECASE)
+    out = []
+    for m in _QUANTITY_RE.finditer(text):
+        unit = next(u for u, _s in _UNIT_SPELLINGS if m.group(u) is not None)
+        number = float(m.group(1))
+        if unit == 'tb':
+            unit, number = 'gb', number * 1024
+        out.append((number, unit, m.group(0)))
+    return out
+
+
+def _bare_number(text):
+    m = re.fullmatch(r'\s*' + _NUMBER + r'\s*', str(text or ''))
+    return float(m.group(1)) if m else None
+
+
+def _single_quantity(text):
+    """(number, unit or None) when `text` is exactly one quantity, else None."""
+    text = compact(text)
+    found = _quantities(text)
+    if len(found) == 1 and compact(found[0][2]).lower() == text.lower():
+        return found[0][0], found[0][1]
+    number = _bare_number(text)
+    return (number, None) if number is not None else None
+
+
+def _allowed_entry(value):
+    """Classify one allowed value: ('exact', n, unit, text),
+    ('band', lo, hi, lo_incl, hi_incl, unit, text) or ('text', norm, text)."""
+    text = compact(value)
+    low = text.lower()
+    for pattern, shape in (
+            (r'(?:below|under|up\s*to|less\s+than)\s+(.+)', 'lt'),
+            (r'(?:above|over|more\s+than)\s+(.+)', 'gt'),
+            (r'(.+?)\s*(?:&|and)\s*below', 'le'),
+            (r'(.+?)\s*(?:&|and)\s*above', 'ge'),
+            (r'(.+?)\s*\+', 'ge')):
+        m = re.fullmatch(pattern, low)
+        q = _single_quantity(m.group(1)) if m else None
+        if q:
+            n, unit = q
+            lo, hi, lo_in, hi_in = {
+                'lt': (None, n, False, False), 'gt': (n, None, False, False),
+                'le': (None, n, False, True), 'ge': (n, None, True, False)}[shape]
+            return ('band', lo, hi, lo_in, hi_in, unit, text)
+    m = re.fullmatch(r'(.+?)\s*-\s*(.+)', low)
+    if m:
+        first, second = _single_quantity(m.group(1)), _single_quantity(m.group(2))
+        if first and second and (first[1] is None or second[1] is None
+                                 or first[1] == second[1]):
+            unit = second[1] or first[1]
+            return ('band', first[0], second[0], True, True, unit, text)
+    q = _single_quantity(low)
+    if q and q[1]:
+        return ('exact', q[0], q[1], text)
+    return ('text', _norm_filter_text(text), text)
+
+
+def _in_band(entry, number):
+    _kind, lo, hi, lo_in, hi_in, _unit, _text = entry
+    if lo is not None and (number < lo or (number == lo and not lo_in)):
+        return False
+    if hi is not None and (number > hi or (number == hi and not hi_in)):
+        return False
+    return True
+
+
+def _norm_filter_text(text):
+    """Case, hyphens, '&'/'and' and the spacing around '+', '/', '&' folded."""
+    text = compact(text).lower()
+    text = re.sub(r'[-_–—]', ' ', text)
+    text = re.sub(r'\band\b', '&', text)
+    text = re.sub(r'\s*([+/&])\s*', r'\1', text)
+    text = re.sub(r'(\d)\s*[x×*]\s*(?=\d)', r'\1x', text)   # 3840 x 2160
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _text_hits(raw, entries):
+    """Allowed text values stated in `raw` as whole words / phrases. A match
+    that sits inside a longer match of ANOTHER value is dropped ('Inverter'
+    inside 'Non-Inverter', 'BLDC' inside 'non BLDC')."""
+    norm = _norm_filter_text(raw)
+    found = []
+    for entry in entries:
+        _kind, value_norm, text = entry
+        if not value_norm:
+            continue
+        for phrase in (value_norm,) + FILTER_VALUE_ALIASES.get(value_norm, ()):
+            for m in re.finditer(r'(?<![a-z0-9])' + re.escape(phrase)
+                                 + r'(?![a-z0-9])', norm):
+                found.append((m.start(), m.end(), text))
+    kept = [hit for hit in found
+            if not any(o[2] != hit[2] and o[0] <= hit[0] and hit[1] <= o[1]
+                       and (o[1] - o[0]) > (hit[1] - hit[0]) for o in found)]
+    texts = {hit[2] for hit in kept}
+    return [entry[2] for entry in entries if entry[2] in texts]
+
+
+def snap_filter_matches(raw, allowed, unit=None):
+    """[(allowed spelling, kind)] that `raw` states; kind is 'exact', 'band'
+    or 'text'. Numbers compare numerically (1 == 1.0) in the axis unit, and
+    are NEVER rounded: '1.2 Ton' against 1 / 1.5 / 2 Ton matches nothing."""
+    entries = [_allowed_entry(v) for v in allowed or () if compact(v)]
+    numeric = [e for e in entries if e[0] in ('exact', 'band')]
+    texts = [e for e in entries if e[0] == 'text']
+    if numeric:
+        axis_unit = unit or next((e[2] if e[0] == 'exact' else e[5]
+                                  for e in numeric
+                                  if (e[2] if e[0] == 'exact' else e[5])), None)
+        found = [(n, u) for n, u, _t in _quantities(raw)
+                 if axis_unit is None or u == axis_unit]
+        if not found and _bare_number(raw) is not None:
+            found = [(_bare_number(raw), axis_unit)]
+        for number, _u in found:
+            for e in numeric:
+                if e[0] == 'exact' and abs(e[1] - number) < 1e-6:
+                    return [(e[3], 'exact')]
+        if found:
+            for e in numeric:
+                if e[0] == 'band' and _in_band(e, found[0][0]):
+                    return [(e[6], 'band')]
+    if texts:
+        return [(text, 'text') for text in _text_hits(raw, texts)]
+    return []
+
+
+def snap_filter_values(raw, allowed, unit=None):
+    """Every allowed spelling `raw` states (a list, possibly empty)."""
+    return [text for text, _kind in snap_filter_matches(raw, allowed, unit)]
+
+
+def snap_filter_value(raw, allowed, unit=None):
+    """`raw` (a scraped value or a title) snapped onto `allowed`: the ALLOWED
+    spelling of what it states, several joined by ', ' when the text clearly
+    states several textual values, or None. Pure; no I/O."""
+    hits = snap_filter_values(raw, allowed, unit)
+    return ', '.join(hits) if hits else None
+
+
+def normalise_quantity(raw, unit):
+    """A free-form value for a hint axis: the first `unit` quantity in `raw`
+    written as number + UNIT_DISPLAY suffix ('1200 MM' -> '1200mm'), or None."""
+    for number, found_unit, _text in _quantities(raw):
+        if found_unit == unit:
+            return f'{number:g}{UNIT_DISPLAY.get(unit, "")}'
+    return None
+
+
+def clean_filter_cell(cell):
+    """A filter-sheet / list cell -> its values: split on ',', stripped,
+    empties dropped (trailing commas), 'etc.' dropped, a '1 Star to 5 Star'
+    range expanded, N/A and mojibake cells -> []."""
+    text = compact(cell)
+    if not text or text.upper() == 'N/A' or _MOJIBAKE_RE.search(text):
+        return []
+    expanded = _expand_range(text)
+    if expanded:
+        return expanded
+    return [v for v in (compact(p) for p in text.split(','))
+            if v and v.lower().rstrip('.') != 'etc']
+
+
+def _expand_range(text):
+    m = re.fullmatch(r'(\d+)\s*([a-z]+)\s+to\s+(\d+)\s*([a-z]+)', compact(text),
+                     re.IGNORECASE)
+    if not m or m.group(2).lower() != m.group(4).lower():
+        return []
+    lo, hi = int(m.group(1)), int(m.group(3))
+    if not 0 < hi - lo <= 20:
+        return []
+    return [f'{n} {m.group(2)}' for n in range(lo, hi + 1)]
+
+
+AxisSpec = namedtuple('AxisSpec', 'values hint unit free')
+AxisSpec.__doc__ = ("One sub-category sheet cell: allowed values, the hint "
+                    "text (cell was free text), the unit of its numbers, and "
+                    "free=True when only a free-form number + unit can be "
+                    "written (a hint with an 'e.g.' example and no list).")
+
+
+def _values_unit(values):
+    for value in values:
+        entry = _allowed_entry(value)
+        if entry[0] == 'exact':
+            return entry[2]
+        if entry[0] == 'band' and entry[5]:
+            return entry[5]
+    return None
+
+
+def _embedded_list(text, hint_unit):
+    """The value list a hint cell carries, if any: a tail after the hint
+    ('...(e.g. 8L)- 6, 7, 8'), a list inside parentheses ('(Small, Medium,
+    Jumbo)'), or a comma list around parenthesised names ('Electrical
+    (RO+UV+UF), Non-Electrical (Gravity)'). Bare numbers inherit the unit."""
+    items = []
+    tail = re.search(r'\)\s*-?\s*([^()]+)$', text)
+    if tail and re.search(r'\d', tail.group(1)) and ',' in tail.group(1):
+        items = tail.group(1).split(',')
+    if not items:
+        for m in re.finditer(r'\(([^()]*)\)', text):
+            inner = m.group(1)
+            if ',' in inner and 'e.g' not in inner.lower():
+                items = inner.split(',')
+                break
+    if not items and 'e.g' not in text.lower():
+        outside = re.sub(r'\([^()]*\)', '', text)
+        if ',' in outside:
+            items = text.split(',')
+    items = [compact(i) for i in items if compact(i)]
+    split = []
+    for item in items:                    # '75 cm 90 cm' is two values
+        found = _quantities(item)
+        split.extend([compact(t) for _n, _u, t in found] if len(found) > 1
+                     else [item])
+    items = split
+    if items:
+        last = re.fullmatch(_NUMBER + r'\s*(.+)', items[-1])
+        suffix = last.group(2) if last and _bare_number(items[-1]) is None else ''
+        out = []
+        for item in items:
+            if _bare_number(item) is not None:
+                if suffix:
+                    item = f'{item} {suffix}'
+                elif hint_unit:
+                    item = f'{item}{UNIT_DISPLAY.get(hint_unit, "")}'
+            out.append(item)
+        items = out
+    return items
+
+
+def parse_axis_cell(cell):
+    """One 'Sub-Category Attributes' cell -> AxisSpec, or None (empty / N/A /
+    mojibake: the axis does not apply)."""
+    text = compact(cell)
+    if not text or text.upper() == 'N/A' or _MOJIBAKE_RE.search(text):
+        return None
+    expanded = _expand_range(text)
+    if expanded:
+        return AxisSpec(tuple(expanded), '', _values_unit(expanded), False)
+    if not ('e.g' in text.lower() or '(' in text or len(text) > 60):
+        values = clean_filter_cell(text)
+        return AxisSpec(tuple(values), '', _values_unit(values), False)
+    example = re.search(r'e\.g\.?\s*([^)]*)\)', text, re.IGNORECASE)
+    example_unit = None
+    if example:
+        found = _quantities(example.group(1))
+        example_unit = found[0][1] if found else None
+    values = _embedded_list(text, example_unit)
+    unit = _values_unit(values) or example_unit
+    return AxisSpec(tuple(values), text, unit, bool(not values and example_unit))
+
+
+def _filter_axis_cell(_axis, cell):
+    return parse_axis_cell(cell)
+
+
+def load_subcategory_filter_axes(client=None):
+    """{normalised sub-category: (parent, {axis: AxisSpec})} from the same
+    'Sub-Category Attributes' sheet load_subcategory_attributes reads."""
+    records, _source, _problems = _subcategory_sheet(client)
+    axes = _index_subcategories(records, _filter_axis_cell)
+    parents = {}
+    for row in records:
+        sub = row.get('Sub-Category', '')
+        for key in [sub] + [compact(p) for p in sub.split(',')]:
+            if key:
+                parents.setdefault(_cat_norm(key), row.get('Parent Category', ''))
+        parents.setdefault(_cat_norm(row.get('Parent Category')),
+                           row.get('Parent Category', ''))
+    return {key: (parents.get(key, ''), value) for key, value in axes.items()}
+
+
+def read_filter_groups(path):
+    """{filter group: [allowed values]} from ONE workbook's filter sheet, or
+    None when the workbook has no filter sheet. Raises when unreadable."""
+    _title, rows, col = find_filter_sheet(_workbook_rows(path))
+    if rows is None:
+        return None
+    head = _first_row(rows)
+    groups = {}
+    for row in rows[rows.index(head) + 1:]:
+        name = compact(row[col]) if col < len(row) else ''
+        if not name or _MOJIBAKE_RE.search(name):
+            continue
+        cell = row[col + 1] if col + 1 < len(row) else ''
+        groups[name] = clean_filter_cell(cell)
+    return groups
+
+
+def load_filter_groups(client=None):
+    """{filter group name: ordered list of allowed values} for the client.
+
+    Primary source: the attributes master's filter sheet (found by its
+    'Filter Group' header, not by its sheet name). Fallback: the 'Filters'
+    sheet of category_map.xlsx. {} when neither has one. Cells are cleaned by
+    clean_filter_cell: trailing commas, N/A and mojibake cells dropped, a
+    '1 Star to 5 Star' range expanded."""
+    for path in attribute_workbooks(client):
+        try:
+            groups = read_filter_groups(path)
+        except Exception:
+            continue
+        if groups is not None:
+            return groups
+    return {}
+
+
+def attribute_sheet_differences(client=None):
+    """Human-readable differences between the attributes master and
+    category_map.xlsx copies of the shared sheets ('Sub-Category Attributes'
+    and the filter sheet). [] when there is only one file, or no drift."""
+    client = client or CLIENT
+    master, catmap = attributes_master_path(client), category_map_path(client)
+    if not master or not catmap or catmap.lower().endswith('.csv'):
+        return []
+    try:
+        a, b = _workbook_rows(master), _workbook_rows(catmap)
+    except Exception as exc:
+        return [f'cannot compare the attribute workbooks: {exc}']
+    out = []
+
+    def cells(rows):
+        return [tuple(compact(c) for c in r) for r in rows
+                if any(compact(c) for c in r)]
+
+    for label, finder in (
+            (SUBCAT_SHEET, lambda s: find_subcategory_sheet(s)[1]),
+            ('filter sheet', lambda s: find_filter_sheet(s)[1])):
+        ra, rb = finder(a), finder(b)
+        if ra is None and rb is None:
+            continue
+        if ra is None or rb is None:
+            out.append(f"{label}: only in "
+                       f"{os.path.basename(master if ra is not None else catmap)}")
+            continue
+        ca, cb = cells(ra), cells(rb)
+        for i in range(max(len(ca), len(cb))):
+            row_a = ca[i] if i < len(ca) else ()
+            row_b = cb[i] if i < len(cb) else ()
+            width = max(len(row_a), len(row_b))
+            row_a += ('',) * (width - len(row_a))
+            row_b += ('',) * (width - len(row_b))
+            if row_a != row_b:
+                diff = [j for j in range(width) if row_a[j] != row_b[j]]
+                out.append(f'{label} row {i + 1}: master {row_a[diff[0]]!r} '
+                           f'vs category_map {row_b[diff[0]]!r}'
+                           + (f' (+{len(diff) - 1} more cells)'
+                              if len(diff) > 1 else ''))
+    return out
+
+
+def filter_sheet_warning(client=None):
+    diffs = attribute_sheet_differences(client)
+    if not diffs:
+        return ''
+    return (f'The attributes master and category_map.xlsx disagree in '
+            f'{len(diffs)} place(s) (the master wins; run '
+            f'tools\\check_filter_sheet.py): ' + '; '.join(diffs[:3])
+            + (' ...' if len(diffs) > 3 else ''))
+
+
+# ---- the axis <-> filter group table ----------------------------------------
+# Which store filter group (the filter sheet) each sub-category axis feeds,
+# read off the real sheets. (parent or sub-category, axis, unit of the axis's
+# values or None for any, filter groups). An axis with SEVERAL groups (AC
+# Type -> technology AND type) sends each value to the group whose list holds
+# it. A group missing from the client's filter sheet is simply skipped.
+FILTER_AXIS_GROUPS = (
+    ('air conditioner', 'Ton', None, ('AC Capacity',)),
+    ('air conditioner', 'Star Rating', None, ('AC Star Rating',)),
+    ('air conditioner', 'Type', None, ('AC Technology', 'AC Type', 'AC Mode')),
+    ('led', 'Size', 'inch', ('TV Screen Size',)),
+    ('led', 'Capacity', 'inch', ('TV Screen Size',)),
+    ('led', 'Type', None, ('TV Smart Features',)),
+    ('washing machines', 'Type', None, ('WM Function Type',)),
+    ('washing machines', 'Capacity', 'kg', ('WM Washing Capacity',)),
+    ('refrigerators', 'Type', None, ('Fridge Type',)),
+    ('refrigerators', 'Capacity', 'l', ('Fridge Capacity',)),
+    ('water purifiers', 'Type', None, ('WP Technology',)),
+    ('water purifiers', 'Capacity', 'l', ('WP Storage Capacity',)),
+)
+# ---- filter groups no sub-category axis feeds (2026-11-19) ------------------
+# Some store filter groups have no column in the sub-category sheet (TV
+# resolution, WM colour, ...). They are fed straight from the scraped spec
+# table (`labels`, canonical lower case, read first) and, when `use_title`,
+# from the title, snapped onto the group's list in the client's filter sheet
+# with the same snap functions. `where` is matched like FILTER_AXIS_GROUPS
+# (normalised parent / sub-category / sheet parent). A group missing from the
+# client's filter sheet is skipped. These groups are OPTIONAL: they never add
+# to `_spec_gaps`. `note_labels`: the dedicated labels whose stated value that
+# does not snap is written as scraped, with a "new value" note in
+# `_filter_unmatched` (never the title; never a general feature list). `pick`: 'highest' keeps one value (the best stated
+# resolution); 'specific' drops plain 'LED' when QLED/OLED/... is also hit.
+DirectGroup = namedtuple('DirectGroup',
+                         'where group labels use_title note_labels pick')
+_TV_RES_LABELS = ('resolution', 'display resolution', 'screen resolution')
+_DEFROST_LABELS = ('defrost system', 'defrosting type', 'defrost type',
+                   'defrosting')
+DIRECT_FILTER_GROUPS = (
+    DirectGroup('led', 'TV Resolution', _TV_RES_LABELS, True, _TV_RES_LABELS,
+                'highest'),
+    DirectGroup('led', 'TV Display Tech',
+                ('display technology', 'display type', 'panel type',
+                 'screen type'), True,
+                ('display technology', 'display type'), 'specific'),
+    # numeric (Hz): a title only feeds it with a number directly followed by
+    # Hz/Hertz, matched exactly - never rounded
+    DirectGroup('led', 'TV Refresh Rate', ('refresh rate',), True,
+                ('refresh rate',), None),
+    DirectGroup('washing machines', 'WM Features',
+                ('special features', 'features', 'key features', 'technology',
+                 'motor type'), True, (), None),
+    DirectGroup('washing machines', 'WM Color', ('colour', 'color'), True,
+                ('colour', 'color'), None),
+    DirectGroup('refrigerators', 'Fridge Defrosting', _DEFROST_LABELS, True,
+                _DEFROST_LABELS, None),
+)
+_RESOLUTION_RANK = ('hd ready', 'full hd', '4k uhd', '8k')       # low -> high
+# a scraped part that says the feature is ABSENT: 'No', 'Not available',
+# 'without heater', 'Wi-Fi: No'
+_NEGATIVE_PART_RE = re.compile(
+    r'^\s*(?:no|none|nil|not|without|n/?a|absent)\b'
+    r'|[:\-]\s*(?:no|none|not available|absent)\s*$', re.IGNORECASE)
+# An axis no filter-sheet group covers is still a filter (the owner builds
+# filters from the sub-category sheet); it is named from the axis and the unit
+# of its values, so 'Capacity' in W is 'Power Rating', not 'Capacity'.
+AXIS_FILTER_NAMES = {
+    'Type': 'Product Type', 'Star Rating': 'Energy Rating', 'Ton': 'Tonnage',
+    'Storage': 'Storage', 'Size': 'Size', 'Capacity': 'Capacity',
+}
+UNIT_FILTER_NAMES = {
+    'w': 'Power Rating', 'm3h': 'Airflow', 'kva': 'Load Capacity',
+    'spm': 'Stitch Speed', 'rpm': 'Motor Speed', 'mm': 'Sweep Size',
+}
+SUB_TYPE_FILTER_NAMES = {'fans': 'Motor Type',
+                         'water purifiers': 'Installation Type'}
+# spec-table labels (canonical, lower case) that can carry each kind of value
+UNIT_SPEC_LABELS = {
+    'w': ('power rating',), 'mm': ('sweep size', 'sweep', 'blade sweep'),
+    'inch': ('screen size',), 'star': ('energy rating',),
+    'ton': ('capacity', 'tonnage'), 'l': ('capacity',), 'kg': ('capacity',),
+    'm3h': ('air flow', 'airflow', 'suction power', 'suction capacity', 'cadr'),
+    'kva': ('capacity', 'load capacity', 'output capacity'),
+    'spm': ('stitch speed',), 'rpm': ('speed', 'motor speed'),
+}
+GROUP_SPEC_LABELS = {
+    'TV Smart Features': ('smart platform',),
+    'AC Technology': ('compressor', 'compressor type'),
+    'WP Technology': ('purification technology', 'filtration technology',
+                      'purification method'),
+    'Fridge Type': ('door type',),
+}
+SUB_TYPE_SPEC_LABELS = ('motor type', 'motor', 'installation type',
+                        'mounting type', 'installation')
+
+FilterHit = namedtuple('FilterHit', 'group value axis labels kind')
+FilterHit.__doc__ = ("One filter attribute for one product: group (the "
+                     "attribute name), value (allowed spelling), axis, the "
+                     "spec labels that fed it, and kind 'exact' / 'band' / "
+                     "'text' / 'free' / 'new' (a value the lists do not "
+                     "hold, written as scraped - owner decision 2026-11-19).")
+# the `axis` of a FilterHit from DIRECT_FILTER_GROUPS (no sub-category axis)
+DIRECT_AXIS = '(direct)'
+
+
+def filter_axes(sub, parent='', table=None):
+    """(sheet parent, {axis: AxisSpec}) for this product - the same lookup
+    rules as attribute_axes() (merged names are the union of their parts,
+    bare parent only when the parent has a single row)."""
+    table = SUBCATEGORY_FILTER_AXES if table is None else table
+    hit = table.get(_cat_norm(sub))
+    if hit and hit[1]:
+        return hit
+    parts = [table.get(_cat_norm(p)) for p in str(sub or '').split(',')]
+    parts = [p for p in parts if p and p[1]]
+    if len(parts) == 1:
+        return parts[0]
+    if parts:
+        merged = {}
+        for _parent, axes in parts:
+            for axis, spec in axes.items():
+                if axis not in merged:
+                    merged[axis] = spec
+                else:
+                    old = merged[axis]
+                    merged[axis] = AxisSpec(
+                        old.values + tuple(v for v in spec.values
+                                           if v not in old.values),
+                        old.hint or spec.hint, old.unit or spec.unit,
+                        old.free and spec.free)
+        return parts[0][0], merged
+    if not compact(sub) or _cat_norm(sub) == _cat_norm(parent):
+        return table.get(_cat_norm(parent)) or ('', {})
+    return '', {}
+
+
+def _group_lookup(groups):
+    return {name.lower(): name for name in groups}
+
+
+def _category_keys(sub, parent, sheet_parent):
+    """The normalised names a filter table's `where` is matched against."""
+    return {_cat_norm(parent), _cat_norm(sub), _cat_norm(sheet_parent)}
+
+
+def _direct_plan(sub, parent='', table=None, groups=None):
+    """[(DirectGroup, group name as the client's sheet spells it, allowed
+    values)] for one product: the DIRECT_FILTER_GROUPS whose `where` matches
+    and whose group the client's filter sheet holds (with values)."""
+    groups = FILTER_GROUPS if groups is None else groups
+    lookup = _group_lookup(groups)
+    sheet_parent, _axes = filter_axes(sub, parent, table)
+    keys = _category_keys(sub, parent, sheet_parent)
+    out = []
+    for entry in DIRECT_FILTER_GROUPS:
+        name = lookup.get(entry.group.lower())
+        if entry.where in keys and name and groups.get(name):
+            out.append((entry, name, list(groups[name])))
+    return out
+
+
+def _direct_parts(raw):
+    """A scraped value / title split into its listed parts (',', ';', '|')."""
+    return [p for p in (compact(x) for x in re.split(r'[,;|]', raw or '')) if p]
+
+
+def _direct_matches(part, options):
+    """snap_filter_matches for one part, but [] when the part says the
+    value is ABSENT ('No Wi-Fi', 'Wi-Fi: No', 'without heater'). A negative
+    word that is part of the value's own name ('No Frost' = Frost Free) is
+    not a negation: the part is negative only when it snaps the same with
+    the negative word removed."""
+    found = snap_filter_matches(part, options)
+    m = _NEGATIVE_PART_RE.search(part)
+    if found and m:
+        rest = compact(part[:m.start()] + ' ' + part[m.end():])
+        if snap_filter_matches(rest, options) == found:
+            return []
+    return found
+
+
+def _snap_direct(raw, options, pick=None):
+    """[(allowed spelling, kind)] that `raw` states for a direct group, in
+    the sheet's order, after the group's `pick` rule."""
+    found = []
+    for part in _direct_parts(raw):
+        for text, kind in _direct_matches(part, options):
+            if text not in [t for t, _k in found]:
+                found.append((text, kind))
+    if pick == 'specific' and len(found) > 1:
+        found = [f for f in found if _norm_filter_text(f[0]) != 'led']
+    if pick == 'highest' and len(found) > 1:
+        def rank(item):
+            norm = _norm_filter_text(item[0])
+            return (_RESOLUTION_RANK.index(norm) if norm in _RESOLUTION_RANK
+                    else -1, options.index(item[0]))
+        found = [max(found, key=rank)]
+    order = {v: i for i, v in enumerate(options)}
+    return sorted(found, key=lambda f: order.get(f[0], len(order)))
+
+
+def _direct_filter_hits(sub, parent, title, scraped, table, groups, done):
+    """([FilterHit], [notes]) for the DIRECT_FILTER_GROUPS of one product.
+    Scraped values under the group's labels first, then the title; the first
+    source that gives a value wins. A value the list does not hold is WRITTEN
+    as scraped (owner decision 2026-11-19, see _new_filter_value) with a
+    "new value" note, but only from a dedicated label (note_labels) or, for a
+    numeric group, a number in the group's unit - never a text value from the
+    title, never from a negative ('No')."""
+    hits, unmatched = [], []
+    for entry, group, options in _direct_plan(sub, parent, table, groups):
+        if group.lower() in done:
+            continue
+        labels = frozenset(entry.labels)
+        sources = [(compact(v), compact(label).lower()) for label, v in scraped
+                   if compact(label).lower() in labels and compact(v)]
+        if entry.use_title and compact(title):
+            sources.append((compact(title), None))
+        unit = _values_unit(options)
+        numeric = bool(unit)
+        dedicated = frozenset(entry.note_labels)
+        evidence = ''
+        for raw, label in sources:
+            value, kind, new = None, None, []
+            if not numeric and label is not None and label in dedicated:
+                matched, new = _text_parts(raw, (options,), group, label)
+                if entry.pick == 'highest' and matched:
+                    matched = [t for t, _k in _snap_direct(
+                        ', '.join(matched), options, 'highest')]
+                    new = []
+                elif entry.pick == 'specific' and len(matched) > 1:
+                    matched = [t for t in matched
+                               if _norm_filter_text(t) != 'led']
+                if matched or new:
+                    value = ', '.join(matched + new)
+                    kind = 'new' if new else 'text'
+            else:
+                found = _snap_direct(raw, options, entry.pick)
+                if found:
+                    value, kind = ', '.join(t for t, _k in found), found[0][1]
+                elif numeric:
+                    quantity = _new_quantity(raw, unit, options)
+                    if quantity:
+                        value, kind, new = quantity, 'new', [quantity]
+            if value:
+                hits.append(FilterHit(group, value, DIRECT_AXIS, labels, kind))
+                done.add(group.lower())
+                for part in new:
+                    note = new_value_note(group, part)
+                    if note not in unmatched:
+                        unmatched.append(note)
+                evidence = ''
+                break
+            if (not evidence and label in entry.note_labels
+                    and not _only_empty_words(raw, group)):
+                evidence = raw
+        if evidence:
+            note = f"{group}: '{evidence[:60]}' not in list"
+            if note not in unmatched:
+                unmatched.append(note)
+    return hits, unmatched
+
+
+# ---- new values (owner decision 2026-11-19) ---------------------------------
+# A scraped value is never replaced, rounded or dropped because the filter
+# list does not hold it; only its spelling is made regular. These words are
+# never a filter value for any group (they say nothing about the product), and
+# 'Smart TV' is not a TV platform: the platform is written only when the page
+# names one (Android TV, Google TV, WebOS, Tizen, ...).
+NEVER_FILTER_VALUES = frozenset(('yes', 'no', 'na', 'n/a', 'not available'))
+NEVER_FILTER_VALUES_BY_GROUP = {
+    'tv smart features': frozenset(('smart tv', 'smart')),
+}
+# a text value written as scraped is at most this long
+NEW_TEXT_VALUE_MAX = 40
+# spec labels that are too general to be DEDICATED to one text group: the
+# canonical 'Configuration' also holds 'Product Type' ('Refrigerator'), and
+# 'Motor' holds '75 W copper motor'
+GENERAL_TEXT_LABELS = frozenset(('configuration', 'type', 'motor'))
+
+
+def new_value_note(group, value):
+    """The `_filter_unmatched` note for a value written but not in the sheet."""
+    return f"{group}: '{value}' is a new value, add it to the sheet"
+
+
+def _empty_word(group, text):
+    low = compact(text).lower().strip(' .')
+    return (low in NEVER_FILTER_VALUES
+            or low in NEVER_FILTER_VALUES_BY_GROUP.get(group.lower(), ()))
+
+
+def _only_empty_words(raw, group):
+    """True when every part of `raw` is a negative or a never-a-value word."""
+    return all(_NEGATIVE_PART_RE.search(p) or _empty_word(group, p)
+               for p in _direct_parts(raw))
+
+
+def _list_suffix(options, unit):
+    """How the group's own list writes `unit` after a number: '1.5 Ton' ->
+    ' Ton', '32"' -> '"', '60Hz' -> 'Hz', '6kg & below' -> 'kg'. Exact values
+    first, then bands; UNIT_DISPLAY when the list has none."""
+    for wanted in ('exact', 'band'):
+        for value in options:
+            text = compact(value)
+            if _allowed_entry(text)[0] != wanted:
+                continue
+            for m in re.finditer(_NUMBER + r'(\s*[^\d\s&+\-,.]+)', text):
+                suffix = m.group(2)
+                found = _quantities('1' + suffix)
+                if (len(found) == 1 and found[0][1] == unit
+                        and not re.search(r'tb', suffix, re.IGNORECASE)):
+                    return suffix
+    return UNIT_DISPLAY.get(unit, '')
+
+
+def _new_quantity(raw, unit, options):
+    """The first quantity in `unit` that `raw` states, written as number +
+    the list's own suffix ('0.8 T' against '1 Ton, ...' -> '0.8 Ton'), or
+    None. The number is the stated one: never rounded."""
+    if not unit:
+        return None
+    for number, found_unit, _text in _quantities(raw):
+        if found_unit == unit:
+            return f'{number:g}{_list_suffix(options, unit)}'
+    return None
+
+
+def _text_parts(raw, option_lists, group, label):
+    """([allowed spellings], [new parts]) for a scraped value under a label
+    dedicated to a text group. Each listed part ('A, B; C') snaps onto the
+    first list that holds it; a part that snaps nowhere is kept as scraped
+    (whitespace compacted) when it is not a negative, not a never-a-value
+    word, passes the content firewall and is at most NEW_TEXT_VALUE_MAX
+    characters."""
+    matched, new = [], []
+    for part in _direct_parts(raw):
+        found = []
+        for options in option_lists:
+            found = _direct_matches(part, options) if options else []
+            if found:
+                break
+        if found:
+            matched.extend(t for t, _k in found if t not in matched)
+            continue
+        if (_NEGATIVE_PART_RE.search(part) or _empty_word(group, part)
+                or len(part) > NEW_TEXT_VALUE_MAX
+                or not content_ok(part) or not spec_row_ok(label, part)):
+            continue
+        if part.lower() not in [n.lower() for n in new]:
+            new.append(part)
+    return matched, new
+
+
+def _dedicated_labels(group, mapped, labels):
+    """The spec labels whose unlisted text value may be written for `group`:
+    the group's own name and GROUP_SPEC_LABELS; on a one-group axis also the
+    axis's labels, minus the general ones. Never the title."""
+    own = {group.lower(), *GROUP_SPEC_LABELS.get(group, ())}
+    if len(mapped) > 1:
+        return frozenset(own)
+    return frozenset((set(labels) | own) - GENERAL_TEXT_LABELS)
+
+
+def _filter_plan(sub, parent='', table=None, groups=None):
+    """[(axis, spec, [mapped filter-sheet groups], derived name)] for one
+    product. Mapped groups are those of FILTER_AXIS_GROUPS present in the
+    client's filter sheet; `derived` names the axis when no group maps, and
+    receives the values only the sub-category row lists on a multi-group
+    axis."""
+    groups = FILTER_GROUPS if groups is None else groups
+    lookup = _group_lookup(groups)
+    sheet_parent, axes = filter_axes(sub, parent, table)
+    keys = _category_keys(sub, parent, sheet_parent)
+    plan = []
+    for axis, spec in axes.items():
+        mapped = []
+        for where, ax, unit, names in FILTER_AXIS_GROUPS:
+            if ax == axis and where in keys and unit in (None, spec.unit):
+                mapped = [lookup[n.lower()] for n in names if n.lower() in lookup]
+                break
+        plan.append((axis, spec, mapped, _derived_filter_name(axis, spec, sub)))
+    return plan
+
+
+def _derived_filter_name(axis, spec, sub):
+    if axis == SUB_TYPE_AXIS:
+        return SUB_TYPE_FILTER_NAMES.get(_cat_norm(sub), 'Sub Type')
+    if axis in ('Capacity', 'Size') and spec.unit in UNIT_FILTER_NAMES:
+        return UNIT_FILTER_NAMES[spec.unit]
+    if axis == 'Capacity' and spec.unit == 'gb':
+        return 'RAM'
+    if spec.unit == 'inch' and axis in ('Capacity', 'Size'):
+        words = (spec.hint + ' ' + ' '.join(spec.values)).lower()
+        return 'Screen Size' if re.search(r'screen|display', words) else 'Size'
+    return woo_attribute_name(AXIS_FILTER_NAMES.get(axis, axis))
+
+
+def _axis_source_labels(axis, spec, groups):
+    if axis == SUB_TYPE_AXIS:
+        return set(SUB_TYPE_SPEC_LABELS)
+    labels = {axis.lower(), *AXIS_SPEC_LABELS.get(axis, ())}
+    labels |= set(UNIT_SPEC_LABELS.get(spec.unit, ()))
+    for group in groups:
+        labels |= {group.lower(), *GROUP_SPEC_LABELS.get(group, ())}
+    if spec.unit == 'gb':
+        if axis == 'Capacity':
+            labels = {'ram', 'memory', 'ram size'}
+        else:
+            labels |= {'storage', 'internal storage', 'rom'}
+    return labels
+
+
+def _evidence(raw, spec, numeric):
+    """What a source states for an axis, for `_filter_unmatched`: a scraped
+    value as written; for a title, only a number in the axis unit."""
+    if numeric and spec.unit:
+        for _n, unit, text in _quantities(raw):
+            if unit == spec.unit:
+                return compact(text)
+    return ''
+
+
+def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
+    """The product's filter attributes: ([FilterHit], [notes]).
+
+    Per axis of the product's sub-category row: the value comes from the
+    scraped spec table (the labels that carry that axis), else from the
+    title; it is snapped onto the filter group's list first (its spelling
+    wins), then onto the sub-category row's list. Snapped -> a FilterHit
+    named by the filter group.
+
+    Owner decision 2026-11-19: a stated value the lists do not hold is
+    WRITTEN, never replaced, rounded or dropped; only its spelling is made
+    regular. A number in the axis unit (scraped label first, else the title)
+    is written as number + the list's own suffix ('0.8 T' -> '0.8 Ton'); a
+    text value under a label dedicated to the group is written as scraped
+    (see _text_parts). Each such value gets a note "<Group>: '<value>' is a
+    new value, add it to the sheet". A stated value that cannot be written
+    (no unit, firewall, too long) gets the note "... not in list". Nothing
+    stated -> nothing (that is what `_spec_gaps` reports)."""
+    groups = FILTER_GROUPS if groups is None else groups
+    hits, unmatched, done = [], [], set()
+    for axis, spec, mapped, derived in _filter_plan(sub, parent, table, groups):
+        labels = _axis_source_labels(axis, spec, mapped)
+        scraped_rows = [(compact(v), compact(label).lower())
+                        for label, v in scraped
+                        if compact(label).lower() in labels and compact(v)]
+        sources = scraped_rows + [(compact(title), None)]
+        numeric = bool(spec.unit) or any(
+            _allowed_entry(v)[0] != 'text'
+            for g in mapped for v in groups.get(g, ()))
+        targets = mapped or [derived]
+        if not mapped and not spec.values and not spec.free:
+            continue                     # a hint with no list and no format
+        written = False
+        evidence = ''
+        for group in targets:
+            if group.lower() in done:
+                continue
+            options = list(groups.get(group, ())) if mapped else []
+            # one group per axis: the row's own list is a valid fallback;
+            # several groups: each takes only values from its OWN list
+            subvals = list(spec.values) if len(targets) == 1 else []
+            listed = options + [v for v in subvals if v not in options]
+            unit = spec.unit or _values_unit(listed)
+            group_numeric = bool(unit)
+            dedicated = _dedicated_labels(group, mapped, labels)
+            for raw, label in sources:
+                value, kind, new = None, None, []
+                if (listed and not group_numeric and label is not None
+                        and label in dedicated):
+                    matched, new = _text_parts(raw, (options, subvals),
+                                               group, label)
+                    if matched or new:
+                        value = ', '.join(matched + new)
+                        kind = 'new' if new else 'text'
+                else:
+                    found = snap_filter_matches(raw, options, spec.unit) or \
+                        snap_filter_matches(raw, subvals, spec.unit)
+                    if found:
+                        value = ', '.join(t for t, _k in found)
+                        kind = found[0][1]
+                    elif listed and group_numeric:
+                        quantity = _new_quantity(raw, unit, listed)
+                        if quantity:
+                            value, kind, new = quantity, 'new', [quantity]
+                if value:
+                    hits.append(FilterHit(group, value, axis,
+                                          frozenset(labels), kind))
+                    done.add(group.lower())
+                    for part in new:
+                        note = new_value_note(group, part)
+                        if note not in unmatched:
+                            unmatched.append(note)
+                    written = True
+                    break
+                if not evidence:
+                    if label is None:
+                        evidence = _evidence(raw, spec, numeric)
+                    elif not _only_empty_words(raw, group):
+                        evidence = raw
+        if len(targets) > 1 and spec.values and derived.lower() not in done:
+            # values only the sub-category row lists ('Hot & Cold') go to the
+            # axis's own name, unless a mapped group already holds them
+            for raw, _is_scraped in sources:
+                extra = [t for t in snap_filter_values(raw, spec.values, spec.unit)
+                         if not any(snap_filter_values(t, groups.get(g, ()))
+                                    for g in mapped)]
+                if extra:
+                    hits.append(FilterHit(derived, ', '.join(extra), axis,
+                                          frozenset(labels), 'text'))
+                    done.add(derived.lower())
+                    written = True
+                    break
+        if written:
+            continue
+        group = targets[0]
+        if (spec.free and not mapped and spec.unit
+                and group.lower() not in done):
+            for raw, _is_scraped in sources:
+                value = normalise_quantity(raw, spec.unit)
+                if value:
+                    hits.append(FilterHit(group, value, axis,
+                                          frozenset(labels), 'free'))
+                    done.add(group.lower())
+                    written = True
+                    break
+        if (not written and evidence and group.lower() not in done
+                and not (spec.free and not mapped)):
+            name = group if group == axis else f'{group} ({axis})'
+            note = f"{name}: '{evidence[:60]}' not in list"
+            if note not in unmatched:
+                unmatched.append(note)
+    # the filter groups no sub-category axis feeds (DIRECT_FILTER_GROUPS)
+    direct, direct_unmatched = _direct_filter_hits(sub, parent, title, scraped,
+                                                   table, groups, done)
+    hits.extend(direct)
+    unmatched.extend(n for n in direct_unmatched if n not in unmatched)
+    return hits, unmatched
+
+
+def filter_allowed_for(sub, parent='', table=None, groups=None):
+    """{filter group name: set of allowed lower-case spellings, or None for
+    a free-form group} for one product. A value is VALID when the filter
+    sheet's group lists it or the product's sub-category row does."""
+    groups = FILTER_GROUPS if groups is None else groups
+    out = {}
+    for axis, spec, mapped, derived in _filter_plan(sub, parent, table, groups):
+        own = {v.lower() for v in spec.values}
+        if mapped:
+            for group in mapped:
+                bucket = out.setdefault(group, set())
+                if bucket is not None:
+                    bucket |= {v.lower() for v in groups.get(group, ())}
+                    if len(mapped) == 1:
+                        bucket |= own
+            if len(mapped) > 1 and own:
+                bucket = out.setdefault(derived, set())
+                if bucket is not None:
+                    bucket |= own
+        elif spec.free:
+            out[derived] = None
+        elif own:
+            bucket = out.setdefault(derived, set())
+            if bucket is not None:
+                bucket |= own
+    for _entry, group, options in _direct_plan(sub, parent, table, groups):
+        bucket = out.setdefault(group, set())
+        if bucket is not None:
+            bucket |= {v.lower() for v in options}
+    return out
+
+
+def filter_group_names(client=None):
+    """Every attribute name a filter attribute can carry for this client: the
+    filter-sheet groups the axis table maps, the derived names of the axes no
+    group covers, and the DIRECT_FILTER_GROUPS the client's sheet holds.
+    wc_publish.py sends these as GLOBAL attributes."""
+    if client is None or client is CLIENT:
+        table, groups = SUBCATEGORY_FILTER_AXES, FILTER_GROUPS
+    else:
+        table, groups = load_subcategory_filter_axes(client), load_filter_groups(client)
+    names = set()
+    for key, (parent, _axes) in table.items():
+        for _axis, spec, mapped, derived in _filter_plan(key, parent, table,
+                                                         groups):
+            if mapped:
+                names.update(mapped)
+                if len(mapped) > 1 and spec.values:
+                    names.add(derived)
+            elif spec.values or spec.free:
+                names.add(derived)
+    # the directly-fed groups the client's filter sheet holds
+    lookup = _group_lookup(groups)
+    for entry in DIRECT_FILTER_GROUPS:
+        name = lookup.get(entry.group.lower())
+        if name and groups.get(name):
+            names.add(name)
+    return sorted(names)
+
+
+FILTER_GROUPS = load_filter_groups()
+SUBCATEGORY_FILTER_AXES = load_subcategory_filter_axes()
+FILTER_SHEET_WARNING = filter_sheet_warning()
+
+
+def parse_scraped_specs(cell, brand=''):
     """'Label: Value | Label: Value' -> [(canonical label, value)].
 
-    The inverse of sku_enricher.format_specs. Kept here rather than imported:
-    validate/app must stay runnable without the scraper's dependencies.
+    The inverse of sku_enricher.format_specs. Every row passes the content
+    firewall on its raw AND its canonical label; `brand` is the product's own
+    brand, which is never treated as a retailer name.
     """
     rows, seen = [], set()
     for chunk in str(cell or '').split('|'):
@@ -1292,12 +2579,15 @@ def parse_scraped_specs(cell):
         raw_label, value = chunk.split(':', 1)
         label, value = canon_spec_label(raw_label), compact(value)
         key = label.lower()
-        if not label or not value or key in seen or key in SPEC_LABEL_DROP:
+        if not label or not value or key in seen:
             continue
         if len(label) > 40 or len(value) > 120 or label.lower() == value.lower():
             continue
-        if PROMO_SPEC_RE.search(label) or PROMO_SPEC_RE.search(value):
-            continue                      # an offer, not a product fact
+        if not (spec_row_ok(compact(raw_label), value, brand=brand)
+                and spec_row_ok(label, value, brand=brand)):
+            continue                      # retailer content, not a product fact
+        if bare_platform_row(raw_label, value) or bare_platform_row(label, value):
+            continue                      # 'Operating System: Smart TV' names no platform
         seen.add(key)
         rows.append((label, value))
     return rows
@@ -1373,7 +2663,7 @@ def woo_attribute_name(label):
     return label
 
 
-def product_specs(title, brand, category, scraped=()):
+def product_specs(title, brand, category, scraped=(), filters=()):
     """The (label, value) rows shown on the product page and exported as
     WooCommerce attributes.
 
@@ -1385,19 +2675,80 @@ def product_specs(title, brand, category, scraped=()):
 
     `scraped` carries the retailer's own spec table. It fills labels the title
     could not supply; it never replaces one it could.
+
+    Every row passes the content firewall (content_ok on label and value).
     """
+    return [(label, value) for label, value, _origin
+            in _spec_rows(title, brand, category, scraped, filters)]
+
+
+def _repeats_filter(label, value, filters):
+    """True when (label, value) states the same fact as a filter attribute
+    already written: its label is one the hit was read from and its value
+    snaps EXACTLY to the hit's value. A band hit ('Below 200L', '6.1-7kg')
+    NEVER swallows its source row: the exact figure ('190 L', '7 kg') is
+    different information and stays as its own (non-global) attribute."""
+    low = compact(label).lower()
+    for hit in filters:
+        if hit.kind == 'band' or not (low in hit.labels
+                                      or low == hit.group.lower()):
+            continue
+        if hit.kind == 'new' or (hit.axis == DIRECT_AXIS
+                                 and hit.kind == 'text'):
+            # a value written as scraped ('0.8 Ton', 'VIDAA') is matched
+            # part by part, like a direct group's value
+            # a direct group's source row ('Resolution: 4K Ultra HD',
+            # 'Colour: Gray') is the same fact when every part of it snaps
+            # onto the hit's own values; a row that also says more
+            # ('Steam Wash, Child Lock') is kept
+            stated = [v for v in hit.value.split(', ') if v]
+            snapped = [_snap_direct(p, stated) for p in _direct_parts(value)]
+            if snapped and all(snapped) and {t for s in snapped
+                                             for t, _k in s} == set(stated):
+                return True
+            continue
+        if hit.kind == 'text':
+            if _norm_filter_text(value) == _norm_filter_text(hit.value):
+                return True
+        elif snap_filter_value(value, [hit.value]) == hit.value:
+            return True
+    return False
+
+
+def _spec_rows(title, brand, category, scraped=(), filters=()):
+    """product_specs() rows tagged with where each came from: 'filter' (a
+    filter attribute, see filter_attributes - always FIRST, so the
+    MAX_ATTRIBUTES cap can never cut one), 'brand', 'core' (derived from the
+    title) or 'scraped' (the retailer's spec table). key_points() ranks on
+    the tag; the attribute list ignores it."""
     specs = spec_tags(title)
     rows, used = [], set()
+    origin = ['filter']
 
     def add(label, value):
         label, value = woo_attribute_name(label), compact(value)
         # one row per LABEL: a WooCommerce product with two attributes of the
         # same name renders both, and the second is always the worse one
-        if label and value and label.lower() not in used:
-            used.add(label.lower())
-            rows.append((label, value))
+        if not (label and value) or label.lower() in used:
+            return
+        # a platform/OS label with a bare 'Smart TV' / 'Smart' / 'Yes' names
+        # no platform: write nothing (owner decision 2026-11-19)
+        if bare_platform_row(label, value):
+            return
+        # the content firewall: no retailer-owned text in any attribute
+        if not (content_ok(label, brand=brand) and content_ok(value, brand=brand)):
+            return
+        # a row the filter attribute already carries is not written twice
+        if origin[0] != 'filter' and _repeats_filter(label, value, filters):
+            return
+        used.add(label.lower())
+        rows.append((label, value, origin[0]))
 
+    for hit in filters:
+        add(hit.group, hit.value)
+    origin[0] = 'brand'
     add('Brand', brand)
+    origin[0] = 'core'
 
     cap_label = capacity_label(category, title)
     cap_value = capacity_value(title, category)
@@ -1418,6 +2769,7 @@ def product_specs(title, brand, category, scraped=()):
     add('Configuration', configuration_text(title, category))
     add('Power Rating', wattage(title))
 
+    origin[0] = 'scraped'
     for label, value in scraped:
         if len(rows) >= MAX_ATTRIBUTES:
             break
@@ -1425,37 +2777,97 @@ def product_specs(title, brand, category, scraped=()):
     return rows
 
 
-def build_descriptions(sku, title, brand, category, scraped=()):
+def axis_labels(sub, parent=''):
+    """The sub-category's attribute whitelist as spec labels, in sheet order:
+    [(axis, {lower-case labels that satisfy it})]. Empty when the taxonomy
+    declares no axes for this product."""
+    return [(axis, {axis.lower(), *AXIS_SPEC_LABELS.get(axis, ())})
+            for axis in attribute_axes(sub, parent)
+            if axis not in OPTIONAL_AXES]
+
+
+def key_points(tagged_rows, sub='', parent=''):
+    """At most KEY_POINTS_MAX relevant (label, value) points for the three
+    description fields, from _spec_rows() output. The Brand row is excluded
+    (the templates add their own).
+
+    Relevance order: (0) the filter attributes (origin 'filter'), in sheet
+    axis order; (1) rows whose label is on the sub-category's attribute
+    whitelist, in sheet order; (2) the core rows derived from the title, in
+    product_specs order; (3) other scraped rows - left OUT when the
+    sub-category has a whitelist. Fewer than KEY_POINTS_MAX relevant points
+    means fewer points: the list is never padded."""
+    candidates = [(label, value, origin) for label, value, origin in tagged_rows
+                  if origin != 'brand']
+    whitelist = axis_labels(sub, parent)
+    picked = []
+
+    def take(row):
+        if row not in picked and len(picked) < KEY_POINTS_MAX:
+            picked.append(row)
+
+    for row in candidates:
+        if row[2] == 'filter':
+            take(row)
+    for _axis, labels in whitelist:
+        for row in candidates:
+            if row[0].lower() in labels:
+                take(row)
+    for row in candidates:
+        if row[2] == 'core':
+            take(row)
+    if not whitelist:
+        for row in candidates:
+            take(row)
+    return [(label, value) for label, value, _origin in picked]
+
+
+def _firewall_rows(rows, brand):
+    """Last gate before a description is rendered: drop any ROW (not the whole
+    field) whose label or value still fails content_ok."""
+    return [(label, value) for label, value in rows
+            if content_ok(label, brand=brand) and content_ok(value, brand=brand)]
+
+
+def build_descriptions(sku, title, brand, category, scraped=(), sub='',
+                       parent='', filters=()):
     """Returns (key-features HTML, short description, long description, specs).
 
-    The spec rows are returned directly instead of being recovered by regexing
-    the HTML this function just produced - that round-trip through a string was
-    where the wrong attribute names came from.
+    The spec rows (all of them - they become the WooCommerce attributes) are
+    returned directly instead of being recovered by regexing the HTML this
+    function just produced - that round-trip through a string was where the
+    wrong attribute names came from.
+
+    The three description fields show only key_points(): at most
+    KEY_POINTS_MAX relevant points for this `sub`-category. Nothing is written
+    that was not scraped or read off the title (no invented "230 V / 50 Hz").
     """
-    rows = product_specs(title, brand, category, scraped)
-    extra = [(label, value) for label, value in rows if label != 'Brand']
+    tagged = _spec_rows(title, brand, category, scraped, filters)
+    rows = [(label, value) for label, value, _origin in tagged]
+    points = _firewall_rows(key_points(tagged, sub, parent), brand)
+    brand_rows = _firewall_rows([(label, value) for label, value, origin
+                                 in tagged if origin == 'brand'], brand)
 
     # Paragraph, not a bullet list: the storefront renders this inline under the
     # title, where a <ul> broke the flow. Still one sentence per VERIFIED spec
     # pair - nothing is written here that product_specs() did not produce, so a
     # missing spec stays missing instead of being smoothed over with prose.
+    feature_rows = brand_rows + points
     configuration_points = compact(
         '<p class="product-key-features">'
-        + ' '.join(f'{label}: {value}.' for label, value in rows)
+        + ' '.join(f'{label}: {value}.' for label, value in feature_rows)
         + '</p>'
-    ) if rows else ''
-    short_desc = html_block([
+    ) if feature_rows else ''
+    short_desc = html_block(_firewall_rows([
         ('Brand', brand),
         ('Product SKU', sku),
-    ] + extra[:SHORT_DESC_MAX_SPECS])
-    long_desc = html_block([
+    ] + points, brand))
+    long_desc = html_block(_firewall_rows([
         ('Brand Designation', brand),
         ('Model Identifier Code', sku),
         ('Title', title),
         ('Categories', category),
-    ] + extra + [
-        ('Standard Operational Grid', '230 V / 50 Hz'),
-    ])
+    ] + points, brand))
     return configuration_points, short_desc, long_desc, rows
 
 
@@ -1597,7 +3009,15 @@ def seo_description(title, brand, category_hierarchy, spec_rows,
     sale = format_price_output(sale_price)
     regular = format_regular_price_output(regular_price)
     price_bit = ''
-    if sale:
+    if single_price_mode():
+        # [pricing] single_price: ONE price, never an MRP next to it, never a
+        # saving. The pair is normalised here too, so a caller that passes
+        # the raw two values still gets one number.
+        one, _ = single_price_pair(regular_price, sale_price)
+        one = format_regular_price_output(one)
+        if one:
+            price_bit = f'Price Rs {one:,}.'
+    elif sale:
         price_bit = f'Price Rs {sale:,}'
         if regular and regular > sale:
             price_bit += f' (MRP Rs {regular:,})'
@@ -1698,19 +3118,107 @@ def split_image_urls(row):
     return [compact(x) for x in split_image_list(normalised) if compact(x)]
 
 
-def pad_to_square(image):
-    """Centre the photo on a square white canvas without cropping or upscaling.
+def flatten_on_white(image):
+    """RGB copy of the image with any transparency composited onto white.
 
-    Returns RGB: the alpha channel is composited onto white rather than kept,
-    because a transparent PNG and an opaque JPEG side by side on the storefront
-    render as two different backgrounds. Already-square photos come back
-    unchanged apart from that flattening."""
-    side = max(image.size)
-    source = image if image.mode == 'RGBA' else image.convert('RGBA')
-    canvas = Image.new('RGB', (side, side), SQUARE_BACKGROUND)
-    canvas.paste(source,
-                 ((side - image.size[0]) // 2, (side - image.size[1]) // 2),
-                 source)                      # alpha as mask -> transparent = white
+    A transparent PNG and an opaque JPEG side by side on the storefront would
+    otherwise render as two different backgrounds."""
+    if (image.mode in ('RGBA', 'LA', 'PA')
+            or (image.mode == 'P' and 'transparency' in image.info)):
+        rgba = image.convert('RGBA')
+        white = Image.new('RGBA', rgba.size, (255, 255, 255, 255))
+        return Image.alpha_composite(white, rgba).convert('RGB')
+    return image if image.mode == 'RGB' else image.convert('RGB')
+
+
+def _min_channel(rgb):
+    """'L' image of each pixel's darkest channel (255 = every channel white)."""
+    r, g, b = rgb.split()
+    return ImageChops.darker(ImageChops.darker(r, g), b)
+
+
+def white_share(image):
+    """Share (0.0-1.0) of the outer BORDER_PCT strip on all four sides whose
+    pixels have every channel >= WHITE_MIN, after transparency is composited
+    onto white.
+
+    Measure the SOURCE photo, never the finished canvas: layout_on_canvas()
+    pads with white, so every finished file would score as white."""
+    mins = _min_channel(flatten_on_white(image))
+    w, h = mins.size
+    bx = max(1, round(w * BORDER_PCT / 100))
+    by = max(1, round(h * BORDER_PCT / 100))
+    # top and bottom take the full width; the sides skip those rows so no
+    # corner pixel is counted twice
+    strips = [(0, 0, w, min(by, h)), (0, max(h - by, by), w, h),
+              (0, by, min(bx, w), h - by), (max(w - bx, bx), by, w, h - by)]
+    total = white = 0
+    for box in strips:
+        if box[2] <= box[0] or box[3] <= box[1]:
+            continue
+        hist = mins.crop(box).histogram()
+        total += sum(hist)
+        white += sum(hist[WHITE_MIN:])
+    return white / total if total else 0.0
+
+
+def is_white_background(image):
+    """True when the photo sits on a white (or transparent) backdrop: at least
+    WHITE_SHARE of its border strip is white (see white_share). A lifestyle
+    shot fails because its scene runs to the frame edge."""
+    return white_share(image) >= WHITE_SHARE
+
+
+_BBOX_LUT = [255 if (255 - v) > BBOX_TOL else 0 for v in range(256)]
+
+
+def product_bbox(rgb):
+    """Box around the non-white pixels of an RGB image, or None when there is
+    no usable product (all white, or only a speck under BBOX_MIN_PCT)."""
+    box = _min_channel(rgb).point(_BBOX_LUT).getbbox()
+    if not box:
+        return None
+    w, h = rgb.size
+    if ((box[2] - box[0]) < w * BBOX_MIN_PCT / 100
+            or (box[3] - box[1]) < h * BBOX_MIN_PCT / 100):
+        return None
+    return box
+
+
+def canvas_scale(width, height, white):
+    """Scale for a product of width x height pixels on the CANVAS_EDGE square.
+
+    A white-background product fits inside the canvas minus MARGIN_PCT on each
+    side; a lifestyle shot fills the canvas. Downscaling is unlimited;
+    upscaling is capped at MAX_UPSCALE, so a product that would need more sits
+    smaller, still centred, on the same canvas."""
+    margin = MARGIN_PCT / 100 if white else 0.0
+    inner = CANVAS_EDGE * (1 - 2 * margin)
+    return min(inner / width, inner / height, MAX_UPSCALE)
+
+
+def layout_on_canvas(image, white):
+    """Finish one photo in the house layout: a CANVAS_EDGE x CANVAS_EDGE white
+    square with the product centred, never cropped.
+
+    white=True trims the photo to its product box (falling back to the whole
+    photo when the box is empty) and keeps MARGIN_PCT of white on the limiting
+    side. white=False (a lifestyle shot) is never trimmed - the whole frame is
+    fitted inside the canvas. Returns RGB."""
+    rgb = flatten_on_white(image)
+    if white:
+        box = product_bbox(rgb)
+        if box:
+            rgb = rgb.crop(box)
+    width, height = rgb.size
+    edge = CANVAS_EDGE
+    scale = canvas_scale(width, height, white)
+    new_w = max(1, min(edge, round(width * scale)))
+    new_h = max(1, min(edge, round(height * scale)))
+    if (new_w, new_h) != (width, height):
+        rgb = rgb.resize((new_w, new_h), Image.LANCZOS)
+    canvas = Image.new('RGB', (edge, edge), SQUARE_BACKGROUND)
+    canvas.paste(rgb, ((edge - new_w) // 2, (edge - new_h) // 2))
     return canvas
 
 
@@ -1724,17 +3232,114 @@ def filter_dropped_urls(urls, dropped_cell):
     return [u for u in urls if u.strip() not in dropped]
 
 
-def download_urls_for_sku(sku, urls):
+IMAGE_ACCEPT = 'image/avif,image/webp,image/*,*/*;q=0.8'
+# HTTP codes that mean "this client was refused", not "this image is gone":
+# a browser-impersonating retry often gets through (image.haier.com resets
+# every python-requests TLS handshake but answers curl_cffi with 200).
+_RETRY_STATUS = (403, 429)
+
+
+def fetch_image_bytes(url):
+    """Return the body of `url`. Plain requests with BROWSER_UA first; on a
+    connection error or HTTP 403/429, retry ONCE with curl_cffi impersonating
+    Chrome. Raises on failure (never returns empty bytes silently)."""
+    try:
+        response = requests.get(url, headers={'User-Agent': BROWSER_UA},
+                                timeout=30)
+        status = getattr(response, 'status_code', 200)
+        if status not in _RETRY_STATUS:
+            response.raise_for_status()
+            return response.content
+        first_error = requests.HTTPError(f'HTTP {status}', response=response)
+    except requests.ConnectionError as exc:
+        first_error = exc
+    try:
+        from curl_cffi import requests as creq
+    except ImportError:
+        raise first_error
+    response = creq.get(url, impersonate='chrome', timeout=30,
+                        headers={'Accept': IMAGE_ACCEPT})
+    if response.status_code >= 400:
+        raise requests.HTTPError(
+            f'HTTP {response.status_code} (after browser retry; first try: '
+            f'{first_error})')
+    return response.content
+
+
+SUPERSEDED_DIR_NAME = '_superseded'
+
+
+def retire_stale_images(sku, written_indexes, root=None, today=None):
+    """MOVE (never delete) every `<sku>_<n>.webp` in the upload folder that
+    this build did NOT write to `<root>\\_superseded\\<YYYY-MM-DD>\\` (owner
+    decision 2026-11-19). Runs also when the build saved 0 images for the SKU.
+
+    The SKU is matched exactly: 'TV-X_1.webp' belongs to TV-X, never to TV-X2
+    or TV-X-B ('<sku>_' followed by digits only). Case-insensitive, because
+    NTFS is (see process_inventory's P2-30). A name already in the target gets
+    a numeric suffix ('TV-X_1-2.webp'). Only the top level of `root` is
+    scanned, so _superseded itself is never touched again. Every consumer of
+    the upload folder (pack, validator, wc_publish, GUI) opens files BY NAME
+    from the CSV, so nothing reads _superseded. Returns the moved names."""
+    root = str(IMAGE_DIR if root is None else root)
+    if not os.path.isdir(root):
+        return []
+    keep = {f'{sku}_{i}.webp'.lower() for i in written_indexes}
+    own = re.compile(re.escape(str(sku)) + r'_\d+\.webp', re.IGNORECASE)
+    stale = sorted(name for name in os.listdir(root)
+                   if own.fullmatch(name) and name.lower() not in keep
+                   and os.path.isfile(os.path.join(root, name)))
+    if not stale:
+        return []
+    day = today or datetime.now().strftime('%Y-%m-%d')
+    target_dir = os.path.join(root, SUPERSEDED_DIR_NAME, day)
+    os.makedirs(target_dir, exist_ok=True)
+    moved = []
+    for name in stale:
+        stem, ext = os.path.splitext(name)
+        target, n = os.path.join(target_dir, name), 1
+        while os.path.exists(target):
+            n += 1
+            target = os.path.join(target_dir, f'{stem}-{n}{ext}')
+        try:
+            shutil.move(os.path.join(root, name), target)
+            moved.append(name)
+        except OSError as exc:
+            _ui().warning(f'{sku}: could not move old image {name} ({exc})')
+    if moved:
+        safe_print(f'{sku}: moved {len(moved)} old image(s) to '
+                   f'{SUPERSEDED_DIR_NAME}\\{day}: {", ".join(moved)}')
+    return moved
+
+
+def download_urls_for_sku(sku, urls, flags=None):
+    """Download and convert images, then retire this SKU's old files (see
+    retire_stale_images). Returns the list of indexes saved."""
+    saved = _download_urls_for_sku(sku, urls, flags=flags)
+    retire_stale_images(sku, saved)
+    return saved
+
+
+def _download_urls_for_sku(sku, urls, flags=None):
     """Download and convert images. Returns the list of indexes actually
     saved, so the exported Images column never references files that were
     not downloaded (previously failures were silently mapped anyway).
 
     Quality rules, all enforced here so the browser app and build_csv.py cannot
-    diverge: ask the CDN for its largest rendition, refuse anything below
-    MIN_IMAGE_EDGE as unusable on a product page, never upscale, and finish
-    every main product image on a fixed 1:1 canvas - 1200x1200 when the source
-    allows, 1000x1000 otherwise - so every catalogue tile is the same shape
-    AND the same scale."""
+    diverge: ask the CDN for its largest rendition and refuse anything below
+    MIN_IMAGE_EDGE as unusable on a product page.
+
+    SQUARE_IMAGES=True (the house layout): every photo is finished by
+    layout_on_canvas() on the one CANVAS_EDGE white square. Of the photos with
+    a white background, the one with the HIGHEST white share (white_share,
+    measured on the source; ties -> earlier URL) becomes `<sku>_1.webp` - the
+    featured image - and the rest keep their URL order as _2.._n, numbered
+    contiguously so _1 always exists. When no photo has a white background
+    the first one stays _1 and FLAG_MAIN_NOT_WHITE is appended to `flags`
+    (a list the caller owns) for validate_csv to report.
+
+    SQUARE_IMAGES=False: the old path - downscale past MAX_IMAGE_EDGE only,
+    each file keeps its URL position as its index."""
     root = str(IMAGE_DIR)
     os.makedirs(root, exist_ok=True)
     rejected = []
@@ -1742,10 +3347,7 @@ def download_urls_for_sku(sku, urls):
     # Save all images into a single root folder (no per-SKU subfolders)
     def _fetch(pair):
         index, url = pair
-        response = requests.get(largest_rendition(url),
-                                headers={'User-Agent': BROWSER_UA}, timeout=30)
-        response.raise_for_status()
-        image = Image.open(io.BytesIO(response.content))
+        image = Image.open(io.BytesIO(fetch_image_bytes(largest_rendition(url))))
         if max(image.size) < MIN_IMAGE_EDGE:
             # a soft, blocky product photo is worse than one image fewer
             rejected.append(f'{os.path.basename(url)[:40]} '
@@ -1757,17 +3359,20 @@ def download_urls_for_sku(sku, urls):
             image = image.convert('RGBA' if 'transparency' in image.info else 'RGB')
         elif image.mode not in ('RGB', 'RGBA'):
             image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
+        if SQUARE_IMAGES:
+            # the file name depends on which photo wins the main slot, so
+            # encode here (in parallel) and write after every result is in.
+            # Whiteness is measured on the SOURCE, before layout_on_canvas()
+            # pads it with white - measured after, every photo would pass.
+            share = white_share(image)
+            white = share >= WHITE_SHARE
+            buf = io.BytesIO()
+            layout_on_canvas(image, white).save(
+                buf, format='WEBP', quality=WEBP_QUALITY, method=WEBP_METHOD)
+            return index, white, share, buf.getvalue()
         # downscale only - enlarging a small source invents detail and looks
         # worse than the original did
-        if SQUARE_IMAGES:
-            # pad first so the resize measures the finished square, then land
-            # on exactly one of the two catalogue renditions
-            image = pad_to_square(image)
-            side = image.size[0]
-            edge = CATALOG_EDGE if side >= CATALOG_EDGE else MIN_IMAGE_EDGE
-            if side != edge:
-                image = image.resize((edge, edge), Image.LANCZOS)
-        elif max(image.size) > MAX_IMAGE_EDGE:
+        if max(image.size) > MAX_IMAGE_EDGE:
             ratio = MAX_IMAGE_EDGE / max(image.size)
             image = image.resize((max(1, round(image.size[0] * ratio)),
                                   max(1, round(image.size[1] * ratio))),
@@ -1780,19 +3385,51 @@ def download_urls_for_sku(sku, urls):
     if not urls:
         return []
 
-    saved_indexes = []
+    results = []
+    failed = []     # (url, reason) for every failure that is NOT a resolution reject
     workers = min(8, max(1, len(urls)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_fetch, (i, u)) for i, u in enumerate(urls, start=1)]
+        futures = {pool.submit(_fetch, (i, u)): u
+                   for i, u in enumerate(urls, start=1)}
         for future in as_completed(futures):
             try:
-                saved_indexes.append(future.result())
-            except Exception:
-                pass
+                results.append(future.result())
+            except ValueError as exc:
+                if str(exc) != 'below the minimum resolution':
+                    failed.append((futures[future], f'{type(exc).__name__}: {exc}'))
+            except Exception as exc:
+                failed.append((futures[future], f'{type(exc).__name__}: {exc}'))
     if rejected:
         _ui().warning(f'{sku}: skipped {len(rejected)} image(s) below '
-                      f'{MIN_IMAGE_EDGE}px - ' + '; '.join(rejected[:3]))
-    return sorted(saved_indexes)
+                      f'{MIN_IMAGE_EDGE}px - ' + '; '.join(sorted(rejected)[:3]))
+    if failed:
+        _ui().warning(f'{sku}: image download failed for {len(failed)} of '
+                      f'{len(urls)} URL(s) - ' + '; '.join(
+                          f'{os.path.basename(u)[:40]} ({why[:80]})'
+                          for u, why in failed[:3]))
+        if flags is not None:
+            flags.append(f'image download failed: {len(failed)} of {len(urls)}')
+    if not SQUARE_IMAGES:
+        return sorted(results)
+
+    # threads finish in any order: sort by URL position so the main-image
+    # choice and the numbering are the same on every run
+    results.sort(key=lambda r: r[0])
+    if not results:
+        return []
+    # main image = the WHITEST white-background photo (highest border white
+    # share); a tie goes to the earlier URL position. The rest keep URL order.
+    whites = [r for r in results if r[1]]
+    main = max(whites, key=lambda r: (r[2], -r[0])) if whites else None
+    if main is None:
+        main = results[0]
+        if flags is not None:
+            flags.append(FLAG_MAIN_NOT_WHITE)
+    ordered = [main] + [r for r in results if r is not main]
+    for number, (_, _, _, data) in enumerate(ordered, start=1):
+        with open(os.path.join(root, f'{sku}_{number}.webp'), 'wb') as fh:
+            fh.write(data)
+    return list(range(1, len(ordered) + 1))
 
 
 def format_price_output(value):
@@ -1901,6 +3538,33 @@ def filter_active_inventory_rows(df):
     return cleaned[active_mask].copy()
 
 
+def single_price_mode(client=None):
+    """True when the client's client.toml sets [pricing] single_price."""
+    cfg = client or CLIENT
+    pricing = getattr(cfg, 'pricing', None)
+    return bool(getattr(pricing, 'single_price', False))
+
+
+def single_price_pair(regular_price, sale_price):
+    """(price, '') for single-price mode: the HIGHER of the MRP and the
+    selling price, whichever exist. ('', '') when neither exists. The price
+    goes in 'regular price'; 'sale price' is always empty."""
+    values = []
+    for raw in (regular_price, sale_price):
+        if raw == '' or raw is None:
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            values.append(number)
+    if not values:
+        return '', ''
+    best = max(values)
+    return (int(best) if best.is_integer() else round(best, 2)), ''
+
+
 def row_context(row, estimate_mrp=False):
     """Everything process_inventory derives from ONE input row before it starts
     writing output columns: brand, category, family, prefixed sku, scraped
@@ -1919,6 +3583,10 @@ def row_context(row, estimate_mrp=False):
     raw_sku = row.get('sku')
     title = compact(row.get('title'))
     brand = compact(row.get('Brands')) or infer_brand(title, raw_sku)
+    # The content firewall, ONCE, here: the name, SEO title/description and
+    # tags are all built from this title, so every later use is clean. The
+    # product's own brand is never stripped as a "retailer" (Croma kettles).
+    title = compact(content_clean(title, brand=brand)) or title
     parent_guess, sub_guess = detect_category(title, row.get('categories'),
                                               brand, raw_sku)
     category_hierarchy, category_mapped = canonicalize_category(parent_guess, sub_guess)
@@ -1931,15 +3599,27 @@ def row_context(row, estimate_mrp=False):
 
     sale_price = number_or_blank(row.get('sale price'))
     regular_price = number_or_blank(row.get('regular price'))
-    # sanity: an MRP at or below the selling price is bogus data
-    if regular_price != '' and sale_price != '' and regular_price <= sale_price:
-        regular_price = ''
-    # MRP estimation is now opt-in: fabricated regular prices are not real
-    if estimate_mrp and regular_price == '' and sale_price != '':
-        regular_price = round(float(sale_price) * 1.25, 2)
+    if single_price_mode():
+        # [pricing] single_price: ONE price, the higher of the two. No
+        # struck-through MRP, no sale price, no estimated MRP.
+        regular_price, sale_price = single_price_pair(regular_price,
+                                                      sale_price)
+    else:
+        # sanity: an MRP at or below the selling price is bogus data
+        if (regular_price != '' and sale_price != ''
+                and regular_price <= sale_price):
+            regular_price = ''
+        # MRP estimation is now opt-in: fabricated regular prices are not real
+        if estimate_mrp and regular_price == '' and sale_price != '':
+            regular_price = round(float(sale_price) * 1.25, 2)
 
-    scraped = parse_scraped_specs(row.get('specs'))
-    dynamic_attrs = product_specs(title, brand, category_family, scraped)
+    scraped = parse_scraped_specs(row.get('specs'), brand=brand)
+    # filter attributes: named by the store's filter group, value snapped
+    # onto the sheet's own spelling (see filter_attributes)
+    filters, filter_unmatched = filter_attributes(sub_guess, parent_guess,
+                                                  title, scraped)
+    dynamic_attrs = product_specs(title, brand, category_family, scraped,
+                                  filters)
 
     return {
         'raw_sku': raw_sku,
@@ -1952,6 +3632,8 @@ def row_context(row, estimate_mrp=False):
         'category_family': category_family,
         'sku': sku,
         'scraped': scraped,
+        'filters': filters,
+        'filter_unmatched': filter_unmatched,
         'dynamic_attrs': dynamic_attrs,
         'regular price': regular_price,
         'sale price': sale_price,
@@ -1976,9 +3658,13 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
     skipped_duplicates = 0
     unmapped_categories = set()
     gap_counts = {}
+    not_white_main = []
+    unmatched_rows = 0
     ui = _ui()
     if SUBCATEGORY_ATTRIBUTES_WARNING:
         ui.warning(SUBCATEGORY_ATTRIBUTES_WARNING)
+    if FILTER_SHEET_WARNING:
+        ui.warning(FILTER_SHEET_WARNING)
     progress = ui.progress(0)
     tracker = ui.empty()
 
@@ -2016,14 +3702,25 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
         urls = filter_dropped_urls(split_image_urls(row),
                                    row.get('dropped_images'))
-        saved_indexes = download_urls_for_sku(sku, urls)
+        image_flags = []
+        saved_indexes = download_urls_for_sku(sku, urls, flags=image_flags)
+        if FLAG_MAIN_NOT_WHITE in image_flags:
+            not_white_main.append(sku)
 
         # BUGFIX: only map images that were really downloaded (previously a
         # minimum of 2 URLs was invented even when nothing was saved)
         mapped_images = ','.join([f'{media_base}/{sku}_{i}.webp' for i in saved_indexes])
         scraped = ctx['scraped']
+        # key points are ranked by this sub-category's attribute whitelist;
+        # build_descriptions drops any rendered row that fails content_ok
+        # filter attributes come FIRST in dynamic_attrs (never cut by the
+        # MAX_ATTRIBUTES cap) and are named by the store's filter group
         config, short_desc, long_desc, dynamic_attrs = build_descriptions(
-            sku, title, brand, category_family, scraped)
+            sku, title, brand, category_family, scraped,
+            sub=sub_guess, parent=parent_guess, filters=ctx['filters'])
+        filter_unmatched = ctx['filter_unmatched']
+        if filter_unmatched:
+            unmatched_rows += 1
 
         gaps = missing_spec_axes(sub_guess, title, category_family, scraped,
                                  parent=parent_guess)
@@ -2039,8 +3736,11 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             'title': title,
             # the importer splits this cell on ',' unless escaped as '\,'
             'categories': escape_category_for_csv(category_hierarchy),
+            # the price band follows the price the shopper pays: the sale
+            # price, or in single-price mode the one price ('regular price')
             'Tags': build_tags(brand, parent_guess, sub_guess, title,
-                               sale_price, category_family),
+                               regular_price if single_price_mode()
+                               else sale_price, category_family),
             'regular price': format_regular_price_output(regular_price),
             'sale price': format_price_output(sale_price),
             'Brands': brand,
@@ -2049,6 +3749,13 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             # axes this product's own sub-category declares but nothing could
             # fill. Blank means complete. validate_csv.py reports these.
             '_spec_gaps': ', '.join(gaps),
+            # a filter value WAS stated (spec table or title) but is not in
+            # the filter sheet / sub-category lists, so no filter attribute
+            # was written for it. Blank means none. validate_csv.py warns.
+            '_filter_unmatched': '; '.join(filter_unmatched),
+            # image problems to review (blank = none); validate_csv.py reports
+            # them as warnings that never block the import
+            '_image_flags': '; '.join(image_flags),
         }
 
         if seo:
@@ -2056,11 +3763,17 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
                 sku, title, brand, category_hierarchy, dynamic_attrs,
                 regular_price, sale_price, seo_plugin))
 
+        # only a FILTER attribute is a global (taxonomy) attribute; every other
+        # spec label stays a per-product custom attribute, so the store does
+        # not grow one global taxonomy per scraped label
+        filter_names = {woo_attribute_name(hit.group).lower()
+                        for hit in ctx['filters']}
         for index, (attr_name, attr_value) in enumerate(dynamic_attrs, start=1):
             output_row[f'Attribute {index} name'] = attr_name
             output_row[f'Attribute {index} value(s)'] = attr_value
             output_row[f'Attribute {index} visible'] = '1'
-            output_row[f'Attribute {index} global'] = '1'
+            output_row[f'Attribute {index} global'] = (
+                '1' if attr_name.lower() in filter_names else '0')
 
         processed_rows.append(output_row)
 
@@ -2080,6 +3793,16 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             + ', '.join(f'{axis} x{n}' for axis, n
                         in sorted(gap_counts.items(), key=lambda kv: -kv[1]))
             + '. These products will be missing storefront filters.')
+    if unmatched_rows:
+        ui.warning(f'{unmatched_rows} product(s) state a filter value that is '
+                   'not in the filter sheet (see _filter_unmatched). A "new '
+                   'value" was written as scraped; add it to the attributes '
+                   'master if it is real.')
+    if not_white_main:
+        ui.warning(f'{len(not_white_main)} product(s) have no white-background '
+                   'photo, so the featured image is a lifestyle shot (see '
+                   '_image_flags): ' + ', '.join(not_white_main[:10])
+                   + (' ...' if len(not_white_main) > 10 else ''))
 
     attribute_columns = []
     for row in processed_rows:

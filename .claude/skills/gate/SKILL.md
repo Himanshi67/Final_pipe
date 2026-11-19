@@ -13,7 +13,7 @@ Run this after a chunk of work, not after every edit. It is the single source of
 ```bash
 .venv\Scripts\python.exe -m py_compile app.py build_csv.py client_config.py gui.py \
   gui_helpers.py sku_enricher.py validate_csv.py wc_checkpoint.py wc_publish.py \
-  wc_seo.py \
+  wc_seo.py url_index.py \
   && .venv\Scripts\python.exe -m pytest tests -q --no-header -p no:cacheprovider 2>&1 | tail -15
 ```
 

@@ -100,6 +100,11 @@ clients/*/backups/
 clients/*/.env
 clients/*/credits.json
 
+# Tier-0 URL index (url_index.py): downloaded retailer sitemaps in SQLite.
+# Generated state, rebuilt automatically when stale. Root-anchored, so the
+# offline fixtures in tests/fixtures/url_index/ stay tracked.
+/url_index/
+
 # Nothing in here belongs to the catalogue pipeline - a portable Node
 # distribution plus scratch DSA work. Ignoring the whole folder rather than
 # just _tools/ stops `git add -A` sweeping another session's files into a
@@ -130,3 +135,6 @@ docs/PRODUCT_PLAN.md
 # Session handovers summarising the same open-defect material.
 docs/handover-audit-productization.md
 docs/handover-phase0-closeout.md
+# The same two handovers after the 2026-11-19 move into _not_in_use/.
+_not_in_use/docs/handover-audit-productization.md
+_not_in_use/docs/handover-phase0-closeout.md

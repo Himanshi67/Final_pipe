@@ -11,7 +11,9 @@ place per client, and every entry point takes `--client <slug>`.
         client.toml                        the contract below
         category_map.xlsx                  taxonomy (was at repo root)
         category_seo.xlsx                  curated tags + SEO keywords (was at repo root)
-        SubCategory_Attributes_Master.xlsx reference copy, read by no script (was at root)
+        SubCategory_Attributes_Master.xlsx attributes master: SOURCE of the filter groups and
+                                           the sub-category attribute lists (app.py reads it;
+                                           category_map.xlsx copies are the fallback)
         backups/                           category-map editor backups (gitignored)
         .env                               WC_*/WP_*/SERPER_* for this client (gitignored, Phase 1 item 3)
         credits.json                       serper ledger (gitignored, Phase 1 item 4)
@@ -90,7 +92,9 @@ constants see the right client.
 |---|---|---|
 | `app.MEDIA_BASE` / `build_media_base` | literal shreejee URL | `CLIENT.media_base(month)` |
 | `app.SEO_SITE_NAME` | literal | `CLIENT.seo_site_name` |
-| `app.CATEGORY_MAP_CANDIDATES` / `load_category_map` / `load_subcategory_attributes` / `load_category_seo` | files next to app.py | `CLIENT.category_map`, `CLIENT.category_seo` |
+| `app.CATEGORY_MAP_CANDIDATES` / `load_category_map` / `load_category_seo` | files next to app.py | `CLIENT.category_map`, `CLIENT.category_seo` |
+| `app.load_subcategory_attributes` / `load_subcategory_filter_axes` / `load_filter_groups` (2026-11-19) | `category_map.xlsx` only | `CLIENT.attributes_master` first (its 'Sub-Category Attributes' sheet and the sheet whose header starts with 'Filter Group'), then the `category_map.xlsx` copies ('Sub-Category Attributes', 'Filters'). `app.configure` reloads all three; `tools\check_filter_sheet.py` and a build warning report drift between the two files |
+| `wc_publish.attributes_for` (2026-11-19) | every attribute custom | a filter-group attribute is sent as the store's global attribute (`products/attributes`, read once per run; created once only with `--commit`) |
 | `app.download_urls_for_sku` image root | `os.getcwd()/product_images_for_upload` | `CLIENT.image_dir` (closes P3-57 for app) |
 | `app.configure(slug)` | — | NEW: reloads every constant above for a different client (tests, wc_seo) |
 | `build_csv.py` | rebuilds the literal URL | pre-scans `--client` before `import app`; passes `media_base=` from CLIENT |
@@ -226,8 +230,29 @@ a guard tripped and NOTHING was written (distinct from 2 row-failed / 3 edge-blo
 api_key_env = "SERPER_API_KEY"   # BYOK: the env var (in the client's .env) that holds the key
 monthly_budget = 2500            # informational (free tier); the GUI shows month-to-date against it
 default_run_budget = 0           # 0 = unlimited; the GUI pre-fills --budget with it
+query_mode = "incremental"       # or "batch" (the behaviour before 2026-11-19)
+search_order = "paid_first"      # or "free_first"; --search-order overrides it per run
 ```
 
+- **`query_mode`** (default `"incremental"`). Per search tier, the cached queries are
+  read first (free); the uncached ones go out one at a time, each followed by a crawl,
+  and sending stops at the first complete listing or when the SKU's page-fetch budget
+  is spent. A wholly cached tier takes the batch path, so a warm-cache replay is
+  byte-identical in both modes. `"batch"` sends every query of a tier before any crawl.
+  Another value raises `ClientConfigError`.
+- **`search_order`** (default `"paid_first"`). `"free_first"` asks DuckDuckGo first and
+  serper only when DuckDuckGo returns no result. The `--search-order
+  {paid_first,free_first}` flag of `sku_enricher.py` overrides it for one run. The
+  search cache key is the bare query in both orders (old entries stay valid); the
+  `--budget` gate and the ledger behave the same in both. Another value raises
+  `ClientConfigError`.
+- **Duplicate-query skip** (always on, both modes): an UNCACHED `site:croma.com` query
+  is not sent when the Croma site search answered for that SKU (no error, no block)
+  with no match; an UNCACHED brand-site `site:` query is not sent when the URL index
+  has a fresh, non-empty source on the brand's own domain and the lookup found nothing
+  there. Counted in `RUN_STATS["queries_skipped_dup"]`; queries the incremental mode
+  never sent are in `RUN_STATS["queries_skipped_early"]`. Both appear on the report's
+  `Credits:` line.
 - `serper_search` reads `os.environ.get(SERPER_KEY_ENV)` where `SERPER_KEY_ENV` is a
   module variable set from the client in `main()` (default `SERPER_API_KEY`, so
   `--probe` and tests behave as before).
@@ -274,6 +299,62 @@ default_run_budget = 0           # 0 = unlimited; the GUI pre-fills --budget wit
   the ledger and surfaces the budget-stop line (`gui_helpers.parse_enricher_log` learns
   the new line).
 
+## Tier 0 URL sources (`[url_index]` table, `url_index.py`, `sku_enricher.py`)
+
+```toml
+[url_index]
+enabled = true          # false = straight to serper/DuckDuckGo, as before
+max_age_days = 7        # sources older than this refresh at enricher start (>= 0)
+disable = []            # source and site-search names to switch off for this client
+# [[url_index.extra_sources]]       # same keys as [[source]] in url_sources.toml
+# name = "mydealer"
+# root = "https://www.example.com/sitemap.xml"
+# url_pattern = '/product/'
+```
+
+- Optional; every key defaults (`client_config.UrlIndexConfig`, loaded by
+  `_load_url_index` exactly like `[serper]`). A bad type raises `ClientConfigError`.
+- The shared defaults live in the root `url_sources.toml` (`[[source]]` sitemaps,
+  `[[site_search]]` endpoints). An extra source with the same name as a shared one
+  replaces it. A name in `disable` drops it from BOTH lists.
+- The index file `url_index\index.sqlite` is SHARED across clients (retailer URLs are
+  not client data); only the selection of sources is per client. It is gitignored.
+- `--no-url-index` and `PIPELINE_URL_INDEX=off` override `enabled = true` for one run.
+- A keyed site search (`key_page` + `key_inputs`) reads its keys from the page's hidden
+  inputs at run time, once per run, in memory only: they are never committed, cached
+  (the cache key is `<name>:<code>`), logged or reported.
+
+## One price only (`[pricing]` table, owner decision 2026-11-19)
+
+```toml
+[pricing]
+single_price = true     # shreejee: ONE price. Code default (table absent): false
+```
+
+- Optional; loaded by `client_config._load_pricing` into `ClientConfig.pricing`
+  (`PricingConfig`). A value that is not `true`/`false` raises `ClientConfigError`.
+- `false` (default): today's output. `regular price` = MRP (struck through),
+  `sale price` = the selling price; an MRP at or below the price is dropped.
+- `true`: the BUILD OUTPUT has one price. `regular price` = the HIGHER of the row's
+  MRP and selling price (whichever exist); `sale price` = empty. If only one exists,
+  that one is the price. `_filled.xlsx` is not changed: the enricher still records both.
+- What follows the switch:
+  - `app.row_context` (`single_price_pair`): the two prices; `--estimate-mrp` and the
+    GUI "Estimate missing MRP" box do nothing (the box is disabled).
+  - `app.build_tags`: the price-band tag uses the one price.
+  - `app.seo_description` (CSV `--seo`, GUI SEO preview, `wc_seo.py`): "Price Rs N." only.
+    No "MRP", no saving, no "% off".
+  - `validate_csv.py` export check: the one price drives `missing_price` and the
+    category floor / ceiling / TV price checks; the MRP-ratio checks are off (no pair);
+    a non-empty `sale price` is `sale_price_in_single_price_mode` (BLOCKING, a stale
+    or hand-edited CSV). Stage-1 check (`_filled.xlsx`): an MRP alone is a price (no
+    `verified_but_no_price`), the TV price check reads the higher value, and the
+    MRP-ratio checks STAY (a wrong MRP becomes the price in this mode).
+  - `wc_publish.payload_prices`: `regular_price` = the higher of the two CSV values,
+    `sale_price` is SENT as `""`. On an update this CLEARS a sale price the live
+    product had - only for the products in that CSV. The dry run names it
+    (`sale_price 28990 -> -`).
+
 ## Item 5 — review instrumentation (`gui.py` step_review / card_review, `gui_helpers.py`)
 
 `review_state.json` gains an `events` list beside `confirmed`:
@@ -307,8 +388,13 @@ default_run_budget = 0           # 0 = unlimited; the GUI pre-fills --budget wit
   two-pass statuses. `gui_helpers.render_batch_readme(meta, coverage, review, images,
   validation) -> str` renders the README (one renderer for both entry points).
 - `archive_run` additionally copies the client's original input list (under its
-  original name), writes the README with `## Coverage` and `## Review` sections, and
-  zips the folder to `batches/<name>.zip` (`shutil.make_archive`) - one file to hand over.
-- `build_csv.py --pack` writes `<out dir>/<stem>_pack/` (CSV, issues, referenced images,
-  README from the same renderer, the input list) and zips it. A repo file, never a
-  published page.
+  original name) and writes the README with `## Coverage` and `## Review` sections into
+  `batches/<name>/` - the INTERNAL archive. The zip handed over, `batches/<name>.zip`,
+  is made from a separate `batches/<name>_client/` folder: CSV, referenced images and a
+  README only (`validation_issues.csv` is internal since 2026-11-19, fifth round).
+- `build_csv.py --pack` writes `<out dir>/<stem>_pack/` (CSV, referenced images,
+  README from the same renderer; no `validation_issues.csv`) and zips it. A repo file, never a published page.
+- Owner rule 2026-11-19: a client pack never holds `*_filled.xlsx`, `*_report.md`,
+  `*.log`, `validation_issues.csv` or a text file that links to a host other than the client's store / media
+  host. `gui_helpers.assemble_pack` refuses such members (`internal=True` only for the
+  operator's archive) and `remove_refused` checks the finished folder before the zip.

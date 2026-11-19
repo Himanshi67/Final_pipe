@@ -46,11 +46,16 @@ from client_config import (DEFAULT_CLIENT, ClientConfigError,
 from gui_helpers import (BADGE, append_events, assemble_pack, batch_summary,
                          card_queue_index, classify, configure_sku_codes,
                          clock_elapsed, confirmed_from_state,
-                         coverage_summary,
+                         coverage_summary, default_client_hosts,
+                         remove_refused,
                          csv_signature, eligible_rows, eta_text,
                          filter_review_df, flag_value, found_status,
-                         image_basenames_from_csv, limit_from_flags,
-                         merge_confirm_flags,
+                         limit_from_flags,
+                         merge_confirm_flags, merge_review_flags,
+                         APPROVE as REVIEW_APPROVE, SKIP as REVIEW_SKIP,
+                         CLEAR as REVIEW_CLEAR,
+                         review_counts, review_counts_text, review_decision,
+                         review_entries, skipped_from_state,
                          parse_enricher_log,
                          parse_image_urls, parse_publish_output,
                          parse_specs_cell, raw_sku_for_csv_sku,
@@ -302,27 +307,34 @@ def confirmed_set(P) -> set:
     return confirmed_from_state(load_json(P["review"]))
 
 
-def save_confirmed(P, skus: dict, df=None):
-    """Persist the tick map as {sku: {"confirmed": bool, "fp": <sha1>}}.
+def skipped_map(P) -> dict:
+    """{sku: reason} of the rows the reviewer skipped."""
+    return skipped_from_state(load_json(P["review"]))
+
+
+def save_confirmed(P, skus: dict, df=None, skipped=None):
+    """Persist the review map as {sku: {"confirmed", "skipped",
+    "skip_reason", "fp"}}.
 
     `df` is the sheet as it stands AFTER the edits being saved (P3-53): the
     fingerprint has to describe the row the reviewer just approved, so a
     later --retry-incomplete rewriting that row invalidates the tick. Rows
     absent from `df` keep whatever fingerprint they already had - the card
-    view hands in a single-row frame, and that must not blank the rest."""
+    view hands in a single-row frame, and that must not blank the rest.
+
+    `skipped` is the COMPLETE {sku: reason} skip map to store. None keeps
+    the skips already on disk - and then a skipped row stays skipped even
+    if `skus` ticks it (gui_helpers.review_entries: skip wins), so a caller
+    that means 'approve' must clear the skip through review_decision."""
     state = load_json(P["review"])
     old = state.get("confirmed", {})
+    if skipped is None:
+        skipped = skipped_from_state(state)
     fps = {}
     if df is not None and "sku" in getattr(df, "columns", []):
         for _, row in df.iterrows():
             fps.setdefault(str(row["sku"]), row_fingerprint(row))
-    out = {}
-    for sku, ok in skus.items():
-        sku = str(sku)
-        prev = old.get(sku)
-        fp = fps.get(sku, prev.get("fp") if isinstance(prev, dict) else None)
-        out[sku] = {"confirmed": bool(ok), "fp": fp}
-    state["confirmed"] = out
+    state["confirmed"] = review_entries(old, skus, skipped, fps)
     state["updated"] = datetime.now().isoformat(timespec="seconds")
     save_json(P["review"], state)
 
@@ -352,13 +364,15 @@ REVIEW_CLOCK = "review_clock_{run}"
 CARD_SHOWN = "card_shown_{run}"
 
 
-def log_table_save(P, touched, before, flags):
+def log_table_save(P, touched, before, flags, before_skips=None,
+                   skips=None):
     """Log one save from the review TABLE.
 
     `touched` is write_edits_back_detail's {sku: {col: value}}: a row whose
     url_link changed counts as 'url_pasted' (that is the NEEDS LINK
     remediation, not a cosmetic edit), any other changed column as 'edit'.
-    A confirmed flag that flipped adds 'approve'/'unapprove'. One save can
+    A confirmed flag that flipped adds 'approve'/'unapprove', a Skip flag
+    that flipped adds 'skip'/'unskip'. One save can
     only be timed as a whole, so its elapsed seconds are split EQUALLY over
     every event it logs - guessing per-row would be fiction."""
     events = []
@@ -372,6 +386,11 @@ def log_table_save(P, touched, before, flags):
             events.append((sku, "approve"))
         elif was and not bool(ok):
             events.append((sku, "unapprove"))
+    if skips is not None:
+        was_skipped = {str(s) for s in (before_skips or {})}
+        now_skipped = {str(s) for s in skips}
+        events += [(s, "skip") for s in sorted(now_skipped - was_skipped)]
+        events += [(s, "unskip") for s in sorted(was_skipped - now_skipped)]
     if not events:
         return 0
     elapsed = clock_elapsed(st.session_state,
@@ -923,11 +942,15 @@ def review_editor(df: pd.DataFrame, key: str,
     anyway (see gui_helpers.found_status)."""
     view = df.copy()
     view.insert(0, "confirmed", view.pop("confirmed"))
-    view.insert(1, "state", view["status"].map(
+    # Skip sits next to ✔: the reviewer's explicit 'no'. Allowed on every
+    # tab - a skip needs no FOUND status
+    view.insert(1, "skipped", view.pop("skipped") if "skipped" in view.columns
+                else False)
+    view.insert(2, "state", view["status"].map(
         lambda s: f"{BADGE[classify(s)]} {s}"))
-    view.insert(2, "thumb", view["image_url"].map(
+    view.insert(3, "thumb", view["image_url"].map(
         lambda v: str(v).split(",")[0].strip() if str(v).strip() else None))
-    show = ["confirmed", "state", "sku", "title", "regular price",
+    show = ["confirmed", "skipped", "state", "sku", "title", "regular price",
             "sale price", "thumb", "image_url", "url_link", "categories",
             "Brands", "specs"]
     show = [c for c in show if c in view.columns]
@@ -941,6 +964,10 @@ def review_editor(df: pd.DataFrame, key: str,
                 help=None if allow_confirm else
                 "Not confirmable — paste a URL and press Crawl all info "
                 "first"),
+            "skipped": st.column_config.CheckboxColumn(
+                "Skip", default=False, width="small",
+                help="Skip this row: it is never built, in any scope. "
+                     "Ticking ✔ later clears the skip."),
             "state": st.column_config.TextColumn("status", width="medium"),
             "thumb": st.column_config.ImageColumn("img", width="small"),
             "url_link": st.column_config.LinkColumn("url", width="medium"),
@@ -1051,17 +1078,23 @@ def card_review(P, df, cat_opts, all_raws=None):
         st.info("No rows in the current filter.")
         return
     order = {"review": 0, "failed": 1, "pending": 2, "found": 3, "skipped": 4}
+    df = df.copy()
+    if "skipped" not in df.columns:
+        df["skipped"] = False
+    # a DECIDED card (approved or skipped) sorts after every undecided one,
+    # so the queue always offers the next row nobody has judged yet
+    df["_decided"] = df["confirmed"].astype(bool) | df["skipped"].astype(bool)
     queue = df.sort_values(
-        by=["confirmed", "_bucket"],
+        by=["_decided", "_bucket"],
         key=lambda s: s.map(order) if s.name == "_bucket" else s,
     ).reset_index(drop=True)
 
     ikey = f"card_i_{run}"
-    # never rest on a confirmed card while unconfirmed ones remain: approving
-    # the LAST unconfirmed card leaves it at position i, and i + 1 clamps
+    # never rest on a decided card while undecided ones remain: approving
+    # the LAST undecided card leaves it at position i, and i + 1 clamps
     # right back onto it, so Approve/Skip would dead-loop on an already
     # approved card (P1-9 tail) - card_queue_index snaps forward instead
-    i = card_queue_index(queue["confirmed"], st.session_state.get(ikey, 0))
+    i = card_queue_index(queue["_decided"], st.session_state.get(ikey, 0))
     st.session_state[ikey] = i
     row = queue.iloc[i]
     sku = str(row["sku"])
@@ -1083,11 +1116,21 @@ def card_review(P, df, cat_opts, all_raws=None):
 
     st.progress((i + 1) / len(queue),
                 text=f"Card {i + 1} / {len(queue)} — "
-                     f"{int(queue['confirmed'].sum())} confirmed")
-    if bool(queue["confirmed"].all()):
-        st.success(f"All {len(queue)} cards confirmed.")
+                     f"{int(queue['confirmed'].sum())} approved, "
+                     f"{int(queue['skipped'].sum())} skipped")
+    if bool(queue["_decided"].all()):
+        st.success(f"All {len(queue)} cards decided (approved or skipped).")
     st.subheader(f"{BADGE[row['_bucket']]} {sku}")
     st.caption(str(row["status"]))
+    is_skipped = bool(row["skipped"])
+    skip_reasons = skipped_map(P)
+    if is_skipped:
+        why = skip_reasons.get(sku, "")
+        st.warning("Skipped — this row is never built"
+                   + (f": {why}" if why else ".")
+                   + " Approve it to take it back into the build.")
+    elif bool(row["confirmed"]):
+        st.success("Approved — this row is in the build.")
     src = str(row.get("url_link", "") or "").strip()
     if src:
         st.markdown(f"🔗 [Open source page]({src})")
@@ -1165,14 +1208,37 @@ def card_review(P, df, cat_opts, all_raws=None):
             events.append(review_event(sku, "edit", "card", 0.0))
         log_review_events(P, events)
         if confirm is not None:
-            flags = {s: True for s in confirmed_set(P)}
-            flags[sku] = bool(confirm)
+            # approving clears a skip (three-state rule, gui_helpers)
+            conf, skips = review_decision(
+                confirmed_set(P), skipped_map(P), sku,
+                REVIEW_APPROVE if confirm else REVIEW_CLEAR)
+            flags = {s: True for s in conf}
+            flags.setdefault(sku, False)
             # `part` holds this row exactly as it was just written back, so
             # the fingerprint describes what the reviewer approved (P3-53)
-            save_confirmed(P, flags, part)
+            save_confirmed(P, flags, part, skips)
         return True
 
-    b1, b2, b3, b4 = st.columns(4)
+    def skip_row(reason):
+        """Store the SKIP decision: skipped with its reason, approval
+        cleared. The skip event carries the card's time, as before."""
+        conf, skips = review_decision(confirmed_set(P), skipped_map(P), sku,
+                                      REVIEW_SKIP, reason)
+        save_confirmed(P, {s: True for s in conf}, None, skips)
+        log_review_events(P, [review_event(sku, "skip", "card", card_secs())])
+
+    def unskip_row():
+        conf, skips = review_decision(confirmed_set(P), skipped_map(P), sku,
+                                      REVIEW_CLEAR)
+        save_confirmed(P, {s: True for s in conf}, None, skips)
+        log_review_events(P, [review_event(sku, "unskip", "card", 0.0)])
+
+    reason = st.text_input(
+        "Reason to skip (optional)", skip_reasons.get(sku, ""),
+        key=f"skr_{run}_{sku}",
+        placeholder="e.g. wrong model, price looks wrong, images unusable")
+
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
     # only a FOUND row is importable - approving anything else could pull an
     # unvetted row into a confirmed-scope build (the save would refuse it
     # anyway, see gui_helpers.found_status)
@@ -1189,15 +1255,24 @@ def card_review(P, df, cat_opts, all_raws=None):
             # position where an approved row does NOT leave i is the last
             # unconfirmed one; card_queue_index catches that on the next
             # run and snaps to the first card still unconfirmed.
-            goto(i if not bool(row["confirmed"]) else i + 1)
-    if b2.button("💾 Save & next", key=f"sv_{run}_{sku}"):
+            goto(i if not bool(row["_decided"]) else i + 1)
+    # SKIP stores the decision: the row is never built, in any scope. Like
+    # Approve, an undecided card leaves position i (decided cards sort last)
+    if b2.button("⛔ Skip", key=f"sk_{run}_{sku}",
+                 help="Leave this row out of the build. Add a reason above "
+                      "if you like; Approve later clears the skip."):
+        skip_row(reason)
+        goto(i if not bool(row["_decided"]) else i + 1)
+    if b3.button("💾 Save & next", key=f"sv_{run}_{sku}"):
         if save(None):
             goto(i + 1)
-    if b3.button("→ Skip", key=f"sk_{run}_{sku}"):
-        # a skipped card still cost the reviewer the time it was on screen
-        log_review_events(P, [review_event(sku, "skip", "card", card_secs())])
+    if is_skipped and b4.button("↩ Undo skip", key=f"us_{run}_{sku}"):
+        unskip_row()
+        goto(i)
+    if b5.button("Next →", disabled=i >= len(queue) - 1,
+                 key=f"nx_{run}_{sku}"):
         goto(i + 1)
-    if b4.button("← Back", disabled=i == 0, key=f"bk_{run}_{sku}"):
+    if b6.button("← Back", disabled=i == 0, key=f"bk_{run}_{sku}"):
         goto(i - 1)
 
 
@@ -1217,7 +1292,9 @@ def step_review(P):
     # moves needs_human_pct - recompute before the caption reads the file
     refresh_review_metrics(P, df)
     conf = confirmed_set(P)
+    skips = skipped_map(P)
     df["confirmed"] = df["sku"].astype(str).isin(conf)
+    df["skipped"] = df["sku"].astype(str).isin(set(skips))
     df["_bucket"] = df["status"].map(classify)
 
     n = df["_bucket"].value_counts()
@@ -1228,6 +1305,8 @@ def step_review(P):
     m3.metric("🟡 Needs review", int(n.get("review", 0)))
     m4.metric("🔴 No link / failed", int(n.get("failed", 0)))
     m5.metric("✔ Confirmed", int(df["confirmed"].sum()))
+    st.caption("Review: " + review_counts_text(review_counts(df, conf, skips))
+               + " — only approved rows go to the build.")
 
     # Step 2's stopwatch starts on the first render of this session; the
     # caption below is what the last save measured (Phase 1 item 5)
@@ -1297,7 +1376,8 @@ def step_review(P):
         return
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
-               "table; tick ✔ to confirm a row for the CSV. Then press "
+               "table; tick ✔ to approve a row for the CSV, or **Skip** to "
+               "leave it out of every build. Then press "
                "**Save edits & confirmations**.")
 
     tabs = st.tabs([f"🟡 Needs review ({int(n.get('review', 0))})",
@@ -1335,16 +1415,19 @@ def step_review(P):
     # render - the bucket tab, being later, wins.
     ordered = [parts[-1]] + parts[:-1]
 
-    def persist_flags(flags, rejected, changed=None):
-        """Save the merged ✔ map, then stash the outcome and rerun. The rerun
-        throws the page away, so anything printed here would never be seen -
-        step_review pops these messages at the top of the next run."""
+    def persist_flags(flags, rejected, changed=None, new_skips=None):
+        """Save the merged ✔ / Skip maps, then stash the outcome and rerun.
+        The rerun throws the page away, so anything printed here would never
+        be seen - step_review pops these messages at the top of the next
+        run."""
         # re-read: write_edits_back has just landed this render's edits, and
         # the fingerprints stored beside the ticks must describe THAT sheet
-        save_confirmed(P, flags, load_filled_df(P))
+        save_confirmed(P, flags, load_filled_df(P), new_skips)
+        n_skip = len(new_skips if new_skips is not None else skipped_map(P))
         head = "" if changed is None else f"Saved — {changed} cell(s) " \
                                           "updated, "
-        msgs = [("success", f"{head}{sum(flags.values())} row(s) confirmed.")]
+        msgs = [("success", f"{head}{len(confirmed_set(P))} row(s) "
+                            f"confirmed, {n_skip} skipped.")]
         if rejected:
             msgs.append(("warning",
                          f"{len(rejected)} tick(s) ignored — a tick only "
@@ -1358,26 +1441,34 @@ def step_review(P):
     b1, b2, b3, b4 = st.columns([1.4, 1.4, 1.6, 1.6])
     if b1.button("💾 Save edits & confirmations", type="primary"):
         before_conf = confirmed_set(P)
+        before_skips = skipped_map(P)
         try:
             changed, touched = write_edits_back_detail(P, df, ordered)
         except PermissionError:
             st.error("The filled .xlsx is open in Excel — close it and save "
                      "again.")
             return
-        flags, rejected = merge_confirm_flags(before_conf, df, ordered)
-        log_table_save(P, touched, before_conf, flags)
-        persist_flags(flags, rejected, changed)
+        flags, new_skips, rejected = merge_review_flags(
+            before_conf, before_skips, df, ordered)
+        log_table_save(P, touched, before_conf, flags, before_skips,
+                       new_skips)
+        persist_flags(flags, rejected, changed, new_skips)
 
     if b2.button("✅ Confirm all clean FOUND"):
         # merge the tabs FIRST: a tick made in any editor and not yet saved is
         # an edit like any other, and rebuilding the map from `df` alone would
         # silently drop it (the P1-8 data loss). The merge is also what applies
         # the FOUND gate to ticks already sitting on disk.
-        flags, rejected = merge_confirm_flags(confirmed_set(P), df, ordered)
+        flags, new_skips, rejected = merge_review_flags(
+            confirmed_set(P), skipped_map(P), df, ordered)
+        # a bulk confirm never overrides a skip: a skipped row is the
+        # reviewer's explicit 'no', and only a per-row ✔ may take it back
         for _, r in df.iterrows():
-            if r["_bucket"] == "found" and found_status(r["status"]):
-                flags[str(r["sku"])] = True
-        persist_flags(flags, rejected)
+            s = str(r["sku"])
+            if r["_bucket"] == "found" and found_status(r["status"]) \
+                    and s not in new_skips:
+                flags[s] = True
+        persist_flags(flags, rejected, None, new_skips)
 
     meta = load_meta(P)
     # --discover MUST be stripped: passing it alongside --crawl-urls is the one
@@ -1448,20 +1539,57 @@ def step_build(P):
         st.info("No enriched output yet — run Steps 1–2 first.")
         return
 
+    review_df = load_filled_df(P)
+    # drop stale ticks BEFORE counting, so the summary and the scope label
+    # never promise rows the build would then refuse (P3-53)
+    n_stale_top = reconcile_confirmations(P, review_df)
+    if n_stale_top:
+        st.warning(STALE_TICK_MSG.format(n=n_stale_top))
     conf = confirmed_set(P)
+    skips = skipped_map(P)
+    counts = review_counts(review_df, conf, skips)
+    # the review summary the owner checks before he builds
+    st.info("Review: " + review_counts_text(counts))
+    if skips:
+        with st.expander(f"Skipped rows ({len(skips)}) — never built"):
+            st.dataframe(pd.DataFrame(
+                [{"sku": s, "reason": r or "—"}
+                 for s, r in sorted(skips.items())]),
+                hide_index=True, width="stretch")
     # the VALUE is a stable key; only the rendering carries the wording, so a
-    # label rewrite can never silently flip what built_scope records
+    # label rewrite can never silently flip what built_scope records.
+    # The default is ALWAYS the approved rows: the owner's design is that
+    # only rows he approved in Step 2 go on. 'All FOUND rows' is an explicit
+    # choice, never the fallback for an empty approval list.
     scope = st.radio(
         "Rows to include", ["confirmed", "all_found"],
-        format_func=lambda v: (f"Confirmed rows only ({len(conf)})"
+        format_func=lambda v: (f"Confirmed rows only ({counts['approved']})"
                                if v == "confirmed" else
                                "All FOUND rows (skip unverified, like "
                                "build_csv.py)"),
-        index=0 if conf else 1)
+        index=0)
+    blocked = scope == "confirmed" and counts["approved"] == 0
+    if blocked:
+        st.error("No row is approved, so there is nothing to build. Approve "
+                 "at least one row in step 2 - Review.")
+    elif scope == "all_found":
+        st.warning("All FOUND rows includes rows nobody approved "
+                   f"({counts['not_reviewed']} not reviewed). Skipped rows "
+                   "stay out.")
     month = st.text_input("WordPress uploads folder (YYYY/MM)",
                           value=f"{datetime.now():%Y/%m}")
     c1, c2 = st.columns(2)
-    estimate_mrp = c1.checkbox("Estimate missing MRP (sale price × 1.25)")
+    # [pricing] single_price: the build writes ONE price (the higher of MRP
+    # and selling price) and never an MRP, so an estimated MRP has no place
+    single_price = bool(getattr(getattr(st.session_state.get(_CFG_KEY),
+                                        "pricing", None),
+                                "single_price", False))
+    estimate_mrp = c1.checkbox(
+        "Estimate missing MRP (sale price × 1.25)", disabled=single_price,
+        help=("This client builds ONE price (the higher of MRP and selling "
+              "price); no MRP is estimated." if single_price else None))
+    if single_price:
+        estimate_mrp = False
     seo = c2.checkbox("SEO meta columns (opt-in)")
     seo_plugin = st.selectbox("SEO plugin", ["yoast", "rankmath", "both"],
                               disabled=not seo)
@@ -1476,7 +1604,7 @@ def step_build(P):
             # (FOUND gate included), and every field through row_context, so
             # the preview cannot drift from the CSV it is previewing (P1-16)
             pf = _app.filter_active_inventory_rows(pd.read_excel(P["filled"]))
-            pf, _ = select_build_rows(pf, scope, conf)
+            pf, _ = select_build_rows(pf, scope, conf, skips)
 
             # process_inventory's own entry check: a sheet missing a required
             # column renders a full preview and then fails at build time
@@ -1511,7 +1639,9 @@ def step_build(P):
             else:
                 st.info("No rows in scope to preview.")
 
-    if not st.button("🛠 Build CSV", type="primary"):
+    if not st.button("🛠 Build CSV", type="primary", disabled=blocked,
+                     help="Approve at least one row in step 2 - Review"
+                     if blocked else None):
         if P["csv"].exists():
             st.success(f"CSV already built: {P['csv'].name} — rebuild any "
                        "time, or continue to Step 4.")
@@ -1528,14 +1658,18 @@ def step_build(P):
     if n_stale:
         st.warning(STALE_TICK_MSG.format(n=n_stale))
         conf = confirmed_set(P)
-    df, skipped = select_build_rows(df, scope, conf)
+    skips = skipped_map(P)
+    df, skipped = select_build_rows(df, scope, conf, skips)
     if skipped:
         st.warning(f"{len(skipped)} confirmed row(s) skipped — not FOUND "
                    "(NEEDS CRAWL / NOT FOUND / CLOSE MATCH …). Fix them in "
                    "Step 2 and crawl: " + ", ".join(skipped))
     if df.empty:
-        st.error("Nothing to build — confirm rows in Step 2 first.")
+        st.error("Nothing to build. Approve at least one row in step 2 - "
+                 "Review.")
         return
+    n_scoped = len(df)
+    n_skipped_out = len(skips)
 
     folder = month.strip().strip("/") or f"{datetime.now():%Y/%m}"
     # the store this client publishes to, from the very config app.py was
@@ -1566,6 +1700,14 @@ def step_build(P):
     with_images = int((result["Images"].map(app.compact) != "").sum())
     st.success(f"Wrote **{P['csv'].name}** — {len(result)} product(s), "
                f"{with_images} with images, media base `{media_base}`")
+    if scope == "confirmed":
+        st.info(f"Built {len(result)} product(s) from the {n_scoped} "
+                "approved row(s) only. Images were downloaded for those "
+                "rows only.")
+    else:
+        st.info(f"Built {len(result)} product(s) from {n_scoped} row(s): "
+                f"all FOUND rows minus {n_skipped_out} skipped. This "
+                "includes rows nobody approved.")
     if with_images < len(result):
         st.warning(f"{len(result) - with_images} product(s) have NO images — "
                    "check image_url in Step 2.")
@@ -1577,6 +1719,9 @@ def step_build(P):
     k3.metric("Rows w/ spec gaps", s["spec_gap_rows"])
     k4.metric("Missing brand", s["missing_brand"])
     k5.metric("Price range ₹", f"{s['price_min']:,}–{s['price_max']:,}")
+    if s.get("filter_unmatched_rows"):
+        st.caption(f"{s['filter_unmatched_rows']} row(s) state a filter value "
+                   "that is not in the filter sheet — see `_filter_unmatched`.")
     if s["category_counts"]:
         with st.expander("Products per category", expanded=True):
             st.bar_chart(pd.Series(s["category_counts"], name="products"))
@@ -2048,8 +2193,11 @@ def archive_run(run_dir: Path, dest: Path) -> int:
     # OSError. Archiving the REST of the run is far more useful than aborting,
     # so the unreadable CSV only costs the images folder and earns a README
     # line. assemble_pack owns that rule for BOTH entry points.
-    pack = assemble_pack(dest, files,
-                         REPO_ROOT / "product_images_for_upload", Pr["csv"])
+    # This folder is the OPERATOR's internal archive (filled sheet, report,
+    # the client's list): internal=True. It is never handed over - the zip
+    # below is built from the separate client pack.
+    image_dir = REPO_ROOT / "product_images_for_upload"
+    pack = assemble_pack(dest, files, image_dir, Pr["csv"], internal=True)
     notes = []
     if pack["csv_error"]:
         notes.append(f"\n- **The CSV could not be read** "
@@ -2076,18 +2224,48 @@ def archive_run(run_dir: Path, dest: Path) -> int:
             notes=notes),
         encoding="utf-8")
 
+    # The CLIENT pack (owner rule 2026-11-19): a separate folder
+    # batches\<name>_client\ with ONLY the import CSV, the images it
+    # references and a README - never validation_issues.csv (internal since
+    # the fifth round of 2026-11-19), the filled
+    # sheet, the enricher report, a log or the source list. The zip handed
+    # over (batches\<name>.zip) is made from this folder alone.
+    client_dir = dest.parent / f"{dest.name}_client"
+    if client_dir.exists():
+        shutil.rmtree(client_dir)
+    hosts = default_client_hosts()
+    cpack = assemble_pack(client_dir,
+                          {Pr["csv"].name: Pr["csv"]},
+                          image_dir, Pr["csv"], allowed_hosts=hosts)
+    cmeta = dict(meta)
+    cmeta["files"] = sorted({p.name for p in client_dir.iterdir()}
+                            | {"README.md"})
+    cnotes = list(notes) + [
+        f"not packed (internal or links to a source site): "
+        f"{item.split(': ', 1)[0]}" for item in cpack["refused"]]
+    client_readme = client_dir / "README.md"
+    client_readme.write_text(
+        render_batch_readme(
+            run_dir.name, cmeta, coverage,
+            review_metrics=load_json(Pr["metrics"]) or None,
+            images={"count": cpack["images"], "missing": cpack["missing"]},
+            source_name="-", notes=cnotes),
+        encoding="utf-8")
+    remove_refused(client_dir, hosts)       # last check, README included
+
     # one file to hand over. A zip that cannot be written (disk full, the
     # previous .zip open in Explorer) must not lose the folder we just
     # built, so it costs a README line and nothing else.
     try:
         LAST_ARCHIVE_ZIP = Path(shutil.make_archive(str(dest), "zip",
-                                                    root_dir=str(dest)))
+                                                    root_dir=str(client_dir)))
     except (OSError, ValueError) as e:
         LAST_ARCHIVE_ZIP = None
-        with readme.open("a", encoding="utf-8") as fh:
-            fh.write(f"\n- **The .zip could not be written** "
-                     f"({e.__class__.__name__}: {e}) - the folder above is "
-                     f"complete; zip it by hand.\n")
+        for fh_path in (readme, client_readme):
+            with fh_path.open("a", encoding="utf-8") as fh:
+                fh.write(f"\n- **The .zip could not be written** "
+                         f"({e.__class__.__name__}: {e}) - the folder "
+                         f"{client_dir.name} is complete; zip it by hand.\n")
     return pack["copied"]
 
 

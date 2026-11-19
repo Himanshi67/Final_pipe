@@ -1,0 +1,6 @@
+User-agent: *
+Disallow: /private/
+Disallow: /search
+Crawl-delay: 5
+
+Sitemap: https://shop.example.in/sitemap_index.xml

@@ -442,6 +442,45 @@ class Store:
         self.allow_writes = allow_writes
         self.would_create = []
         self._cat_cache, self._tag_cache = {}, {}
+        # filter groups -> the store's GLOBAL attributes (see attributes_for).
+        # Both loaded once per run, on first use.
+        self.filter_groups = None          # set of lower-case names
+        self._global_attrs = None          # {casefolded name or slug: id}
+
+    # -- global attributes (filter groups) ----------------------------------
+    def filter_group_set(self):
+        if self.filter_groups is None:
+            self.filter_groups = {n.casefold() for n in filter_group_names(CLIENT)}
+        return self.filter_groups
+
+    def global_attribute_id(self, name):
+        """The id of the store's global attribute called `name` (matched on
+        name or slug, case-insensitively), fetched from products/attributes
+        ONCE per run. Missing: a dry run prints 'would create global
+        attribute <name>' and returns None; a --commit run creates it once
+        (POST products/attributes) and returns the new id."""
+        if self._global_attrs is None:
+            self._global_attrs = {}
+            for hit in self.call("GET", "products/attributes") or []:
+                slug = str(hit.get("slug", "")).casefold()
+                for key in (term_key(hit.get("name")), slug,
+                            slug[3:] if slug.startswith("pa_") else slug):
+                    if key:
+                        self._global_attrs.setdefault(key, hit["id"])
+        slug = re.sub(r"[^a-z0-9]+", "-", unescaped(name).lower()).strip("-")
+        for key in (term_key(name), slug, f"pa_{slug}"):
+            if key in self._global_attrs:
+                return self._global_attrs[key]
+        if not self.allow_writes:
+            if ("global attribute", name) not in self.would_create:
+                self.would_create.append(("global attribute", name))
+                print(f"    ~ would create global attribute {name}")
+            return None
+        created = self.call("POST", "products/attributes",
+                            json={"name": name, "type": "select"})
+        self._global_attrs[term_key(name)] = created["id"]
+        print(f"    + created global attribute: {name}")
+        return created["id"]
 
     # -- plumbing ---------------------------------------------------------
     def call(self, method, path, **kw):
@@ -730,20 +769,49 @@ def uncsv(text):
     return str(text or "").replace(chr(92) + ",", ",")
 
 
-def attributes_for(row):
+def filter_group_names(cfg=None):
+    """Attribute names that are store filter groups, from the client's
+    attribute sheets through app.filter_group_names (the same loader the
+    build uses). Imported lazily so this module stays importable without
+    app.py; [] (every attribute stays custom) when app cannot load."""
+    try:
+        import app
+    except Exception as exc:
+        print(f"    [warn] filter groups unavailable ({exc}); every "
+              f"attribute is sent as a custom attribute")
+        return []
+    return app.filter_group_names(cfg)
+
+
+def attributes_for(row, store=None):
     attrs, index = [], 1
+    lookup = getattr(store, "filter_group_set", None)
+    groups = lookup() if lookup is not None else set()
     while f"Attribute {index} name" in row:
         name = compact(row.get(f"Attribute {index} name"))
         values = compact(row.get(f"Attribute {index} value(s)"))
         if name and values:
-            attrs.append({
+            entry = {
                 "name": name,
                 # a custom (per-product) attribute: passing no id keeps this
                 # from depending on global attribute taxonomies existing
                 "options": [v.strip() for v in values.split(",") if v.strip()],
                 "visible": compact(row.get(f"Attribute {index} visible")) != "0",
                 "variation": False,
-            })
+            }
+            # a FILTER GROUP goes to the store's global attribute, so the
+            # storefront filter widgets see it (a custom attribute is
+            # invisible to them). None on a dry run when it does not exist.
+            # The CSV's 'global' column is '1' only on filter attributes; a
+            # row it marks '0' (a spec that merely shares a filter name) stays
+            # custom. A CSV without the column is judged by the name alone.
+            if (name.casefold() in groups and compact(
+                    row.get(f"Attribute {index} global")) != "0"):
+                attr_id = store.global_attribute_id(name)
+                if attr_id is not None:
+                    entry = {"id": attr_id, "options": entry["options"],
+                             "visible": entry["visible"], "variation": False}
+            attrs.append(entry)
         index += 1
     return attrs
 
@@ -767,14 +835,31 @@ def meta_from_columns(row):
     return out
 
 
-def build_payload(store, row, status, image_mode):
-    sku = compact(row.get("sku"))
-    title = compact(row.get("title"))
+def payload_prices(row, client=None):
+    """(regular_price, sale_price) strings for the REST payload."""
+    cfg = client if client is not None else CLIENT
     regular, sale = price_str(row.get("regular price")), price_str(row.get("sale price"))
     # WooCommerce: regular_price is the struck-through price, sale_price the
     # one charged. With no MRP the selling price IS the regular price.
     if not regular:
         regular, sale = sale, ""
+    # [pricing] single_price: ONE price. regular_price = the higher of the
+    # two (a CSV from app.py already has sale empty; this also covers a stale
+    # or hand-edited CSV), and sale_price is SENT as "" - on an update that
+    # CLEARS any sale price the live product had, for the products this run
+    # writes only. Products not in the CSV are not touched.
+    if getattr(getattr(cfg, "pricing", None), "single_price", False):
+        values = [float(v) for v in (regular, sale) if v]
+        if values:
+            regular = price_str(max(values))
+        sale = ""
+    return regular, sale
+
+
+def build_payload(store, row, status, image_mode):
+    sku = compact(row.get("sku"))
+    title = compact(row.get("title"))
+    regular, sale = payload_prices(row)
 
     tags = [t.strip() for t in compact(row.get("Tags")).split(",") if t.strip()]
     image_payload, notes = images_for(row, sku, title, image_mode,
@@ -800,7 +885,7 @@ def build_payload(store, row, status, image_mode):
         "sale_price": sale,
         "categories": categories,
         "tags": [{"id": i} for i in store.tag_ids(tags)],
-        "attributes": attributes_for(row),
+        "attributes": attributes_for(row, store),
         "images": image_payload,
         "meta_data": [
             {"key": "_cross_reference_tag", "value": compact(row.get("cross reference tag"))},
@@ -844,6 +929,11 @@ def describe(payload, existing):
             changes.append("name")
         if old != payload["regular_price"]:
             changes.append(f"regular_price {old or '-'} -> {payload['regular_price'] or '-'}")
+        # single-price mode sends sale_price "" - name the sale price that
+        # this write CLEARS, so the dry run shows it before --commit
+        old_sale = price_str(existing.get("sale_price"))
+        if old_sale != payload["sale_price"]:
+            changes.append(f"sale_price {old_sale or '-'} -> {payload['sale_price'] or '-'}")
         bits.append("changes: " + (", ".join(changes) if changes else "none detected"))
     return "  ".join(bits)
 
@@ -1103,6 +1193,11 @@ def main():
     else:
         print(f"\nDry run complete - nothing was written. "
               f"Re-run with --commit to apply.")
+        missing = [n for kind, n in store.would_create
+                   if kind == "global attribute"]
+        if missing:
+            print(f"Would create {len(missing)} global attribute(s) for the "
+                  f"filter groups: {', '.join(missing)}")
 
     # A run in which nothing worked used to exit 0, so gui.py unlocked the
     # commit gate after a dry run that accomplished nothing and then wrote

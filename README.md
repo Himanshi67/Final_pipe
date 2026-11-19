@@ -28,7 +28,8 @@ goes). Visual overview: **docs/data_flow.svg**. Pre-diagnosed bugs with line anc
 **docs/PRODUCTION_READINESS.md**. Getting past the store's CDN setting:
 **docs/HOSTINGER_ACCESS.md**. What else could be automated: **docs/AUTOMATION_OPPORTUNITIES.md**.
 The 2026-08-22 GUI refit was designed up front in
-**docs/superpowers/specs/2026-08-22-ui-refit.md**, with its plans alongside it.
+**docs/superpowers/specs/2026-08-22-ui-refit.md**. Its four shipped plans are in
+`_not_in_use\docs\superpowers\plans\`. Files that no code or doc uses: **_not_in_use/README.md**.
 Hardening backlog (48 verified findings): **docs/NEXT_STEPS.md** (local only - not in
 the repository). How this is being productized: **docs/PRODUCT_PLAN.md** (local only -
 not in the repository). Older narrative state: **docs/HANDOFF.md**

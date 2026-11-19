@@ -14,6 +14,7 @@ donor images, #7 screen size read as kg, #8 unreachable aspect check,
 before filtering, #15 dead second categoriser.
 """
 
+import contextlib
 import io
 import os
 import shutil
@@ -873,18 +874,58 @@ def test_24_promos_are_not_specs():
     check("parse_scraped_specs keeps only the real spec",
           rows, [("Refresh Rate", "60 Hz")])
 
-    # short description carries the essentials, not the whole spec table
+    # the merged firewall: seller, customer-care and origin rows are gone too
+    cell = ("Country of Origin: India | Manufacturer: Haier Appliances | "
+            "Customer Care: 1800 102 9999 | Sold by: Cloudtail | "
+            "Warranty: 2 Years | Installation Type: Wall Mounted")
+    check("parse_scraped_specs drops seller/origin/care rows",
+          app.parse_scraped_specs(cell),
+          [("Warranty", "2 Years"), ("Installation Type", "Wall Mounted")])
+    check("enricher refuses a seller row", E.usable_spec("Sold by", "Cloudtail"),
+          False)
+    check("enricher keeps a plain warranty duration",
+          E.usable_spec("Warranty", "1 Year Comprehensive"), True)
+
+    # every description field carries at most KEY_POINTS_MAX points; the
+    # attributes still carry the whole (capped at MAX_ATTRIBUTES) table
     scraped = [(f"Extra Spec {n}", f"Value {n}") for n in range(1, 13)]
-    _c, short_desc, long_desc, rows = app.build_descriptions(
+    config, short_desc, long_desc, rows = app.build_descriptions(
         "TV-TEST-1", "Samsung 138 cm (55 inches) 4K Ultra HD Smart LED TV",
         "Samsung", "LED TV", scraped=scraped)
-    check("short description row count is capped",
-          short_desc.count("<tr>") <= 2 + app.SHORT_DESC_MAX_SPECS, True)
-    check("the long description still carries the full table",
-          long_desc.count("<tr>") > short_desc.count("<tr>"), True)
+    check("short description: Brand + SKU + at most KEY_POINTS_MAX points",
+          short_desc.count("<tr>") <= 2 + E.KEY_POINTS_MAX, True)
+    check("long description: 4 template rows + at most KEY_POINTS_MAX points",
+          long_desc.count("<tr>") <= 4 + E.KEY_POINTS_MAX, True)
+    check("key features: Brand + at most KEY_POINTS_MAX points",
+          config.count(":") <= 1 + E.KEY_POINTS_MAX, True)
+    check("the attributes are not capped by KEY_POINTS_MAX",
+          len(rows), app.MAX_ATTRIBUTES)
+    check("no invented mains-supply row", "230 V" in long_desc, False)
+
+
+@contextlib.contextmanager
+def two_price_mode():
+    """Run with [pricing] single_price = false (MRP + sale price), whatever
+    the active client sets. #25 and #26 pin the two-price rules; the
+    single-price rules are in tests/test_single_price.py."""
+    import dataclasses
+    import client_config
+    saved = (app.CLIENT, V.CLIENT)
+    try:
+        for mod in (app, V):
+            mod.CLIENT = dataclasses.replace(
+                mod.CLIENT, pricing=client_config.PricingConfig(False))
+        yield
+    finally:
+        app.CLIENT, V.CLIENT = saved
 
 
 def test_25_live_site_audit_findings():
+    with two_price_mode():
+        _test_25_body()
+
+
+def _test_25_body():
     section("#25 live-site audit: Mini LED catch-all, 3x TV MRP, raw-SKU titles")
     # the exact live product that was filed under Mini LED
     check("a plain Full HD TV goes to the bare LED parent",
@@ -923,6 +964,11 @@ def test_25_live_site_audit_findings():
 
 
 def test_26_row_context_is_the_one_derivation():
+    with two_price_mode():
+        _test_26_body()
+
+
+def _test_26_body():
     section("#26 row_context() derives a row the same way process_inventory does")
     row = {"sku": "43FSFHS", "title": "Foxsky 109 cm (43 Inch) Full HD Smart "
                                       "LED TV 43FSFHS",

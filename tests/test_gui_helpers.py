@@ -1220,7 +1220,8 @@ def test_assemble_pack_copies_files_images_and_counts_the_missing(tmp_path):
     res = assemble_pack(dest, {"out.csv": src / "out.csv",
                                "CLIENT LIST.xlsx": src / "LIST.xlsx",
                                "missing.md": src / "nope.md"},
-                        src / "img", src / "out.csv")
+                        src / "img", src / "out.csv",
+                        allowed_hosts={"cdn.test"})
     assert res["files"] == 2                           # nope.md skipped
     assert res["images"] == 2 and res["missing"] == 1  # never raises
     assert res["copied"] == 4 and res["csv_error"] is None
@@ -1309,3 +1310,236 @@ def test_parse_enricher_log_flags_the_budget_stop():
     assert stats["done"] == 2
     other = parse_enricher_log(BUDGET_LOG.replace("Budget of 5", "Budget was 5"))
     assert other["stopped_by_budget"] is False
+
+
+# ------------------------------------------- review states (approve/skip) --
+from gui_helpers import (APPROVE, CLEAR, SKIP,                  # noqa: E402
+                         merge_review_flags, review_counts,
+                         review_counts_text, review_decision, review_entries,
+                         skipped_from_state)
+
+
+def test_three_state_rule_approve_and_skip_clear_each_other():
+    conf, skips = review_decision(set(), {}, "A", SKIP, "  wrong model ")
+    assert conf == set() and skips == {"A": "wrong model"}
+    conf, skips = review_decision(conf, skips, "A", APPROVE)
+    assert conf == {"A"} and skips == {}
+    conf, skips = review_decision(conf, skips, "A", SKIP)
+    assert conf == set() and skips == {"A": ""}
+    conf, skips = review_decision(conf, skips, "A", CLEAR)
+    assert conf == set() and skips == {}
+
+
+def test_review_decision_does_not_mutate_inputs():
+    conf, skips = {"A"}, {"B": "x"}
+    review_decision(conf, skips, "A", SKIP)
+    review_decision(conf, skips, "B", APPROVE)
+    assert conf == {"A"} and skips == {"B": "x"}
+    try:
+        review_decision(conf, skips, "A", "maybe")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown decision must raise")
+
+
+def test_review_entries_store_one_state_per_sku_and_skip_wins():
+    old = {"A": {"confirmed": True, "fp": "old-a"}}
+    out = review_entries(old, {"A": True, "B": True, "C": False},
+                         {"B": "bad price", "D": ""}, {"B": "fp-b"})
+    assert out["A"] == {"confirmed": True, "skipped": False,
+                        "skip_reason": "", "fp": "old-a"}
+    # B is both ticked and skipped in the input: the skip wins
+    assert out["B"] == {"confirmed": False, "skipped": True,
+                        "skip_reason": "bad price", "fp": "fp-b"}
+    assert out["C"]["confirmed"] is False and out["C"]["skipped"] is False
+    # a skip the flag map never mentions still gets its entry
+    assert out["D"]["skipped"] is True and out["D"]["confirmed"] is False
+    state = {"confirmed": out}
+    assert confirmed_from_state(state) == {"A"}
+    assert skipped_from_state(state) == {"B": "bad price", "D": ""}
+
+
+def test_old_review_state_files_load_without_skip_keys():
+    state = {"confirmed": {"A": {"confirmed": True, "fp": "abc"},
+                           "B": {"confirmed": False, "fp": None},
+                           "C": True, "D": False}}
+    assert confirmed_from_state(state) == {"A", "C"}
+    assert skipped_from_state(state) == {}
+    assert skipped_from_state({}) == {}
+    # a corrupt entry saying both: read as skipped only, never buildable
+    both = {"confirmed": {"E": {"confirmed": True, "skipped": True}}}
+    assert confirmed_from_state(both) == set()
+    assert skipped_from_state(both) == {"E": ""}
+
+
+def test_select_build_rows_excludes_skipped_rows_in_both_scopes():
+    df = _build_df()
+    kept, refused = select_build_rows(df, "confirmed", {"A", "B"},
+                                      {"B": "dup"})
+    assert list(kept["sku"]) == ["A"] and refused == []
+    kept, refused = select_build_rows(df, "all_found", set(), {"B": "dup"})
+    assert list(kept["sku"]) == ["A"] and refused == []
+    # a set works as the skip argument too, and a skipped non-FOUND row is
+    # not reported as a refused tick
+    kept, refused = select_build_rows(df, "confirmed", {"A", "C"}, {"C"})
+    assert list(kept["sku"]) == ["A"] and refused == []
+    nostatus = pd.DataFrame([{"sku": "A"}, {"sku": "B"}])
+    kept, _ = select_build_rows(nostatus, "all_found", set(), {"A"})
+    assert list(kept["sku"]) == ["B"]
+
+
+def test_confirmed_scope_with_zero_approvals_builds_nothing():
+    kept, refused = select_build_rows(_build_df(), "confirmed", set())
+    assert kept.empty and refused == []
+    kept, _ = select_build_rows(_build_df(), "confirmed", {"A"}, {"A"})
+    assert kept.empty
+
+
+def _rev_orig(rows):
+    base = {"confirmed": False, "skipped": False,
+            "status": "FOUND (amazon.in)"}
+    return pd.DataFrame([{**base, **r} for r in rows])
+
+
+def _rev_part(rows):
+    return pd.DataFrame([{"sku": s, "confirmed": c, "skipped": k}
+                         for s, c, k in rows])
+
+
+def test_merge_review_flags_three_state_rule():
+    orig = _rev_orig([{"sku": "A", "confirmed": True}, {"sku": "B"},
+                      {"sku": "C", "skipped": True},
+                      {"sku": "D", "status": "NOT FOUND"}])
+    # A: approved -> skip ticked (approval cleared)
+    # B: both ticked in one save -> skipped (safe reading)
+    # C: skipped -> ✔ ticked (skip cleared)
+    # D: non-FOUND -> skip allowed
+    part = _rev_part([("A", True, True), ("B", True, True),
+                      ("C", True, True), ("D", False, True)])
+    # C's skip column is unchanged (still True) so only its ✔ is an edit
+    flags, skips, rejected = merge_review_flags({"A"}, {"C": "old"}, orig,
+                                                [part])
+    assert flags["A"] is False and "A" in skips
+    assert flags["B"] is False and "B" in skips
+    assert flags["C"] is True and "C" not in skips
+    assert "D" in skips and rejected == []
+
+
+def test_merge_review_flags_untick_skip_and_untouched_copies():
+    orig = _rev_orig([{"sku": "A", "skipped": True}, {"sku": "B"}])
+    all_tab = _rev_part([("A", False, False), ("B", False, False)])
+    bucket = _rev_part([("A", False, True)])     # untouched copy, later
+    flags, skips, _ = merge_review_flags(set(), {"A": "why"}, orig,
+                                         [all_tab, bucket])
+    assert skips == {} and not flags.get("A")
+    # an old skip with no edit stays, and a legacy tick on it does not win
+    flags, skips, _ = merge_review_flags({"B"}, {"B": "x"},
+                                         _rev_orig([{"sku": "B",
+                                                     "skipped": True}]), [])
+    assert skips == {"B": "x"} and flags["B"] is False
+
+
+def test_review_counts_put_every_sku_in_one_bucket():
+    df = pd.concat([_build_df(), _build_df().head(1)])   # duplicate A row
+    c = review_counts(df, {"A", "C"}, {"B": "x", "D": ""})
+    # A approved; B skipped; D skipped; C non-FOUND (stray tick); E non-FOUND
+    assert c == {"approved": 1, "skipped": 2, "not_reviewed": 0,
+                 "not_found": 2}
+    assert review_counts_text(c) == \
+        "Approved 1 · Skipped 2 · Not reviewed 0 · Not FOUND 2"
+    c2 = review_counts(_build_df(), set(), {})
+    assert c2["not_reviewed"] == 2 and sum(c2.values()) == 5
+
+
+def test_a_changed_row_keeps_its_skip_but_loses_its_tick():
+    """The stale-fingerprint rule: a tick on a re-enriched row is dropped
+    (P3-53), a SKIP is kept - dropping it would turn an explicit 'no' into
+    'not reviewed', which the 'All FOUND rows' scope would then build."""
+    fp = row_fingerprint(FP_ROW)
+    state = {"confirmed": {
+        "WM-A": {"confirmed": False, "skipped": True, "skip_reason": "x",
+                 "fp": fp},
+        "WM-B": {"confirmed": True, "skipped": False, "skip_reason": "",
+                 "fp": fp}}}
+    changed = {**FP_ROW, "sale price": 19999}
+    df = pd.DataFrame([changed, {**changed, "sku": "WM-B"}])
+    assert stale_confirmations(state, df) == {"WM-B"}
+    assert skipped_from_state(state) == {"WM-A": "x"}
+    kept, _ = select_build_rows(df, "all_found", set(),
+                                skipped_from_state(state))
+    assert list(kept["sku"]) == ["WM-B"]
+
+
+# ------------------------------- client pack guard (owner rule 2026-11-19) --
+from gui_helpers import (foreign_hosts, remove_refused,  # noqa: E402
+                         scan_pack_folder, scrub_sites)
+
+
+def _guard_src(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "out.csv").write_text(
+        "sku,Images\nA,https://shop.test/wp-content/uploads/A_1.webp\n",
+        encoding="utf-8")
+    (src / "LIST_filled.xlsx").write_bytes(b"xl")
+    (src / "LIST_filled_report.md").write_text("# report", encoding="utf-8")
+    (src / "enricher.log").write_text("row 2", encoding="utf-8")
+    (src / "leak.csv").write_text(
+        "sku,url_link\nA,https://www.samsung.com/in/tv/x\n", encoding="utf-8")
+    (src / "leak.md").write_text("see www.haier.com/in", encoding="utf-8")
+    return src
+
+
+def test_assemble_pack_refuses_internal_files_and_source_links(tmp_path,
+                                                               capsys):
+    src = _guard_src(tmp_path)
+    dest = tmp_path / "pack"
+    files = {p.name: p for p in src.iterdir()}
+    res = assemble_pack(dest, files, src, src / "out.csv",
+                        allowed_hosts={"shop.test"})
+    assert sorted(p.name for p in dest.iterdir() if p.is_file()) == ["out.csv"]
+    refused = " | ".join(res["refused"])
+    for name in ("LIST_filled.xlsx", "LIST_filled_report.md", "enricher.log",
+                 "leak.csv", "leak.md"):
+        assert name in refused
+    assert "samsung.com" in refused and "haier.com" in refused
+    assert "REFUSED" in capsys.readouterr().out          # visible warning
+
+
+def test_assemble_pack_internal_archive_keeps_everything(tmp_path):
+    src = _guard_src(tmp_path)
+    dest = tmp_path / "archive"
+    res = assemble_pack(dest, {p.name: p for p in src.iterdir()}, src,
+                        src / "out.csv", internal=True)
+    assert res["refused"] == [] and (dest / "LIST_filled.xlsx").exists()
+
+
+def test_foreign_hosts_allows_own_host_and_subdomains():
+    text = ("https://shop.test/a.webp //cdn.shop.test/b.webp "
+            "http://www.shop.test/c https://img.samsung.com/x www.haier.com")
+    assert foreign_hosts(text, {"shop.test"}) == ["img.samsung.com",
+                                                  "haier.com"]
+    assert foreign_hosts("no links, 0.8 Ton, 4.5 kg", {"shop.test"}) == []
+
+
+def test_scan_and_remove_refused_on_a_finished_folder(tmp_path, capsys):
+    dest = tmp_path / "pack"
+    dest.mkdir()
+    (dest / "README.md").write_text("from https://www.flipkart.com/x",
+                                    encoding="utf-8")
+    (dest / "out.csv").write_text("sku\nA\n", encoding="utf-8")
+    assert len(scan_pack_folder(dest, {"shop.test"})) == 1
+    remove_refused(dest, {"shop.test"})
+    assert sorted(p.name for p in dest.iterdir()) == ["out.csv"]
+    assert "REFUSED" in capsys.readouterr().out
+
+
+def test_readme_never_prints_a_site_name():
+    cov = coverage_summary(_cov_sheet())
+    text = render_batch_readme("b", {}, cov)
+    for site in ("flipkart", "amazon", "croma", "reliancedigital"):
+        assert site not in text.lower(), site
+    assert "price from a source site" in text
+    assert scrub_sites("all sources blocked (amazon.in, croma.com)") == \
+        "all sources blocked (source sites)"

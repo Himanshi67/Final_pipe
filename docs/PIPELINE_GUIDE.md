@@ -67,7 +67,9 @@ clients\shreejee\
                                        [sku] prefix scheme, [serper] budgets
   category_map.xlsx                    taxonomy (in git)
   category_seo.xlsx                    curated tags + SEO keywords (in git)
-  SubCategory_Attributes_Master.xlsx   reference copy, read by no script (in git)
+  SubCategory_Attributes_Master.xlsx   attributes master: the SOURCE of the filter
+                                       groups and the sub-category attribute lists
+                                       (app.py reads it; see "Filter groups") (in git)
   backups\                             category-map editor backups (NOT in git)
   .env                                 this client's WC_*/WP_*/SERPER_* (NOT in git)
   credits.json                         serper usage ledger (NOT in git)
@@ -224,6 +226,60 @@ with one `WARNING` line and does not stop. Spend accumulates in `clients\<slug>\
 (above). The API key itself is BYOK: the variable NAME comes from `[serper]
 api_key_env` (default `SERPER_API_KEY`) and its value from the client's `.env`.
 
+**Tier 0 - URLs without a search (`url_index.py`).** Before any paid search, each
+row tries two free sources: (0a) the local URL index - retailer and brand sitemaps
+(`url_sources.toml`) stored in `url_index\index.sqlite` and matched on the model code
+in the URL slug - and, only when the index verified nothing, (0b) the retailers' own
+search endpoints (Reliance Digital, then Croma). Every URL from tier 0 is only a
+candidate: it passes the same URL screens and the same strict `assess()` verdict as a
+search result. A complete match returns with zero searches spent; a verified but
+incomplete one skips the search tiers (exactly as a search-tier match does) and goes
+to the donor merge; anything else falls through to serper/DuckDuckGo unchanged. Tier
+0 gets its own small fetch budget (3 pages for the index, 3 per site-search endpoint),
+so the search tiers keep their full budget. A model code shorter than 6 characters, or
+all digits, must also have the brand in the slug or sit on the brand's own site, and
+must match as a whole token. At start, sources older than `max_age_days` (default 7)
+are refreshed in-process before the first SKU (robots.txt obeyed, incremental by
+`<lastmod>` / ETag, a politeness delay before every live request, robots `Crawl-delay`
+honoured); a failed source logs one line, keeps its old URLs and is retried after 12 h.
+`--discover` uses tier 0; `--crawl-urls` never does. Site-search answers are cached in
+`.cache\sitesearch\` like searches. Kill switches: `--no-url-index`, `[url_index]
+enabled = false` in the client's `client.toml`, or `PIPELINE_URL_INDEX=off` (the test
+suite sets this). The report header gains a `URL index:` line (lookups, candidate URLs,
+rows resolved by the index, site-search calls, rows resolved by site search, rows that
+still needed a web search); `--cache-info` also prints the index per source.
+When tier 0 is on and the enabled index sources hold zero URLs at run start (after
+the automatic refresh), the run prints one line:
+`!! WARNING: the URL index is EMPTY ... Fix: .venv\Scripts\python.exe url_index.py refresh`.
+
+**How the paid search spends credits (2026-11-19).** Three rules cut serper.dev spend
+without lowering the find rate:
+- *Incremental queries* (`[serper] query_mode = "incremental"`, the default). In each
+  search tier, the queries already in `.cache\` are read first (free). The uncached
+  queries then go out one at a time, in their normal order; after each one, the new
+  candidates are crawled (the best URL of each domain first, as before). Sending stops
+  at the first complete listing, or when the SKU's page-fetch budget (6 pages) is
+  spent. A product found by the first query therefore costs 1 credit, not 5. A tier
+  whose queries are all cached runs exactly as before, so a warm-cache replay gives
+  byte-identical output. `query_mode = "batch"` restores the old behaviour (every
+  query of a tier goes out before any page is crawled). `--discover` uses the same
+  rule; `--crawl-urls` sends no searches at all.
+- *Duplicate queries are skipped.* The `site:croma.com` query is not sent when the
+  Croma site search ran for that SKU without an error or a block and returned no
+  match. The brand-site `site:` query is not sent when the URL index holds a fresh
+  (within `max_age_days`), non-empty source for that brand's own domain and the index
+  lookup found no URL on it. If the free source errored, was blocked, was off, was
+  stale or empty, or the lookup was cut at its candidate limit, the paid query is
+  sent. A query that is already cached is always read, never skipped.
+- *Search order* (`[serper] search_order`, or `--search-order` for one run).
+  `paid_first` (default): serper.dev, DuckDuckGo only when serper fails.
+  `free_first`: DuckDuckGo first, serper.dev only when DuckDuckGo gives no result.
+  The cache key is the bare query in both orders, so old cache entries stay valid,
+  and the `--budget` gate and the ledger work the same way in both.
+
+The report's `Credits:` line adds `queries not sent: N (free source said not there)
++ M (stopped early)`, and the console prints the same two counts at the end of a run.
+
 **Batch report:** each run writes `<output>_report.md` next to the workbook —
 a header with `Client:`, `Credits:` (this run / month-to-date / budget) and
 `Stopped by:` (`done`, `user` or `budget`), then outcome counts, the rows that
@@ -253,6 +309,8 @@ the canonical ones in the output copy (your original file keeps its names).
 
 :: which client's config to use  --client shreejee   (or set PIPELINE_CLIENT)
 :: stop after N serper credits   --budget 200        (0 = unlimited)
+:: DuckDuckGo before serper      --search-order free_first   (default: client
+::                               [serper] search_order = paid_first)
 :: quick test on 5 SKUs          --limit 5
 :: redo everything               --force
 :: re-attempt NOT FOUND rows     --retry-missing
@@ -270,6 +328,11 @@ the canonical ones in the output copy (your original file keeps its names).
 :: skip the retailer spec table                         --no-specs
 :: skip the run summary / put it elsewhere    --no-report | --report PATH
 
+:: --- url index (tier 0: free URL sources before any paid search) ---
+:: skip tier 0 for this run       --no-url-index
+:: refresh every source now       --refresh-index      (works without an input file)
+:: refresh sources older than     --index-max-age 7    (default: client max_age_days)
+
 :: --- cache ---
 :: what is cached, how big        --cache-info
 :: throw it all away              --cache-clear
@@ -278,6 +341,16 @@ the canonical ones in the output copy (your original file keeps its names).
 :: age at which entries stop counting (0 = never)      --cache-ttl 14
 :: keep the cache somewhere else  --cache-dir PATH
 ```
+**`url_index.py` CLI** (the index on its own, no spreadsheet):
+```
+.venv\Scripts\python.exe url_index.py refresh [--source NAME] [--force]   :: --force ignores lastmod/ETag
+.venv\Scripts\python.exe url_index.py stats                              :: sources, URL counts, last refresh
+.venv\Scripts\python.exe url_index.py lookup MODEL [--brand B]           :: candidate URLs for one code
+```
+All three take `--client SLUG` (its `[url_index] disable` / `extra_sources` apply).
+Add or switch a source in `url_sources.toml` (`[[source]]` / `[[site_search]]`, each
+entry commented with its live-check result).
+
 **Re-running an old batch is now free.** With the cache warm, `--force` replays
 the stored pages through the CURRENT parsers instead of re-downloading and
 re-paying every Serper credit — so a parser improvement can be applied
@@ -336,6 +409,22 @@ nothing — the enricher checkpoints after every row and reopening the wizard
 resumes where it left off. It gets a client selector and the same guards as the
 CLI; see docs/CLIENT_CONFIG.md.
 
+**Review states and the approved-only build.** In Step 2 every row is in
+exactly one of three states: **approved** (✔ in the table, *Approve & next* in
+card view), **skipped** (the *Skip* column in the table, *Skip* plus an
+optional reason in card view), or **not reviewed**. Approving clears a skip and
+skipping clears an approval; only a FOUND row can be approved, any row can be
+skipped. `review_state.json` stores each SKU as `{confirmed, skipped,
+skip_reason, fp}`; older files with only `{confirmed, fp}` still load (missing
+keys read as not skipped). Step 3 shows "Approved N · Skipped N · Not reviewed
+N · Not FOUND N" with the skipped SKUs and their reasons, and its scope ALWAYS
+defaults to "Confirmed rows only": with zero approvals it builds nothing and
+the Build button stays off until a row is approved. "All FOUND rows" is an
+explicit choice that warns it includes unapproved rows. Skipped rows are never
+built in either scope, so they never reach the CSV, the images or the store.
+When a re-enrichment changes a row, its ✔ is dropped (P3-53) but its skip is
+KEPT: an explicit "no" must not turn back into "not reviewed".
+
 **Review instrumentation.** `runs\<name>\review_state.json` records an `events`
 list beside `confirmed` — one entry per approve / unapprove / edit / url_pasted /
 drop_image / skip, with the mode (table or card), an ISO timestamp and the wall
@@ -347,10 +436,19 @@ section and in the enricher's report:
 actually costs, per client.
 
 **Hand-over pack.** Archiving a run copies its reviewable outputs plus the
-original input list into `batches\<name>\`, writes a README with `## Coverage`
-(status buckets), `## Review` (the line above) and `## Files`, and zips the whole
-folder to `batches\<name>.zip` — one file to hand over. `build_csv.py --pack`
-produces the same pack from the headless route.
+original input list into `batches\<name>\` and writes a README with
+`## Coverage` (status buckets), `## Review` (the line above) and `## Files`.
+That folder is the INTERNAL archive; it is not handed over. The client gets
+`batches\<name>.zip`, which is made from a separate folder
+`batches\<name>_client\` with ONLY the import CSV, the images it references
+and a README (owner rule, 2026-11-19; `validation_issues.csv` is INTERNAL since
+the fifth round: it stays next to the CSV and in the internal archive). The client pack
+never holds the `_filled.xlsx`, the enricher report, a log or the source list.
+`gui_helpers.assemble_pack` refuses (skips, with a printed warning) a member
+named `*_filled.xlsx`, `*_report.md`, `*.log` or `validation_issues.csv`, and any text member with a
+link to a host that is not the client's store or media host. The README never
+prints a site name (`price from a source site`). `build_csv.py --pack`
+produces the same client pack from the headless route.
 
 **Command:**
 ```
@@ -372,6 +470,36 @@ columns, and downloads every image as `SKU_n.webp` into
 `[sku]` table, `WM-`/`WH-` never renamed) — the Images column only lists files
 that really downloaded.
 
+**Image layout (owner rule, 2026-11-19):** every image of every product has
+the same fixed layout. Each file is exactly `CANVAS_EDGE` x `CANVAS_EDGE`
+(1500 x 1500 since the fifth round of 2026-11-19; it was 1200) WebP on a
+white canvas. The product is centred with
+`MARGIN_PCT` (4%) of white on its limiting side and is never cropped. A source
+under `MIN_IMAGE_EDGE` (1000 px) is refused. Upscaling is capped at
+`MAX_UPSCALE` (1.15x): a small product that needs more stays centred at that
+size on the same canvas (it is not dropped). On the 1500 canvas a source with a
+long edge under ~1200 px (white background) or ~1305 px (lifestyle) does not
+fill it: a 1000 px source becomes a 1150 px product with more white around it.
+The per-product 1500/1200/1000 canvas tiers are gone.
+
+**Old image files leave the upload folder (owner rule, 2026-11-19).** After a
+build writes a SKU's images, every other `<sku>_<n>.webp` in
+`product_images_for_upload\<client>\` is MOVED (never deleted) to
+`_superseded\<YYYY-MM-DD>\` in the same folder - also when the build saved 0
+images for that SKU. The SKU is matched exactly (`TV-X_1.webp` is TV-X, never
+TV-X2 or TV-X-B). A name already in the target gets a suffix (`TV-X_2-2.webp`).
+One line per SKU is printed. Nothing reads `_superseded\`: every consumer opens
+images by the names in the CSV.
+
+**White main image:** the FIRST image (`SKU_1.webp`) has a white background.
+`app.white_share()` measures the white share of the outer `BORDER_PCT` (2%)
+border strip of each SOURCE photo, before it is placed on the white canvas. A
+photo is white when that share is at least `WHITE_SHARE` (0.95). Of the white
+photos, the one with the HIGHEST share becomes `_1` (a tie goes to the earlier
+URL). The other images keep their URL order as `_2.._n`. When no photo is
+white, the first URL stays `_1` and `_image_flags` gets
+`main image background not white` (validate_csv.py reports a warning).
+
 **Controls in the app:** upload the `_filled.xlsx` directly (Excel accepted);
 "Import only verified rows" (on by default — uses the status column);
 WordPress uploads folder YYYY/MM (must match the month you'll upload images);
@@ -380,6 +508,24 @@ optional "estimate MRP as sale x 1.25" (off by default); optional
 **Quality check** panel runs validate_csv.py on the result and lists anything
 that needs a look, so QA is part of generating the file rather than a separate
 step to remember.
+
+**One price only (`[pricing] single_price`, owner decision 2026-11-19).** When a
+client's `client.toml` sets `[pricing] single_price = true` (shreejee does; the code
+default is false), the CSV has ONE price: `regular price` = the higher of the row's
+MRP and selling price (whichever exist), `sale price` = empty. Price-band tags and
+the SEO description use that one price; no "MRP", saving or "% off" text is written;
+"estimate MRP" does nothing. The `_filled.xlsx` still records both values. The
+validator, `wc_publish.py` (sends `sale_price: ""`, which clears a live sale price on
+the products it writes) and `wc_seo.py` follow. Details: docs/CLIENT_CONFIG.md.
+
+**Gross Weight is not written** (owner decision 2026-11-19): the content firewall's
+label deny list refuses it. Product / Item / Net Weight are written as `Weight`.
+
+**TV platform** (owner decision 2026-11-19): the platform (Google TV, Android TV,
+WebOS, Tizen, Fire TV, VIDAA) is written when the title or the spec table names one.
+A bare "Smart" / "Smart TV" / "Yes" under a platform or OS label is never written -
+not as an attribute, not in the description, not in the key features. The tag
+"Smart TV" stays.
 
 **Attributes from the retailer's spec table:** when the filled sheet carries a
 `specs` column, those facts become real WooCommerce attributes on top of the
@@ -395,6 +541,165 @@ title, its specs or the sheet's own vocabulary is written to a `_spec_gaps`
 column, summarised in a warning, and reported by validate_csv.py as
 `missing_required_attribute`. It **flags, it does not block** — a missing axis
 is often just a terse title, and the human review step decides.
+
+#### Filter groups (owner rule, 2026-11-19)
+
+The store's filter groups decide the product attributes. A customer filters
+by attribute, so an attribute that feeds a filter must use the filter's own
+name and the filter's own spelling of the value.
+
+**Where the sheets are.** The source is the client's attributes master,
+`clients\<slug>\SubCategory_Attributes_Master.xlsx` (client.toml
+`attributes_master`). It has two sheets that matter:
+
+- `Sub-Category Attributes` - one row per sub-category; the columns `Type`,
+  `Size`, `Star Rating`, `Ton`, `Capacity`, `Storage` and a second lower-case
+  `type` column (carried as the optional axis `Sub Type`, for example Fans:
+  `non BLDC, BLDC` -> attribute `Motor Type`). A cell is a comma list, `N/A`,
+  a range (`1 Star to 5 Star`), or a free-text hint
+  (`Sweep Size in mm (e.g. 1200mm)`).
+- The filter sheet - any sheet whose header starts with `Filter Group`
+  (`Sheet2` in the master). One row per store filter group with its values.
+
+`category_map.xlsx` holds copies (`Sub-Category Attributes`, `Filters`). They
+are used only when the master is missing or lacks the sheet. The build warns
+when the two copies differ. The in-app category editor edits only the FIRST
+sheet of `category_map.xlsx` and keeps the other sheets as they are.
+
+**What the build does.** For each axis of the product's sub-category,
+`app.filter_attributes` takes the value from the scraped spec table, else
+from the title. It snaps the value onto the filter group's list first (that
+spelling is written: `1.0 Ton` in the sub-category sheet is written as
+`1 Ton`), then onto the sub-category row's list. Units and spellings are
+folded (`1.5 T` = `1.5 TR` = `1.5 Tonne`; `190 Ltr` = `190L`; `5-star` =
+`5 Star`), and numbers compare as numbers. A value is NEVER rounded:
+`1.2 Ton` against `1 / 1.5 / 2 Ton` matches nothing. A filter group whose
+values are ranges (`Below 200L`, `6.1-7kg`) gets the range that holds the
+value; the exact figure stays as an ordinary attribute. A free-text hint with
+an `e.g.` example gets a clean number + unit (`1200mm`).
+
+The snapped value becomes an attribute NAMED BY THE FILTER GROUP
+(`AC Capacity: 1.5 Ton`). Filter attributes come FIRST in the attribute list
+and the 15-attribute cap never cuts them. The scraped row they came from is not
+written again under its retailer label. An axis that no filter-sheet group
+covers is named from the axis and its unit (`Energy Rating`, `Product Type`,
+`Power Rating`, `Sweep Size`, ...). Nothing is invented: no stated value, no
+filter attribute.
+
+The axis -> filter group table is `app.FILTER_AXIS_GROUPS` (AC Ton -> AC
+Capacity, AC Star Rating -> AC Star Rating, AC Type -> AC Technology + AC Type,
+LED Size/Capacity -> TV Screen Size, LED Type -> TV Smart Features, Washing
+Machines Type -> WM Function Type and Capacity -> WM Washing Capacity,
+Refrigerators Type/Capacity -> Fridge Type/Fridge Capacity, Water Purifiers
+Type/Capacity -> WP Technology/WP Storage Capacity). The AC Type axis also
+feeds AC Mode (Hot & Cold).
+
+**Directly-fed groups (2026-11-19).** Some groups have no sub-category column.
+`app.DIRECT_FILTER_GROUPS` feeds them from the scraped spec table (named
+labels first), then from the title. The value is snapped onto the client's
+filter-sheet list with the same rules: TV Resolution (one value, the highest
+stated), TV Display Tech (plain LED is dropped when QLED/OLED/Mini LED/QNED is
+also stated), TV Refresh Rate (a number with Hz only, exact), WM Features
+(several values; a negative such as `No` or `without heater` is never
+written), WM Color, Fridge Defrosting. These groups are optional: they never
+add to `_spec_gaps`. A dedicated label (for example `Resolution`, `Colour`)
+whose value does not snap is written as scraped, with a "new value" note in
+`_filter_unmatched` (see below). The title and the general feature lists never
+give a new text value. A group that is not in the client's
+filter sheet is skipped. Brand, Price, Availability, Discount and Fridge Price
+Range are computed by the store and are never written.
+
+**`Attribute N global`.** The CSV writes `1` only for filter attributes and `0`
+for every other attribute, so scraped spec labels stay custom attributes and
+do not become global taxonomies. `wc_publish.py` keeps a `0` row custom even
+when its name is a filter-group name.
+
+**New values (owner decision, 2026-11-19).** A scraped value is never replaced,
+rounded or dropped because the list does not hold it. Only its spelling is made
+regular. A stated value that is in neither list is WRITTEN as the filter
+attribute (first in order, `Attribute N global` = 1):
+
+- Numeric group: a number in the axis unit (the scraped label first, else the
+  title) is written as number + the list's own suffix. `0.8 Ton` gives
+  `AC Capacity: 0.8 Ton`; `1.8 T` gives `1.8 Ton`; `24 inch` against a list
+  that spells `32"` gives `24"`.
+- Band group (WM Washing Capacity, Fridge Capacity, WP Storage Capacity,
+  `75"+`): a value inside a band writes the band label, and the exact scraped
+  row stays as its own attribute (`Capacity: 7 kg` next to
+  `WM Washing Capacity: 6.1-7kg`). A value outside every band is written exact.
+- Text group: a value under a label dedicated to the group (never the title,
+  never a general feature list, never the general `Configuration` label) is
+  written as scraped, when it passes the content firewall and has at most 40
+  characters. In a multi-value cell, the matched parts get the sheet spelling
+  and the other parts stay as scraped.
+- Never a value: `Yes`, `No`, `NA`, `N/A`, `Not available`, a negative
+  (`without heater`), and for TV Smart Features a bare `Smart TV`. The
+  platform (Android TV, Google TV, WebOS, Tizen, or another named platform
+  under `Smart Platform` / `Operating System`) is written only when the page
+  names one.
+
+**`_filter_unmatched`.** Each written new value gets the note
+`AC Capacity: '0.8 Ton' is a new value, add it to the sheet`. A stated value
+that cannot be written (no unit, fails the firewall, too long) gets the note
+`... not in list`. validate_csv.py gives a WARNING for each, never a block:
+`warning_filter_value_not_in_sheet` for a written value that is in neither
+list, `warning_filter_value_unmatched` for the other notes. `_spec_gaps` is
+unchanged: a required axis with no value at all.
+
+**How to add a value.** Open the attributes master. Add the value to the filter
+group in the filter sheet (this spelling is the one written), and to the
+sub-category row if it belongs to one sub-category. Keep the
+`category_map.xlsx` copies the same, then rebuild the CSV.
+
+**The check tool.** It is read-only:
+
+    .venv\Scripts\python.exe tools\check_filter_sheet.py --client shreejee
+
+It prints the values that are in one sheet and not the other (per axis), the
+same values spelled two ways, cells that give no value list, the filter groups
+nothing feeds (only the store-computed ones should remain), and every difference between the master and the
+category_map.xlsx copies.
+
+**REST publish.** `wc_publish.py` sends an attribute whose name is a filter
+group as the store's GLOBAL attribute (`{id, options}`), so the filter widgets
+see it. It reads `products/attributes` once per run. A missing global attribute
+is printed as "would create global attribute <name>" in a dry run and is
+created once with `--commit`. All other attributes are sent as before.
+
+**Content firewall (owner rule, 2026-11-19):** nothing that belongs to the
+SOURCE RETAILER goes into a field we write: name, description, short
+description, key features, attributes, SEO title/description, tags. The
+firewall removes retailer and marketplace-seller names, "sold by" /
+"fulfilled by" text, EMI, bank and card offers, cashback, coupons, exchange
+offers, delivery and pincode text, return and replacement policy, the
+retailer's warranty-service and customer-care text, badges ("Amazon's
+Choice", "Best Seller", "Flipkart Assured"), ratings and review counts, URLs,
+phone numbers and e-mail addresses. The ONE definition is in `sku_enricher.py`
+(`RETAILER_NAMES`, `SPEC_LABEL_DENY_RE`, `COMMERCE_RE`, `SERVICE_RE`,
+`URL_RE`, `EMAIL_RE`, `PHONE_RE`, and the functions `content_hits`,
+`content_ok`, `spec_row_ok`, `content_clean`). The enricher applies it while
+it scrapes (`usable_spec`). `app.py` applies it again at build time, so an
+already-enriched `_filled.xlsx` is cleaned without a re-scrape: spec rows
+(`parse_scraped_specs`, `product_specs`), the title (`content_clean`, once,
+in `row_context`), and each rendered description row. The product's own brand
+is never a retailer name (a Croma-brand kettle keeps "Croma"). Genuine
+product features stay: "Amazon Alexa built-in", "Works with Alexa", "Amazon
+Fire TV", "Prime Video". A `Warranty` row stays when its value is a duration
+("2 Years Comprehensive") and goes when it holds service or customer-care
+text. validate_csv.py runs the same check over every written field
+(`retailer_content_in_field`, blocking).
+
+**Key points (owner rule, 2026-11-19):** the key-features paragraph, the short
+description and the long description each show at most `KEY_POINTS_MAX` (6)
+relevant spec points. The Brand / Product SKU / Title / Categories template
+rows do not count. Order: (1) rows whose label is on the sub-category's
+attribute whitelist (`Sub-Category Attributes` sheet), in sheet order;
+(2) the core rows read from the title (capacity, screen, resolution, energy,
+power, ...); (3) other scraped rows, which are left out when the sub-category
+has a whitelist. Fewer relevant points means fewer points — never padded.
+The attributes are not capped by this (still `MAX_ATTRIBUTES`, 15). No row is
+invented: the old fixed "Standard Operational Grid: 230 V / 50 Hz" row is
+removed.
 
 **SEO meta (OFF by default).** Meta title and description are not WooCommerce
 fields; they belong to Yoast or Rank Math and live as WordPress post meta. With
@@ -463,6 +768,11 @@ titles labelled Top Load, plus:
   anything under 400 px on its long edge or beyond a 3:1 aspect is flagged.
   Caught on the LED batch: a 3x1 pixel, a 94x46 and a 60x60 icon shipped as
   product images.
+- **`warning_image_not_house_canvas`** — a final image file that is not exactly
+  `CANVAS_EDGE` x `CANVAS_EDGE` (1500 x 1500). A warning, not a block.
+- **`retailer_content_in_field`** (blocking) — the content firewall found
+  retailer-owned text in the name, a description, key features, tags, SEO meta
+  or an attribute. The reason names the field and the matched term.
 - **byte-identical galleries across SKUs.** On this file the URL-based
   cross-row checks *cannot* fire, because app.py renames every image to
   `<sku>_<n>.webp` — so the files themselves are compared. Caught on the LED
@@ -471,6 +781,11 @@ titles labelled Top Load, plus:
 - **price above the category ceiling** as well as below its floor — a bundle,
   a dealer pack, or an MRP read into the price field.
 - **`missing_required_attribute`** — the axes `_spec_gaps` recorded.
+- **`warning_filter_value_unmatched`** — a `_filter_unmatched` note for a
+  stated filter value that could not be written (see "Filter groups").
+- **`warning_filter_value_not_in_sheet`** — a filter attribute (`global` = 1)
+  holds a value that neither the filter sheet nor the sub-category row lists:
+  a new value, written as scraped. Add it to the sheet. Non-blocking.
 
 Prints a summary and writes `validation_issues.csv`. It also runs
 **automatically** at the end of `build_csv.py` and in the app after Generate.
@@ -514,7 +829,7 @@ a batch can run unattended and so the formatter can be asserted on by tests.
 | `--seo` | Add the SEO meta columns (OFF by default) |
 | `--seo-plugin` | `yoast` (default) · `rankmath` · `both` |
 | `--no-validate` | Skip the QA pass that otherwise runs on the file just written |
-| `--pack` | Also write `<out stem>_pack\` — CSV, `validation_issues.csv`, the images the CSV references, the input list and a README — and zip it. The same deliverable the GUI's Archive button builds |
+| `--pack` | Also write `<out stem>_pack\` — CSV, the images the CSV references and a README (never the `_filled.xlsx`, the report or a log) — and zip it. The same client pack the GUI's Archive button zips |
 | `--client SLUG` | Which client's config to use (default: `PIPELINE_CLIENT`, then `shreejee`) |
 
 The QA pass runs by default the moment the CSV is written, so a problem is
@@ -526,7 +841,7 @@ folder puts them in the same place.
 
 `--pack` is the hand-over route: it produces one folder plus one
 `<out stem>_pack.zip` containing the CSV, the validation issues, every image the
-CSV references, the original input list and a README with `## Coverage`,
+CSV references and a README (no `_filled.xlsx`: it holds source links) with `## Coverage`,
 `## Review` and `## Files` sections. The README is rendered by the same
 `gui_helpers.render_batch_readme` the GUI archive uses, so the two routes cannot
 drift.
@@ -696,10 +1011,11 @@ Final_pipe\
     client.toml                     store URL, [sku] scheme, [serper] budgets
     category_map.xlsx               taxonomy - CONFIG, kept in git on purpose
     category_seo.xlsx               curated tags + SEO keywords (in git)
-    SubCategory_Attributes_Master.xlsx   REFERENCE COPY ONLY - no script reads it.
-                                    The attributes app.py actually enforces live in
-                                    the 'Sub-Category Attributes' SHEET of
-                                    category_map.xlsx (app.load_subcategory_attributes)
+    SubCategory_Attributes_Master.xlsx   attributes master - app.py READS it: its
+                                    'Sub-Category Attributes' sheet and its filter
+                                    sheet drive the filter attributes and
+                                    `_spec_gaps`. category_map.xlsx holds copies of
+                                    both sheets and is only the fallback.
     backups\ .env credits.json      editor backups, credentials, ledger (NOT in git)
   <name>.xlsx  <name>_filled.xlsx   the batch you are working on
   product_images_for_upload\<slug>\ images for the CURRENT batch, per client

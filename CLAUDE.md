@@ -24,16 +24,30 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   review mode, image keep/drop, an in-app category-map editor with backups, an SEO
   preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~640 lines).
   Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
-  a URL pasted in.
+  a URL pasted in. Review has three saved states per row (approved / skipped / not
+  reviewed, in `runs\<name>\review_state.json`); the build ALWAYS defaults to
+  "Confirmed rows only", is blocked at zero approvals, and never builds a skipped row
+  in either scope.
 - `app.py` (~2,170 lines, Streamlit) — `_filled.xlsx` → WooCommerce CSV; categories snap
   to exact strings in `category_map.xlsx`; images saved as `SKU_n.webp`; scraped
   specs become WooCommerce attributes; `_spec_gaps` records attributes the
   sub-category requires but nothing filled; optional SEO meta columns (off by default).
+  Since 2026-11-19: every image is laid out on one fixed 1500 x 1500 white canvas
+  (`CANVAS_EDGE`; 1200 before the fifth round), older `<sku>_<n>.webp` files are moved
+  to `_superseded\<date>\`, and `_1` is the photo with the whitest background; every text field
+  passes the content firewall (`content_ok` / `content_clean`, defined ONCE in
+  `sku_enricher.py`) so no retailer name, seller, EMI, offer, delivery, rating, URL or
+  phone text reaches the output; each description field shows at most `KEY_POINTS_MAX`
+  (6) points; filter attributes named by the store's filter group come first and
+  `_filter_unmatched` records a stated value that is not in the filter sheet.
 - `build_csv.py` — imports app.py, calls the same `process_inventory()` from a CLI.
 - `validate_csv.py` — QA gate for BOTH stages; writes `validation_issues.csv`. Also
   imported and run automatically by `build_csv.py` and the app after generation.
 - `wc_publish.py` — upserts products over the WooCommerce REST API (keyed on SKU).
-  Dry-run unless `--commit`; creates drafts unless `--status publish`.
+  Dry-run unless `--commit`; creates drafts unless `--status publish`. Filter-group
+  attributes are sent as the store's GLOBAL attributes (filter widgets need that); a
+  missing global attribute is created only with `--commit` — tested with mocked HTTP
+  only, so prove it on a staging store first.
 - `gui_helpers.py` — pure helpers for `gui.py` (enricher-log/publish-output parsing,
   status classification, batch summary, run_stage, ETA text); imports no Streamlit.
 - `wc_seo.py` — back-fills SEO meta on products ALREADY LIVE, recomputed from each
@@ -48,7 +62,7 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   or products created after the snapshot.
 - `client_config.py` — per-client config: `clients\<slug>\client.toml` holds the store
   URL, media-base template, SEO site name, placeholder HTML, the taxonomy paths, the
-  `[sku]` prefix scheme and `[serper]` (BYOK key name + budgets); `clients\<slug>\.env`
+  `[sku]` prefix scheme and `[serper]` (BYOK key name + budgets + `query_mode` / `search_order`); `clients\<slug>\.env`
   holds that client's credentials. Slug resolution is `--client` > `$PIPELINE_CLIENT`
   > `shreejee`; `app.configure(slug)` / `validate_csv.configure(slug)` do it in-process.
   The GUI gets a client selector and the same guards; see docs/CLIENT_CONFIG.md.
@@ -56,7 +70,13 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
 ## Environment
 - Windows 11 + PowerShell. Python is ALWAYS `.venv\Scripts\python.exe` — never bare
   `python`, never "activate".
-- `SERPER_API_KEY` (serper.dev) drives search: up to ~8 credits/SKU; free tier
+- `SERPER_API_KEY` (serper.dev) drives search: up to ~8 credits/SKU in the worst
+  case. `[serper] query_mode = "incremental"` (the code default) sends uncached queries
+  one at a time and stops at the first complete listing, so a SKU found by its first
+  query costs 1 credit; `"batch"` is the old send-all behaviour. An uncached `site:`
+  query that a free tier-0 source already answered "not there" (Croma site search, a
+  fresh brand sitemap) is not sent. `[serper] search_order` / `--search-order
+  free_first` asks DuckDuckGo before serper. Free tier
   2,500/month ≈ 300 SKUs. BYOK per client: the variable NAME comes from `[serper]
   api_key_env`, its value from `clients\<slug>\.env` (which OVERRIDES the shell env).
   `--budget N` caps a run at N credits (0 = unlimited; default `[serper]
@@ -95,16 +115,24 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   directions, and a block costs far more than the minutes saved.
 
 ## Repo layout
-    *.py                  the 10 pipeline scripts — MUST stay at root (see below)
+    *.py                  the 11 pipeline scripts (incl. url_index.py) — MUST stay at root (see below)
     clients\<slug>\       ALL per-client config; NO taxonomy file is at root any more
       client.toml         store URL, media base, SEO name, placeholder, [sku], [serper]
       category_map.xlsx   taxonomy (in git); its 'Sub-Category Attributes' sheet is what
                           load_subcategory_attributes enforces
       category_seo.xlsx   curated per-category tags + SEO keywords (hand-written;
                           rebuild with tools\build_category_seo.py)
-      SubCategory_Attributes_Master.xlsx  reference copy ONLY - no script reads it
+      SubCategory_Attributes_Master.xlsx  SOURCE of the filter groups and the
+                          sub-category attribute lists; app.py reads it FIRST and falls
+                          back to the copies in category_map.xlsx. Check it with
+                          tools\check_filter_sheet.py
       backups\ .env credits.json   gitignored: editor backups, creds, serper ledger
-    tools\                generators for the config sheets, not pipeline stages
+    url_sources.toml      tier-0 sitemap sources + retailer site-search endpoints (url_index.py)
+    url_index\            index.sqlite: downloaded sitemaps, shared by all clients (gitignored)
+    tools\                generators and checks for the config sheets (build_category_seo.py,
+                          check_filter_sheet.py), not pipeline stages
+    _not_in_use\          files parked on 2026-11-19 because nothing uses them; its
+                          README.md gives the reason and a restore command per file
     docs\                 all reference docs (KNOWN_ISSUES, PIPELINE_GUIDE, HANDOFF, …)
     docs\archive\         superseded code kept for reference (scraper2-source.zip)
     inputs\               source SKU lists
@@ -113,7 +141,8 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
     checkpoints\<slug>\  product_images_for_upload\<slug>\  .cache\  generated state
     blog_automate\        isolated blog generator
     Sku_enrichment\  _push_export\   mirrors — never edit directly, use /sync-copies
-    Code_Unrelated\       portable Node toolchain, nothing to do with the pipeline
+    (Code_Unrelated\ was moved OUT of the repo on 2026-11-19, to ..\Code_Unrelated\ —
+     a Node toolchain and personal files, nothing to do with the pipeline)
 
 The old standalone `scraper (2)\` was merged in and deleted (1.08 GB, almost all
 of it a .venv and a Chrome profile). Its source is `docs\archive\
@@ -133,13 +162,17 @@ Moving a `.py` file out of root silently relocates the directory it owns — don
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --limit 3          # smoke
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --client shreejee --budget 200
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --min-price 8000 --delay 5 8
+    .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --search-order free_first   # DuckDuckGo before serper
+    .venv\Scripts\python.exe tools\check_filter_sheet.py --client shreejee  # filter-sheet disagreements
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --retry-incomplete # re-do half-filled rows
     :: two-pass flow: review the links BEFORE paying for the full extraction
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --discover         # pass 1: links + photos only
     ::   -> review LIST_filled.xlsx, paste a url_link on every NEEDS LINK row
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --crawl-urls       # pass 2: crawl those links, NO searches
     .venv\Scripts\python.exe sku_enricher.py --probe "<url>"                # test ONE page, no spreadsheet
-    .venv\Scripts\python.exe sku_enricher.py --cache-info                   # what the page cache holds
+    .venv\Scripts\python.exe sku_enricher.py --cache-info                   # what the page cache + URL index hold
+    :: tier 0 (free URLs before any paid search) runs by default; --no-url-index skips it
+    .venv\Scripts\python.exe url_index.py refresh [--source NAME] [--force] | stats | lookup MODEL [--brand B]
     .venv\Scripts\python.exe -m streamlit run gui.py    # 5-step wizard, drives the WHOLE pipeline
     .venv\Scripts\python.exe -m streamlit run app.py    # just the CSV builder
     .venv\Scripts\python.exe build_csv.py "LIST_filled.xlsx" -o out.csv --month 2026/07
@@ -194,6 +227,9 @@ Main loop does: designing fixes, editing code, judgment calls. Prefer one well-b
 subagent over 20 tool calls in the main context.
 
 ## Docs (load on demand only)
+- `docs/handover-2026-11-19.md` — the current handover: what changed on 2026-11-19
+  (image canvas, content firewall, search spend, filter groups, GUI review states), the
+  test baseline, the git state and the open owner actions. Read it first in a new session.
 - `docs/KNOWN_ISSUES.md` — pre-diagnosed bugs with line anchors + acceptance tests. Read it
   BEFORE diagnosing any enricher misbehavior; most failure modes are already there.
 - `docs/PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
@@ -213,3 +249,20 @@ subagent over 20 tool calls in the main context.
 `/clear` between unrelated tasks · `/context` to audit window usage · long batches run
 via the runner agent or in background, never watched in the main loop · reference
 spreadsheets by path, don't paste their contents into chat.
+
+## Explanations and output format (owner rules, 2026-11-13)
+Same rules as `~/.claude/CLAUDE.md`; repeated here so they load in every session.
+- **Explain in ASD-STE100 (Simplified Technical English), about 80% strict.**
+  Short sentences (about 20 words for instructions, 25 for descriptions), one
+  topic per sentence, active voice, simple present/past/future tenses, one
+  meaning per word, the same term for the same thing each time, no idioms, no
+  needless words. The other 20% is latitude: keep necessary technical names
+  and product terms when the simplified word would lose accuracy.
+- **Create diagrams when the user asks for one.** Draw it as a local file
+  (inline SVG in an HTML file, or Mermaid in an HTML file), not as a
+  published page.
+- **Give written output as HTML, not `.md` or `.txt`.** Reports, plans,
+  handovers, audits, and other documents made for the user are self-contained
+  `.html` files in the repo. Exceptions: files that a tool reads by a fixed
+  name or format (`CLAUDE.md`, `MEMORY.md` and memory files, `SKILL.md`,
+  `README.md`, MDX site content, existing `.md` files that are only edited).

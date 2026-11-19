@@ -78,7 +78,9 @@ def test_pack_writes_a_folder_a_readme_and_a_zip(tmp_path):
     pack = tmp_path / "out_pack"
     assert pack.is_dir(), sorted(x.name for x in tmp_path.iterdir())
     assert (pack / "out.csv").exists()               # the import file
-    assert (pack / "LED_filled.xlsx").exists()       # the list it came from
+    # owner rule 2026-11-19: the enriched sheet (source URLs, statuses that
+    # name the source site) never goes to the client
+    assert not (pack / "LED_filled.xlsx").exists()
     assert (pack / "README.md").exists()
     assert "Pack: " in p.stdout and "Zip:  " in p.stdout
 
@@ -86,8 +88,18 @@ def test_pack_writes_a_folder_a_readme_and_a_zip(tmp_path):
     assert zip_path.exists()
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
-        assert {"out.csv", "README.md", "LED_filled.xlsx"} <= names
-        assert "## Coverage" in zf.read("README.md").decode("utf-8")
+        assert {"out.csv", "README.md"} <= names
+        assert not [n for n in names if n.endswith(("_filled.xlsx",
+                                                    "_report.md", ".log"))]
+        # owner decision 2026-11-19 (fifth round): the client pack is the
+        # import CSV, the images and README.md - validation_issues.csv is
+        # internal
+        assert names <= {"out.csv", "README.md"}
+        assert "validation_issues.csv" not in names
+        readme = zf.read("README.md").decode("utf-8")
+        assert "## Coverage" in readme
+        # no status in the README names the source site
+        assert "croma" not in readme.lower() and "amazon" not in readme.lower()
 
 
 def test_pack_readme_covers_the_whole_list_not_just_the_built_rows(tmp_path):
@@ -101,7 +113,7 @@ def test_pack_readme_covers_the_whole_list_not_just_the_built_rows(tmp_path):
 
     assert text.startswith("# Batch out\n\n")
     assert "build_csv.py --pack" in text             # no run folder to name
-    assert "- Source list: LED_filled.xlsx\n" in text
+    assert "- Source list: LED.xlsx\n" in text       # the client's list name
     assert "- Rows enriched: 3\n" in text
     assert "- Built scope: FOUND rows only (1 SKUs)\n" in text
     assert "- Images: 0 file(s) copied\n" in text    # image_url was empty
@@ -128,7 +140,9 @@ def test_pack_records_the_validation_count_it_just_measured(tmp_path):
     count = line.split(": ", 1)[1]
     assert count.isdigit(), line          # a real number, never '?' / 'not run'
     if int(count):                        # the QA pass writes it next to out.csv
-        assert (tmp_path / "out_pack" / "validation_issues.csv").exists()
+        assert (tmp_path / "validation_issues.csv").exists()
+    # ... but it is INTERNAL: never in the client pack (2026-11-19)
+    assert not (tmp_path / "out_pack" / "validation_issues.csv").exists()
 
 
 def test_build_csv_advertises_pack_and_still_imports_gui_helpers_purely():
@@ -169,3 +183,25 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_validation_issues_is_refused_from_a_client_pack(tmp_path):
+    """Owner decision 2026-11-19 (fifth round): validation_issues.csv is an
+    INTERNAL file. The guard refuses it in a client pack; the internal
+    archive (internal=True) keeps it."""
+    import gui_helpers
+    issues = tmp_path / "validation_issues.csv"
+    issues.write_text("row,sku,reasons\n2,TV-X,missing_price\n",
+                      encoding="utf-8")
+    assert gui_helpers.pack_member_problem(issues.name, issues, {"x.test"})
+    csv_file = tmp_path / "out.csv"
+    csv_file.write_text("sku,Images\nTV-X,\n", encoding="utf-8")
+    client = gui_helpers.assemble_pack(
+        tmp_path / "client", {csv_file.name: csv_file, issues.name: issues},
+        tmp_path, csv_file, allowed_hosts={"x.test"})
+    assert not (tmp_path / "client" / "validation_issues.csv").exists()
+    assert any("validation_issues.csv" in r for r in client["refused"])
+    gui_helpers.assemble_pack(
+        tmp_path / "internal", {csv_file.name: csv_file, issues.name: issues},
+        tmp_path, csv_file, internal=True)
+    assert (tmp_path / "internal" / "validation_issues.csv").exists()

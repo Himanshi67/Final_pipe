@@ -1,0 +1,5 @@
+{"searchMetaData": {"status": 0}, "response": {"numberOfProducts": 3, "products": [
+  {"uniqueId": "11111", "title": "Samsung 7 kg Front Load Washing Machine WW70T4020CE/TL", "productUrl": "/p/11111/samsung-7-kg-front-load-ww70t4020ce-tl", "sku": "WW70T4020CE/TL"},
+  {"uniqueId": "11112", "title": "Samsung 8 kg Front Load Washing Machine WW80T4020CE/TL", "productUrl": "/p/11112/samsung-8-kg-ww80t4020ce-tl", "sku": "WW80T4020CE/TL"},
+  {"uniqueId": "11113", "title": "Samsung WW70T4020CE/TL drum cover", "productUrl": "/search-listing?q=WW70T4020CE", "sku": "X"}
+]}}

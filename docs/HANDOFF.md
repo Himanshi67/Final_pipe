@@ -2,8 +2,9 @@
 
 > **SUPERSEDED (2026-09-01).** Written 2026-07-28, before the 2026-08-22 GUI refit and
 > the 2026-09-01 audit. Its repo-layout, remote, branch and script-count statements are
-> no longer true, and it names `SubCategory_Attributes_Master.xlsx` as the attribute
-> source (no script reads that file). Kept for its narrative of how the pipeline was
+> no longer true. It names `SubCategory_Attributes_Master.xlsx` as the attribute
+> source; since 2026-11-19 that is true again (app.py reads it first - see
+> PIPELINE_GUIDE "Filter groups"). Kept for its narrative of how the pipeline was
 > proven end to end. For current state read `CLAUDE.md`, then `docs/NEXT_STEPS.md`
 > (open defects) and `docs/PRODUCT_PLAN.md` (where this is going).
 
@@ -81,13 +82,15 @@ fresh SKU, product created, verified, deleted, store left as found.
   `_push_export\` in the SAME relative layout — the scripts anchor on
   `Path(__file__).parent / "clients"`, so a flattened copy breaks the export.
 - Gitignored on purpose and **only on disk**: `.cache\`, `batches\`, `backups\`,
-  `product_images_for_upload\`, `checkpoints\`, `Code_Unrelated\_tools\` (92 MB
-  Node), `clients\*\backups\`, `clients\*\.env`, `clients\*\credits.json`, and
+  `product_images_for_upload\`, `checkpoints\`, `clients\*\backups\`,
+  (`Code_Unrelated\` was moved out of the repo on 2026-11-19, to `..\Code_Unrelated\`), `clients\*\.env`, `clients\*\credits.json`, and
   all `*.xlsx` **except** `clients\*\category_map.xlsx`,
   `clients\*\category_seo.xlsx` and `clients\*\SubCategory_Attributes_Master.xlsx`,
-  which are configuration and are committed deliberately. (The Master workbook is a
-  REFERENCE COPY read by no script — the enforced attributes live in the
-  'Sub-Category Attributes' sheet of `category_map.xlsx`, `app.load_subcategory_attributes`.)
+  which are configuration and are committed deliberately. (Since 2026-11-19 the
+  Master workbook is the SOURCE app.py reads first: its 'Sub-Category Attributes'
+  sheet and its filter sheet drive the filter attributes and `_spec_gaps`; the
+  copies in `category_map.xlsx` are the fallback. `tools\check_filter_sheet.py`
+  reports drift between the two.)
   Those three workbooks MOVED out of the repo root into `clients\<slug>\` in
   Phase 1; nothing taxonomy-shaped is at root any more.
 

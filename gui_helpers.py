@@ -126,6 +126,12 @@ def batch_summary(result):
         "avg_images": round(float(imgs.mean()), 1) if len(result) else 0.0,
         "spec_gap_rows": int((result["_spec_gaps"].astype(str)
                               .str.strip() != "").sum()),
+        # filter values stated but not in the filter sheet (app.py writes
+        # them to _filter_unmatched); 0 for output that predates the column
+        "filter_unmatched_rows": int((result["_filter_unmatched"].astype(str)
+                                      .str.strip().replace("nan", "") != "")
+                                     .sum()) if "_filter_unmatched" in result
+                                 else 0,
         "missing_brand": int((result["Brands"].astype(str)
                               .str.strip() == "").sum()),
         "price_min": int(sale.min()) if has_price else 0,
@@ -628,13 +634,99 @@ def row_fingerprint(row) -> str:
 def confirmed_from_state(state) -> set:
     """The confirmed SKUs in a review_state.json dict.
 
-    Values are {"confirmed": bool, "fp": "<sha1>"} since P3-53; a bare bool
-    is the legacy format and still counts."""
+    Values are {"confirmed": bool, "fp": "<sha1>"} since P3-53, plus
+    "skipped" / "skip_reason" since the review-states change; a bare bool is
+    the legacy format and still counts. An entry that says BOTH confirmed and
+    skipped (hand-edited or corrupt file) counts as skipped only - the safe
+    reading, because a skipped row must never become buildable."""
     out = set()
     for sku, v in (state or {}).get("confirmed", {}).items():
         ok = v.get("confirmed") if isinstance(v, dict) else v
+        if isinstance(v, dict) and v.get("skipped"):
+            continue
         if ok:
             out.add(str(sku))
+    return out
+
+
+# ------------------------------------------------------- review states ----
+# A review row is in exactly ONE of three states: approved, skipped, or not
+# reviewed. review_state.json keeps them in the same per-sku entry:
+#     {"confirmed": bool, "skipped": bool, "skip_reason": str, "fp": sha1}
+# Files written before this change hold only {confirmed, fp} (or a bare
+# bool); a missing key reads as False / "" - there is no migration step.
+
+APPROVE, SKIP, CLEAR = "approve", "skip", "clear"
+
+
+def skipped_from_state(state) -> dict:
+    """The skipped SKUs in a review_state.json dict, as {sku: reason}.
+
+    A legacy entry (bare bool, or a dict without "skipped") is never
+    skipped. The reason is "" when the reviewer gave none."""
+    out = {}
+    for sku, v in (state or {}).get("confirmed", {}).items():
+        if isinstance(v, dict) and v.get("skipped"):
+            out[str(sku)] = str(v.get("skip_reason") or "").strip()
+    return out
+
+
+def review_decision(confirmed, skipped, sku, decision, reason=""):
+    """Apply one reviewer decision under the three-state rule.
+
+    confirmed  set of approved SKUs
+    skipped    {sku: reason} of skipped SKUs
+    decision   APPROVE - approved, any skip cleared
+               SKIP    - skipped (with `reason`), any approval cleared
+               CLEAR   - back to not reviewed
+    Returns (confirmed, skipped) as NEW objects; the inputs are untouched.
+    The FOUND gate is not applied here - callers check found_status()
+    before they approve (merge_review_flags and the card button do)."""
+    conf = {str(s) for s in (confirmed or set())}
+    skips = {str(k): str(v or "") for k, v in (skipped or {}).items()}
+    sku = str(sku)
+    if decision == APPROVE:
+        conf.add(sku)
+        skips.pop(sku, None)
+    elif decision == SKIP:
+        conf.discard(sku)
+        skips[sku] = str(reason or "").strip()
+    elif decision == CLEAR:
+        conf.discard(sku)
+        skips.pop(sku, None)
+    else:
+        raise ValueError(f"unknown review decision: {decision!r}")
+    return conf, skips
+
+
+def review_entries(old_entries, confirmed_flags, skipped, fps):
+    """The new review_state.json "confirmed" map.
+
+    old_entries      the map as it is on disk (fp fallback for rows the
+                     caller did not hash)
+    confirmed_flags  {sku: bool} - every sku the caller knows a tick for
+    skipped          {sku: reason} - the COMPLETE skip map to persist
+    fps              {sku: sha1} fingerprints of the rows as just saved
+
+    Enforces the three-state rule on write: a sku in `skipped` is stored
+    with confirmed False, whatever the flag map says (skip wins - a skip is
+    the reviewer's explicit no, and the build must never pick it up). A
+    skipped sku the flag map does not mention still gets its entry."""
+    old = old_entries or {}
+    skips = {str(k): str(v or "").strip() for k, v in (skipped or {}).items()}
+    out = {}
+    keys = [str(s) for s in (confirmed_flags or {})]
+    keys += [s for s in skips if s not in set(keys)]
+    flags = {str(k): bool(v) for k, v in (confirmed_flags or {}).items()}
+    for sku in keys:
+        prev = old.get(sku)
+        fp = (fps or {}).get(sku,
+                             prev.get("fp") if isinstance(prev, dict) else None)
+        is_skip = sku in skips
+        out[sku] = {"confirmed": bool(flags.get(sku, False)) and not is_skip,
+                    "skipped": is_skip,
+                    "skip_reason": skips.get(sku, ""),
+                    "fp": fp}
     return out
 
 
@@ -644,7 +736,12 @@ def stale_confirmations(state, df) -> set:
     A stored fp of None (legacy tick, or one saved without a frame to hash)
     is never stale - there is nothing to compare. A sku the sheet no longer
     holds is not stale either: it cannot be built, and the FOUND gate in
-    select_build_rows already covers that case."""
+    select_build_rows already covers that case.
+
+    Skips are NEVER stale: a changed row keeps its skip. Dropping it would
+    turn the reviewer's explicit 'no' back into 'not reviewed', and the
+    explicit 'All FOUND rows' scope would then build it unseen - so the safe
+    choice is to keep the skip until a human clears it."""
     if df is None or "sku" not in getattr(df, "columns", []):
         return set()
     current = {}
@@ -654,7 +751,8 @@ def stale_confirmations(state, df) -> set:
             current[sku] = row_fingerprint(row)
     stale = set()
     for sku, v in (state or {}).get("confirmed", {}).items():
-        if not isinstance(v, dict) or not v.get("confirmed"):
+        if not isinstance(v, dict) or not v.get("confirmed") \
+                or v.get("skipped"):
             continue
         fp = v.get("fp")
         sku = str(sku)
@@ -712,31 +810,143 @@ def merge_confirm_flags(existing, original, parts):
     return flags, sorted(rejected)
 
 
-def select_build_rows(df, scope, confirmed):
+def merge_review_flags(existing_conf, existing_skips, original, parts):
+    """merge_confirm_flags for BOTH review columns (✔ and Skip).
+
+    existing_conf   set of SKUs persisted as approved
+    existing_skips  {sku: reason} persisted as skipped
+    original        the review frame as loaded - sku, confirmed, skipped,
+                    status (a frame without 'skipped' reads as all False)
+    parts           the editor frames, LATER parts win (same as
+                    merge_confirm_flags)
+
+    A part's Skip value counts as an edit only when it differs from that
+    sku's value in `original`. Then the three-state rule:
+      - ✔ newly ticked on a skipped row (skip untouched)  -> approved,
+        skip cleared
+      - Skip newly ticked                                 -> skipped,
+        approval cleared
+      - both newly ticked in the same save                -> skipped (the
+        safe reading of a contradictory edit)
+    The FOUND gate applies to the approval only; a skip is allowed on any
+    row. A skip a reviewer unticks loses its reason. Returns
+    (confirm_flags, skips, rejected) and never mutates its inputs."""
+    flags, rejected = merge_confirm_flags(existing_conf, original, parts)
+
+    orig_conf, orig_skip = {}, {}
+    for _, row in original.iterrows():
+        sku = str(row["sku"])
+        if sku in orig_skip:
+            continue
+        orig_conf[sku] = bool(row.get("confirmed", False))
+        orig_skip[sku] = bool(row.get("skipped", False))
+
+    skips = {str(k): str(v or "") for k, v in (existing_skips or {}).items()}
+    skip_changed, conf_changed = set(), set()
+    for part in parts or []:
+        has_skip = "skipped" in part.columns
+        for _, row in part.iterrows():
+            sku = str(row["sku"])
+            if sku not in orig_skip:
+                continue
+            if bool(row.get("confirmed", False)) != orig_conf[sku]:
+                conf_changed.add(sku)
+            if not has_skip:
+                continue
+            now = bool(row.get("skipped", False))
+            if now != orig_skip[sku]:
+                skip_changed.add(sku)
+                if now:
+                    skips.setdefault(sku, "")
+                else:
+                    skips.pop(sku, None)
+
+    for sku in list(skips):
+        if sku in skip_changed:
+            flags[sku] = False                # a new skip clears the tick
+        elif flags.get(sku) and sku in conf_changed:
+            skips.pop(sku)                    # a new tick clears the skip
+        else:
+            flags[sku] = False                # an old skip still wins
+    return flags, skips, rejected
+
+
+def select_build_rows(df, scope, confirmed, skipped=None):
     """Rows that may reach the CSV build, plus the SKUs refused.
 
     scope 'confirmed'  -> a row must be ticked AND found_status(); a ticked
                           NEEDS CRAWL / NOT FOUND / CLOSE MATCH row is
-                          dropped and named in `skipped`.
+                          dropped and named in `skipped`. No approvals ->
+                          an empty frame (never a fallback to all rows).
     scope 'all_found'  -> every found_status() row, ticked or not;
                           skipped is always [].
+
+    `skipped` (a set or a {sku: reason} map) names rows the reviewer
+    skipped. They are excluded in BOTH scopes and are not reported in the
+    refused list - a skip is a decision, not an error.
 
     A frame with no 'status' column is not an enricher sheet (a hand-made
     or already-filtered input), so nothing can be judged: keep everything
     for 'all_found', keep the ticked rows for 'confirmed', skipped = [].
     Returns a copy; the input frame is untouched."""
-    conf = {str(s) for s in (confirmed or set())}
+    skip = {str(s) for s in (skipped or ())}
+    conf = {str(s) for s in (confirmed or set())} - skip
     skus = df["sku"].astype(str) if "sku" in df.columns else None
+    keep = ~skus.isin(skip) if skus is not None else None
     if "status" not in df.columns:
         if scope == "confirmed" and skus is not None:
             return df[skus.isin(conf)].copy(), []
-        return df.copy(), []
+        return (df[keep].copy() if keep is not None else df.copy()), []
     is_found = df["status"].map(found_status)
+    if keep is None:
+        keep = is_found | True
     if scope == "confirmed":
         ticked = skus.isin(conf) if skus is not None else is_found & False
         return (df[ticked & is_found].copy(),
                 sorted(set(df.loc[ticked & ~is_found, "sku"].astype(str))))
-    return df[is_found].copy(), []
+    return df[is_found & keep].copy(), []
+
+
+def review_counts(df, confirmed, skipped) -> dict:
+    """The review summary: every unique sku on the sheet in ONE bucket.
+
+    approved      ticked, not skipped, status FOUND (what 'Confirmed rows
+                  only' builds)
+    skipped       skipped by the reviewer, whatever the status
+    not_reviewed  FOUND, neither ticked nor skipped
+    not_found     status is not FOUND and not skipped (cannot be approved
+                  until crawled; a stray legacy tick on one lands here too)
+    A frame without a status column treats every row as FOUND."""
+    conf = {str(s) for s in (confirmed or set())}
+    skip = {str(s) for s in (skipped or ())}
+    out = {"approved": 0, "skipped": 0, "not_reviewed": 0, "not_found": 0}
+    if df is None or "sku" not in getattr(df, "columns", []):
+        return out
+    has_status = "status" in df.columns
+    seen = set()
+    for _, row in df.iterrows():
+        sku = str(row["sku"])
+        if sku in seen:
+            continue
+        seen.add(sku)
+        found = found_status(row["status"]) if has_status else True
+        if sku in skip:
+            out["skipped"] += 1
+        elif not found:
+            out["not_found"] += 1
+        elif sku in conf:
+            out["approved"] += 1
+        else:
+            out["not_reviewed"] += 1
+    return out
+
+
+def review_counts_text(counts) -> str:
+    """'Approved N · Skipped N · Not reviewed N · Not FOUND N'."""
+    c = counts or {}
+    return (f"Approved {c.get('approved', 0)} · Skipped {c.get('skipped', 0)}"
+            f" · Not reviewed {c.get('not_reviewed', 0)}"
+            f" · Not FOUND {c.get('not_found', 0)}")
 
 
 def card_queue_index(confirmed, i) -> int:
@@ -769,9 +979,6 @@ def card_queue_index(confirmed, i) -> int:
 # "confirmed", and the GUI renders runs\<name>\review_metrics.json from it.
 # Everything here is pure - the clock reading and the session state live in
 # gui.py, these functions only ever see plain values.
-
-REVIEW_ACTIONS = ("approve", "unapprove", "edit", "url_pasted", "drop_image",
-                  "skip")
 
 # a row that took more than a bare tick: someone had to change something
 _HANDS_ON_ACTIONS = frozenset({"edit", "url_pasted", "drop_image"})
@@ -996,8 +1203,128 @@ def coverage_total(coverage) -> int:
     return total
 
 
-def assemble_pack(dest, files, image_dir, csv_path) -> dict:
-    """Copy one hand-over pack into `dest` - the single copy routine behind
+# ---- client hand-over guard (owner rule, 2026-11-19) --------------------
+# The pack a client receives must never hold the enriched sheet
+# (*_filled.xlsx: source page URLs, maker image URLs, statuses that name the
+# source site), the enricher report, a log, or any text file with a link to
+# a host that is not the client's own store / media host. The internal
+# archive (gui.archive_run's batches\<name>\ folder) is NOT handed over and
+# passes internal=True. validation_issues.csv is INTERNAL too (owner
+# decision 2026-11-19, fifth round): its reasons can name a source site.
+CLIENT_PACK_REFUSED_RE = re.compile(
+    r"(?:_filled\.xlsx|_report\.md|\.log|(?:^|[\\/])validation_issues\.csv)$",
+    re.IGNORECASE)
+PACK_TEXT_SUFFIXES = (".csv", ".md", ".txt", ".json", ".tsv", ".html", ".htm",
+                      ".xml")
+_PACK_URL_RE = re.compile(r"(?:https?://|(?<![:\w/])//|(?<![\w.])www\.)"
+                          r"([^\s/\"'<>),;|\]]+)",
+                          re.IGNORECASE)
+
+
+def _bare_host(host) -> str:
+    host = str(host or "").strip().lower().rstrip(".")
+    host = host.rsplit("@", 1)[-1].split(":", 1)[0]
+    return host[4:] if host.startswith("www.") else host
+
+
+def client_hosts(cfg) -> set:
+    """The hosts a client pack may link to: the store and the media base."""
+    hosts = set()
+    for url in (getattr(cfg, "store_url", ""), _safe_media_base(cfg)):
+        host = _bare_host(re.sub(r"^[a-z]+://", "", str(url or ""),
+                                 flags=re.IGNORECASE).split("/", 1)[0])
+        if host:
+            hosts.add(host)
+    return hosts
+
+
+def _safe_media_base(cfg) -> str:
+    try:
+        return cfg.media_base()
+    except Exception:
+        return ""
+
+
+def default_client_hosts() -> set:
+    """client_hosts() of the client $PIPELINE_CLIENT (else the default)
+    names; an empty set (every link refused) when it cannot be loaded."""
+    try:
+        import client_config
+        return client_hosts(client_config.load_client())
+    except Exception:
+        return set()
+
+
+def foreign_hosts(text, allowed) -> list:
+    """Hosts linked in `text` (http(s)://, //, www.) that are neither in
+    `allowed` nor a sub-domain of one, in order, without repeats."""
+    allowed = {_bare_host(h) for h in (allowed or ()) if h}
+    out = []
+    for m in _PACK_URL_RE.finditer(str(text or "")):
+        host = _bare_host(m.group(1))
+        if not host or "." not in host:
+            continue
+        if host in allowed or any(host.endswith("." + a) for a in allowed):
+            continue
+        if host not in out:
+            out.append(host)
+    return out
+
+
+def pack_member_problem(name, path, allowed_hosts) -> str:
+    """Why `name` (copied from `path`) must not go into a client pack, or
+    ''. Refused: *_filled.xlsx, *_report.md, *.log, validation_issues.csv,
+    and a text member that links to a host other than the client's own."""
+    if CLIENT_PACK_REFUSED_RE.search(str(name)) or \
+            CLIENT_PACK_REFUSED_RE.search(Path(path).name):
+        return ("internal file (enriched sheet, enricher report, log or "
+                "validation issues)")
+    if str(name).lower().endswith(PACK_TEXT_SUFFIXES):
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            return f"cannot be read to check for source links ({exc})"
+        hosts = foreign_hosts(text, allowed_hosts)
+        if hosts:
+            return ("links to a host that is not the client's: "
+                    + ", ".join(hosts[:3]))
+    return ""
+
+
+def scan_pack_folder(dest, allowed_hosts) -> list:
+    """['<file>: <why>'] for every file in a finished client pack folder
+    (README included) that pack_member_problem refuses. [] = clean."""
+    dest = Path(dest)
+    out = []
+    if not dest.is_dir():
+        return out
+    for path in sorted(dest.rglob("*")):
+        if path.is_file():
+            rel = path.relative_to(dest).as_posix()
+            why = pack_member_problem(rel, path, allowed_hosts)
+            if why:
+                out.append(f"{rel}: {why}")
+    return out
+
+
+def remove_refused(dest, allowed_hosts) -> list:
+    """scan_pack_folder, then DELETE each refused file from the client pack
+    folder (with a printed warning) so the zip cannot carry it. Returns the
+    problems found."""
+    problems = scan_pack_folder(dest, allowed_hosts)
+    for item in problems:
+        rel = item.split(": ", 1)[0]
+        try:
+            (Path(dest) / rel).unlink()
+        except OSError:
+            pass
+        print(f"[pack] REFUSED and removed from the client pack: {item}")
+    return problems
+
+
+def assemble_pack(dest, files, image_dir, csv_path, *, internal=False,
+                  allowed_hosts=None) -> dict:
+    """Copy one pack into `dest` - the single copy routine behind
     BOTH gui.archive_run and build_csv.py --pack.
 
     files      {destination filename: source Path}; a missing source is
@@ -1008,20 +1335,36 @@ def assemble_pack(dest, files, image_dir, csv_path) -> dict:
                nothing else - a build killed mid-to_csv leaves a 0-byte or
                ragged file and pandas raises ValueError (EmptyDataError /
                ParserError), not OSError (P2-25).
+    internal   True only for the operator's own archive (never handed over):
+               no member is refused. Default False = a CLIENT pack: every
+               member passes pack_member_problem (no *_filled.xlsx, no
+               *_report.md, no *.log, no text file that links to a host other
+               than `allowed_hosts`); a refused member is skipped with a
+               printed warning and listed in res['refused'].
+    allowed_hosts  the client's own hosts (client_hosts(cfg)); None = the
+               hosts of the client $PIPELINE_CLIENT names.
 
-    Returns {files, images, missing, copied, csv_error}. images\\ is created
-    only when the CSV actually references a photo, so a pack with none has no
-    empty folder in it.
+    Returns {files, images, missing, copied, csv_error, refused}. images\\ is
+    created only when the CSV actually references a photo, so a pack with
+    none has no empty folder in it.
     """
     dest = Path(dest)
     dest.mkdir(parents=True, exist_ok=True)
     res = {"files": 0, "images": 0, "missing": 0, "copied": 0,
-           "csv_error": None}
+           "csv_error": None, "refused": []}
+    if not internal and allowed_hosts is None:
+        allowed_hosts = default_client_hosts()
     for name, src in (files or {}).items():
         if not src:
             continue
         src = Path(src)
         if src.exists():
+            if not internal:
+                why = pack_member_problem(name, src, allowed_hosts)
+                if why:
+                    res["refused"].append(f"{name}: {why}")
+                    print(f"[pack] REFUSED {name}: {why}")
+                    continue
             shutil.copy2(src, dest / name)
             res["files"] += 1
 
@@ -1050,7 +1393,8 @@ def assemble_pack(dest, files, image_dir, csv_path) -> dict:
 _FILE_BLURB = {
     "input_filled.xlsx": "the enriched sheet, one row per SKU with its status",
     "wordpress_ready.csv": "the WooCommerce import file",
-    "validation_issues.csv": "rows the QA pass flagged before publishing",
+    "validation_issues.csv": ("rows the QA pass flagged before publishing "
+                              "(internal archive only)"),
     "input_filled_report.md": "the enricher's end-of-run report",
     "images": "exactly the photos the CSV references",
     "README.md": "this file",
@@ -1067,7 +1411,7 @@ def _blurb(fname) -> str:
         return known
     low = str(fname).lower()
     if low.endswith((".xlsx", ".xls")):
-        return "the list this batch was built from"
+        return "the SKU list the batch started from (internal archive only)"
     if low.endswith(".csv"):
         return "the WooCommerce import file"
     return ""
@@ -1087,6 +1431,20 @@ _COVERAGE_ROWS = (
 )
 
 
+# a site name in a status reason ('price from flipkart.com', 'all sources
+# blocked (amazon.in, croma.com)'): the README never prints one
+_SITE_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?[a-z0-9][a-z0-9-]*(?:\.[a-z0-9-]+)*"
+    r"\.(?:com|in|net|org|co|io|shop|store|biz|info)(?:\.[a-z]{2})?\b[^\s,)]*",
+    re.IGNORECASE)
+
+
+def scrub_sites(text) -> str:
+    """`text` with every site name / link replaced by 'a source site'."""
+    text = _SITE_RE.sub("a source site", str(text or ""))
+    return re.sub(r"a source site(?:,\s*a source site)+", "source sites", text)
+
+
 def _coverage_table(coverage) -> str:
     cov = coverage or {}
     lines = ["| bucket | rows |", "| --- | ---: |",
@@ -1095,7 +1453,11 @@ def _coverage_table(coverage) -> str:
         value = cov.get(key, 0)
         if isinstance(value, dict):
             lines.append(f"| {label} | {sum(value.values())} |")
-            for reason, n in sorted(value.items(),
+            merged = {}
+            for reason, n in value.items():
+                key = scrub_sites(reason)
+                merged[key] = merged.get(key, 0) + n
+            for reason, n in sorted(merged.items(),
                                     key=lambda kv: (-kv[1], kv[0])):
                 lines.append(f"| &nbsp;&nbsp;↳ {reason} | {n} |")
         else:

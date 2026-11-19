@@ -289,7 +289,8 @@ def t_dry_run_guarantees(csv_path):
         check("KI-16: assembling a dry-run payload performs zero writes",
               not rec.writes, rec.writes[:5])
         check("KI-16: missing terms are reported, not created",
-              all(lbl in ("category", "tag") for lbl, _ in store.would_create),
+              all(lbl in ("category", "tag", "global attribute")
+                  for lbl, _ in store.would_create),
               store.would_create[:4])
 
         rec2 = RecordingSession(get_payload=[])

@@ -31,6 +31,10 @@ if str(ROOT) not in sys.path:
 
 # the streamlit-importing suites set this too; harmless when already set
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+# Tier 0 (url_index.py) refreshes retailer sitemaps over the network at the
+# start of every enricher run. Suites that drive sku_enricher.main() stub the
+# page fetcher and serper only, so keep tier 0 off for them; tests# test_url_index.py turns it back on per test with fixtures and a temp DB.
+os.environ.setdefault("PIPELINE_URL_INDEX", "off")
 
 collect_ignore = ["qa_pipeline.py", "qa_deep.py", "qa_cli.py"]
 

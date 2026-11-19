@@ -38,9 +38,9 @@ from gui_helpers import image_basenames_from_csv              # noqa: E402
 # app.py writes it - unquoted, pandas would read it as extra columns
 CSV_TEXT = (
     "sku,title,Images\n"
-    'WM-A,Washer A,"https://cdn.test/WM-A_1.webp,'
-    'https://cdn.test/WM-A_2.webp"\n'
-    "WM-B,Washer B,https://cdn.test/WM-B_1.webp\n"
+    'WM-A,Washer A,"https://shreejeeelectronics.in/wp-content/uploads/WM-A_1.webp,'
+    'https://shreejeeelectronics.in/wp-content/uploads/WM-A_2.webp"\n'
+    "WM-B,Washer B,https://shreejeeelectronics.in/wp-content/uploads/WM-B_1.webp\n"
 )
 
 
@@ -369,14 +369,26 @@ def test_archive_writes_a_coverage_review_readme_and_a_zip(tmp: Path):
     assert "- `LIST.xlsx`" in readme                  # the Files section
     assert "- Source list: LIST.xlsx" in readme       # the pre-item-6 line
 
-    # one file to hand over, and it holds the README we just wrote
+    # one file to hand over, made from the CLIENT pack only (owner rule
+    # 2026-11-19): CSV, its images and a README - never the issues file
+    # (internal since the fifth round), the filled sheet, the enricher
+    # report, a log or the source list
     assert zip_path is not None and zip_path.exists()
     assert zip_path == repo / "batches" / "pack-1.zip"
     with zipfile.ZipFile(zip_path) as zf:
         names = set(zf.namelist())
-        assert "README.md" in names and "LIST.xlsx" in names
+        assert {"README.md", "wordpress_ready.csv"} <= names
+        assert "validation_issues.csv" not in names
         assert "images/WM-A_1.webp" in names
-        assert "## Coverage" in zf.read("README.md").decode("utf-8")
+        assert not {"LIST.xlsx", "input_filled.xlsx",
+                    "input_filled_report.md", "enricher.log"} & names
+        readme_c = zf.read("README.md").decode("utf-8")
+        assert "## Coverage" in readme_c
+        assert "amazon" not in readme_c and "croma" not in readme_c
+        assert "input_filled" not in readme_c
+    # the internal archive keeps the operator's files
+    assert (dest / "input_filled.xlsx").exists()
+    assert (repo / "batches" / "pack-1_client" / "README.md").exists()
 
 
 def test_archive_survives_a_zip_that_cannot_be_written(tmp: Path):
