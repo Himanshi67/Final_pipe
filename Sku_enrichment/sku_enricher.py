@@ -41,6 +41,14 @@ from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit
 
 import client_config
 
+# Tier 0 of the URL search (local sitemap index + retailer site search). An
+# OPTIONAL import: the mirror copies (Sku_enrichment\, _push_export\) ship
+# without url_index.py, and must keep working exactly as before.
+try:
+    import url_index
+except ImportError:                    # pragma: no cover - mirror copies
+    url_index = None
+
 # A comma-joined URL list cannot be split on commas alone: Amazon's rendition
 # modifiers legitimately contain them (`._AC_UL165_SR165,165_.jpg`), and a plain
 # split shredded those into fragments like '165_.jpg'. Seen live losing 7 of 12
@@ -190,6 +198,11 @@ FETCH_TIMEOUT = 30        # seconds
 MERGE_BUDGET = 2          # extra pages fetched purely to complete a verified
                           # row (see the price hunt at the end of lookup_sku)
 MAX_SPECS = 24            # spec-table rows kept per product
+# Owner rule (2026-11-19): the key-features paragraph, the short description
+# and the long description each show at most this many RELEVANT spec points
+# (app.py imports it; the Brand / Product SKU template rows do not count).
+# The 24 scraped rows above still feed the WooCommerce attributes.
+KEY_POINTS_MAX = 6
 SPECS_ENABLED = True      # scrape the page's spec table (--no-specs turns off)
 
 OUT_COLS = ["title", "regular price", "sale price", "url_link", "image_url",
@@ -227,7 +240,8 @@ CACHE_ENABLED = True
 CACHE_TTL_DAYS = 14.0
 CACHE_REFRESH = False     # bypass reads but still write: force a fresh fetch
 CACHE_STATS = {"page_hit": 0, "page_miss": 0, "page_write": 0,
-               "search_hit": 0, "search_miss": 0, "search_write": 0}
+               "search_hit": 0, "search_miss": 0, "search_write": 0,
+               "sitesearch_hit": 0, "sitesearch_miss": 0, "sitesearch_write": 0}
 
 # what the run actually spent, for the batch report. serper.dev bills per
 # search call, so a cached search is a credit not spent.
@@ -239,7 +253,17 @@ RUN_STATS = {"serper_calls": 0, "ddg_calls": 0, "pages_fetched": 0,
              "client": client_config.DEFAULT_CLIENT,
              # how the run ended: "done" | "user" (Ctrl+C) | "budget"
              # (--budget hit). Copied into the report header and the ledger.
-             "stopped_by": "done"}
+             "stopped_by": "done",
+             # tier 0 (url_index.py): what the free URL sources did. A row
+             # resolved here spent no search at all.
+             "index_lookups": 0, "index_candidates": 0, "rows_by_index": 0,
+             "sitesearch_calls": 0, "rows_by_sitesearch": 0,
+             "rows_web_search": 0,
+             # uncached queries NOT sent because a free tier-0 source already
+             # answered "not there" (croma site search / a fresh brand
+             # sitemap), and uncached queries never sent because the
+             # incremental mode stopped early (winner or fetch budget spent)
+             "queries_skipped_dup": 0, "queries_skipped_early": 0}
 
 # --budget N, as a module var so the refusal can sit in front of EVERY search
 # and not only between rows (item 4). One row fires 3-5 tier-1 queries, so a
@@ -247,6 +271,21 @@ RUN_STATS = {"serper_calls": 0, "ddg_calls": 0, "pages_fetched": 0,
 # this, the spend can never exceed N. 0 = unlimited. main() rebinds it.
 SERPER_BUDGET = 0
 _budget_warned = False
+
+# [serper] query_mode / search_order of the resolved client (main() rebinds
+# them; --search-order overrides the order). The defaults below are what an
+# import, --probe and the tests get.
+#   QUERY_MODE   "incremental": a tier's CACHED queries are read first (free),
+#                then its uncached queries go out ONE AT A TIME, each followed
+#                by a crawl, and sending stops at the first complete listing
+#                or when the SKU's page-fetch budget is spent.
+#                "batch": every query of a tier goes out before any crawl
+#                (the behaviour before 2026-11-19).
+#   SEARCH_ORDER "paid_first": serper.dev, DuckDuckGo only when serper fails.
+#                "free_first": DuckDuckGo first, serper only when DuckDuckGo
+#                gives no result.
+QUERY_MODE = "incremental"
+SEARCH_ORDER = "paid_first"
 
 # BYOK (item 4): which env var holds the serper.dev key. main() rebinds it
 # from [serper] api_key_env of the resolved client; the default keeps
@@ -317,7 +356,8 @@ def cache_put(kind, key, data):
         with gzip.open(tmp, "wt", encoding="utf-8") as f:
             json.dump({"key": key, "ts": time.time(), "data": data}, f)
         tmp.replace(path)            # atomic: a killed run leaves no half file
-        CACHE_STATS[("page_write" if kind == "page" else "search_write")] += 1
+        stat = f"{kind}_write"       # page_write / search_write / sitesearch_write
+        CACHE_STATS[stat] = CACHE_STATS.get(stat, 0) + 1
     except Exception:
         pass
 
@@ -344,6 +384,12 @@ def cache_info():
         f"{n - pages} search(es))")
     log(f"  entries expire after {CACHE_TTL_DAYS:g} day(s) "
         f"(--cache-ttl, 0 = never)")
+    if url_index is not None:
+        try:
+            for line in url_index.stats_lines():
+                log(line)
+        except Exception as e:           # the cache report must not crash
+            log(f"URL index: unreadable ({type(e).__name__})")
 
 
 def cache_clear():
@@ -460,6 +506,229 @@ def clean_title(t):
             t = stripped
         t = re.sub(r"\s+online\s*$", "", t, flags=re.I).strip()
     return t
+
+
+# ============================ content firewall ============================
+# Owner rule (2026-11-19): NOTHING that belongs to the SOURCE RETAILER may
+# reach a field we write - title, descriptions, key features, attributes, SEO
+# meta, tags. That is: retailer and marketplace-seller names, "sold by" /
+# "fulfilled by", EMI, bank/card offers, cashback, coupons, exchange offers,
+# delivery and pincode text, return/replacement policy, the retailer's
+# warranty-service or customer-care text, badges, ratings and review counts,
+# URLs, phone numbers and e-mail addresses.
+#
+# This block is the ONE source of truth. usable_spec() below applies it while
+# scraping; app.py imports it to clean already-enriched *_filled.xlsx sheets
+# at build time (no re-scrape needed); validate_csv.py runs content_hits()
+# over every written field as a blocking QA check.
+#
+# The product's OWN brand is never a retailer name: pass it as `brand=` so a
+# Croma-brand kettle keeps "Croma" and an Amazon Basics product keeps
+# "Amazon". Genuine product features that contain a retailer word survive by
+# design: "Amazon Alexa built-in", "Amazon Fire TV", "Amazon Prime Video".
+
+# Retailers, marketplaces and the big marketplace sellers. Matched on word
+# boundaries, case-insensitive; a space also matches no space ("TataCliq").
+RETAILER_NAMES = (
+    "amazon", "flipkart", "croma", "reliance digital", "jiomart",
+    "vijay sales", "tata cliq", "poorvika", "sangeetha", "bajaj electronics",
+    "electronics mart", "snapdeal", "paytm mall", "shopclues", "meesho",
+    "myntra", "moglix", "indiamart", "great eastern", "sathya",
+    "pai international", "adishwar", "girias", "viveks", "lotus electronics",
+    "kohinoor",
+    # common marketplace sellers
+    "cloudtail", "appario", "retailnet", "supercomnet",
+)
+# "amazon" followed by one of these is a product feature, not the retailer
+_AMAZON_FEATURE = (r"(?!\s*(?:alexa|fire\s*tv|fire\s*stick|echo|prime|music|"
+                   r"kindle|basics))")
+# an optional domain suffix is part of the name ("Amazon.in", "Croma.com")
+RETAILER_RE = re.compile(
+    r"\b(?:" + "|".join(
+        re.escape(n).replace(r"\ ", r"\s*") + r"(?:\.(?:co\.in|com|in))?"
+        + (_AMAZON_FEATURE if n == "amazon" else "")
+        for n in sorted(RETAILER_NAMES, key=len, reverse=True)) + r")\b", re.I)
+
+# Commerce and promo wording: offers, EMI, delivery, returns, seller lines,
+# badges, ratings, cart furniture. A hit anywhere in a label, a value or a
+# title disqualifies it. Each alternative is anchored on word boundaries;
+# a few carry a guard where the same word is also a genuine spec
+# ("EMI filter", "Ion exchange resin", "Heat exchanger").
+COMMERCE_RE = re.compile(r"""
+      cash\s?back | \bcoupons?\b | \bvouchers?\b | \bpromo | superdost
+    | super\s?coins? | \bbank\s+offers? | \bcard\s+offers? | \bspecial\s+offers?
+    | \bexchange\s+offers? | (?<!ion\s)(?<!ion-)(?<!heat\s)\bexchange\b
+    | \bno[\s-]?cost\s+emi\b | \bemi\b(?!\s*(?:filter|protection|shield|suppress))
+    | instant\s+discount | %\s*off\b | flat\s*off | free\s+gift
+    | \bt\s?&\s?c\b | terms\s+(?:and\s+conditions\s+)?apply
+    | \bpin\s?codes?\b | \bdelivery\s+by\b | \bfree\s+delivery\b
+    | \b(?:cash|pay)\s+on\s+delivery\b | \bcod\b(?!\s*(?:reduction|removal|level))
+    | \b\d+\s*days?\s+(?:easy\s+)?(?:returns?|replacements?|exchanges?)\b
+    | \b(?:non[\s-]?)?returnable\b | \beasy\s+returns?\b
+    | \bsold\s+by\b | \bfulfilled\s+by\b | \bships\s+from\b
+    | \bassured\b | amazon'?s\s+choice | \bbest[\s-]?sellers?\b | \bsponsored\b
+    | \bratings\b | \breviews\b | \b\d[\d,.]*\s*k?\+?\s*(?:ratings?|reviews?)\b
+    | \bout\s+of\s+5\s+stars\b
+    | \badd\s+to\s+(?:cart|bag|basket|wish\s?list)\b | \bbuy\s+now\b
+    | \bin\s+stock\b | \bout\s+of\s+stock\b | \bonly\s+\d+\s+left\b
+    | \blimited\s+time\s+deal\b | \bdeal\s+of\s+the\s+day\b | \blightning\s+deal\b
+    """, re.I | re.X)
+
+# The retailer's warranty-service / customer-care / installation text. A plain
+# warranty DURATION ("2 Years Comprehensive, 10 Years on Compressor") passes.
+SERVICE_RE = re.compile(r"""
+      \bcustomer\s*(?:care|support|service)s?\b | \bservice\s*cent(?:er|re)s?\b
+    | \btoll[\s-]?free\b | \bhelpline\b | \bcall\s+us\b | \bcontact\s+us\b
+    | \btechnician\s+visit | \bbrand\s+authori[sz]ed\s+service
+    | \b(?:warranty|service)\s+(?:is\s+)?(?:provided|serviced|handled|fulfilled)\s+by\b
+    | \bfree\s+installation\b | \binstallation\s+(?:and|&)\s+demo\b
+    | \binstallation\s+charges?\b
+    """, re.I | re.X)
+
+# URLs: any scheme or www., or a bare lower-case domain ("amazon.in"). The
+# bare form is case-SENSITIVE on purpose so "Made in India.Net Wt" cannot hit.
+URL_RE = re.compile(r"(?i:https?://\S+|\bwww\.\S+)"
+                    r"|\b[a-z][a-z0-9-]*\.(?:co\.in|com|in|net|org|store|shop)\b")
+EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+# Indian numbers: mobile (+91 optional, 98765 43210 too), toll-free 1800/1860,
+# STD landline 0XX-XXXXXXXX. \b on both ends keeps a 13-digit EAN out.
+PHONE_RE = re.compile(r"(?:\+91[\s-]?)?\b[6-9]\d{4}[\s-]?\d{5}\b"
+                      r"|\b18[06]0[\s-]?\d{3}[\s-]?\d{3,4}\b"
+                      r"|\b0\d{2,4}[\s-]\d{6,8}\b")
+
+# ONE merged spec-LABEL deny list (was split between this file and app.py):
+# marketplace bookkeeping and commerce rows, never product facts. Anchored on
+# the START of the label. Guards keep "Installation Type" and "Manufacturer
+# Warranty" (real specs); "Warranty" itself is NOT here - its VALUE is judged
+# by content_ok, so "2 Years" passes and "Contact customer care" does not.
+# Owner rule (2026-11-19, second decision): the PRODUCT's own size and weight
+# are product facts and pass - "Product Dimensions", "Item Dimensions",
+# "Dimensions (LxWxH)", "Item Weight", "Product Weight", "Net Weight",
+# "Weight" (app.canon_spec_label names them "Dimensions" / "Weight"). The
+# box's size and weight do not: "Package ...", "Packaging ...", "Shipping ...".
+SPEC_LABEL_DENY_RE = re.compile(
+    r"^(?:asin|fsn|item\s+model\s+number|best\s+sellers?\s+rank|"
+    r"date\s+first\s+available|customer\s+(?:reviews?|care|support|service)|"
+    r"packer|importer|"
+    r"manufacturer(?!\s*warranty)|country\s+of\s+origin|net\s+quantity|"
+    r"generic\s+name|included\s+components|packag(?:e|ed|ing)|shipping|"
+    r"sales\s+package|in\s+the\s+box|seller|sold\s+by|fulfilled\s+by|"
+    r"delivery|returns?|replacement|warranty\s+summary|warranty\s+service|"
+    r"service\s+type|installation(?!\s*type)|emi|offers?|price|mrp|discount|"
+    r"availability|stock|share|compare|quantity|add\s+to|buy|description|"
+    r"about\s+this\s+item|highlights?|features?|specifications?|overview|"
+    r"reviews?|ratings?|q\s?&\s?a|faq|sku|ean|upc|hsn|gst|tax|"
+    # owner decision 2026-11-19: Gross Weight (product + packing) is not
+    # written. Product / Item / Net Weight still pass.
+    r"gross\s+weight|weight\s*[(\[]?\s*gross)\b", re.I)
+
+# A spec VALUE that is itself a commerce column heading or button text
+# ("Purchase Price", "Offer Price", "MRP", "EMI Options", "Buy Now") is page
+# furniture: no product fact reads like that. FULL match only, so a real value
+# that merely contains one of these words ("Low Cost Maintenance") passes;
+# label-side commerce words are SPEC_LABEL_DENY_RE.
+SPEC_VALUE_IS_LABEL_RE = re.compile(
+    r"^(?:(?:purchase|offer|sale|selling|special|best|final|deal|list|market|"
+    r"regular|retail|our|your|effective|exchange|buy[\s-]?back|discounted|"
+    r"original|old|new)\s+)?"
+    r"(?:price|prices|mrp|m\.r\.p\.?|cost|amount|emi(?:\s+options?)?|"
+    r"offers?|discount|savings?)$"
+    r"|^(?:buy\s+now|add\s+to\s+(?:cart|bag|basket|wish\s?list)|"
+    r"notify\s+me|check\s+(?:availability|pincode|delivery)|"
+    r"view\s+(?:details|offers?|plans?)|know\s+more|learn\s+more|"
+    r"compare|share|in\s+stock|out\s+of\s+stock)$", re.I)
+
+# Labels whose value IS the product's brand (so it is never a "retailer").
+_BRAND_LABELS = ("brand", "brand name")
+
+# Badge words removed from a title by content_clean().
+BADGE_RE = re.compile(
+    r"amazon'?s\s+choice|\bflipkart\s+assured\b|\bf-?assured\b|\bassured\b|"
+    r"(?:#\s*1\s+)?\bbest[\s-]?sellers?\b|\bsponsored\b|\blimited\s+time\s+deal\b|"
+    r"\bdeal\s+of\s+the\s+day\b|\blightning\s+deal\b", re.I)
+# "Amazon Exclusive" / "only on Flipkart" / "available at Croma" in a title
+_RETAILER_PHRASE_RE = re.compile(
+    r"\b(?:(?:only|exclusively?|available)\s+(?:on|at)\s+)?(?:"
+    + RETAILER_RE.pattern[5:-3] + r")(?:\s+exclusive)?\b", re.I)
+
+
+def _alnum(text):
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def content_hits(text, *, brand=""):
+    """Every retailer-owned term found in `text`, in order (empty = clean).
+    The product's own `brand` is never counted as a retailer name."""
+    text = str(text or "")
+    if not text.strip():
+        return []
+    own = _alnum(brand)
+    hits = []
+    for m in RETAILER_RE.finditer(text):
+        name = _alnum(m.group(0))
+        if name and own and name in own:
+            continue                      # the product's own brand
+        hits.append(m.group(0))
+    for pattern in (COMMERCE_RE, SERVICE_RE, URL_RE, EMAIL_RE, PHONE_RE):
+        hits.extend(m.group(0).strip() for m in pattern.finditer(text))
+    return hits
+
+
+def content_ok(text, *, brand=""):
+    """False when `text` holds anything that belongs to the source retailer
+    (see the block comment above)."""
+    return not content_hits(text, brand=brand)
+
+
+def spec_row_ok(label, value, *, brand=""):
+    """A (label, value) row passes the firewall: its label is not on the
+    merged deny list and neither part carries retailer content. A 'Brand'
+    row's value is the brand itself, so it is judged against itself."""
+    label, value = str(label or "").strip(), str(value or "").strip()
+    if SPEC_LABEL_DENY_RE.match(label):
+        return False
+    if SPEC_VALUE_IS_LABEL_RE.match(value):
+        return False                      # the "value" is a commerce UI label
+    if label.lower() in _BRAND_LABELS:
+        brand = brand or value
+    return content_ok(label, brand=brand) and content_ok(value, brand=brand)
+
+
+def content_clean(text, *, brand=""):
+    """A product TITLE with retailer content removed: store prefixes/suffixes
+    (clean_title), bracketed promo fragments, badge words, retailer-tagged
+    leading/trailing segments ('... | Sold by Cloudtail') and URLs. Never
+    returns '' for a title that had a product name - it falls back to the
+    clean_title() result."""
+    base = clean_title(text) or re.sub(r"\s+", " ", str(text or "")).strip()
+    t = base
+
+    def _drop_if_dirty(m):
+        return " " if content_hits(m.group(0), brand=brand) else m.group(0)
+
+    t = re.sub(r"[(\[{][^()\[\]{}]*[)\]}]", _drop_if_dirty, t)
+    t = BADGE_RE.sub(" ", t)
+    t = URL_RE.sub(" ", t)
+    # "Amazon Exclusive" / "only on Flipkart" in the running text
+    t = _RETAILER_PHRASE_RE.sub(_drop_if_dirty, t)
+    # retailer-tagged segments at either end, split on a spaced separator
+    for _ in range(3):
+        seps = list(re.finditer(r"\s+[|:–—-]\s+", t))
+        if seps:
+            last, first = seps[-1], seps[0]
+            if (content_hits(t[last.end():], brand=brand)
+                    and t[:last.start()].strip()):
+                t = t[:last.start()]
+                continue
+            if (content_hits(t[:first.start()], brand=brand)
+                    and t[first.end():].strip()):
+                t = t[first.end():]
+                continue
+        break
+    t = re.sub(r"\(\s*\)|\[\s*\]", " ", t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" -|,:;–—")
+    t = clean_title(t)                 # a "Buy ..." exposed by a removed prefix
+    return t if re.search(r"[A-Za-z0-9]", t) else base
 
 
 def domain_of(url):
@@ -783,10 +1052,22 @@ def collect_images(soup, html, base_url=""):
 # (-21%) for byte-identical output. (\b alone will not do it: the label may
 # legitimately end in '.', as in 'M.R.P.', and \b after an optional dot is not
 # the boundary you want.)
+#
+# Label, currency sign and digits may each sit in their OWN element, with the
+# ':' after the tags rather than before them. haier.com (2026-11-19):
+#   <span>MRP</span></div><div><span>: ₹</span></div>
+#   <div><span class="js_mop">37790</span>
+# So the gap between label and currency, and between currency and digits, is
+# a short window of tags, whitespace and ':' / '-' only (no text, no other
+# number) - structural, not a haier-specific selector. Each window is
+# `\s*((tag|punct)\s*){0,N}`, which cannot backtrack exponentially.
+# 'MOP' (market operating price) is deliberately NOT a label here: owner
+# decision 2026-11-19, MOP is not used as a price.
+_MRP_GAP = r"\s*(?:(?:<[^>]{0,120}>|[:\-])\s*){0,%d}"
 MRP_LABEL_RE = re.compile(
     r"\b(?:M\.?R\.?P\.?|Maximum Retail Price|List Price|Was)(?![A-Za-z])\s*"
-    r"(?:\([^)]{0,40}\))?\s*[:\-]?\s*(?:<[^>]{0,120}>\s*){0,6}"
-    r"(?:₹|Rs\.?|INR)\s*([\d][\d,.]*)", re.I)
+    r"(?:\([^)]{0,40}\))?" + (_MRP_GAP % 10)
+    + r"(?:₹|Rs\.?|INR)" + (_MRP_GAP % 8) + r"([\d][\d,.]*)", re.I)
 
 # Substrings that mark a strike-through price in a class name. Matched
 # case-sensitively against the raw class string, which is what the CSS
@@ -830,10 +1111,22 @@ def strike_elements(soup, limit=40):
     return out
 
 
+# A struck-through price in another currency is page furniture, never this
+# product's Indian MRP. samsung.com/in ships a hidden UK "step buying" template
+# (<del class="was-text">£2,399.00</del>) on every TV page, and the old sweep
+# took it as the MRP of a 32-inch TV (smoke 2026-11-19). Matched on the
+# element's own text, so a "₹" price beside it is unaffected.
+FOREIGN_CURRENCY_RE = re.compile(
+    r"[£$€¥]|\b(?:USD|GBP|EUR|AUD|CAD|SGD|AED|US\$)\b", re.I)
+
+
 def mrp_from_strike(soup, sale=""):
     ps = price_value(sale)
     for el in strike_elements(soup):
-        v = clean_price(el.get_text(" ", strip=True))
+        text = el.get_text(" ", strip=True)
+        if FOREIGN_CURRENCY_RE.search(text):
+            continue                  # another market's price, not this MRP
+        v = clean_price(text)
         pv = price_value(v)
         if pv and (ps is None or pv > ps):
             return v
@@ -1090,6 +1383,15 @@ def web_search(query):
     CACHE_STATS["search_miss"] += 1
     NET_CALLS += 1
 
+    # free_first: DuckDuckGo answers first; serper is paid for only when it
+    # gives nothing. The cache key is the bare query whatever the provider,
+    # so entries written in either order stay valid in the other.
+    if SEARCH_ORDER == "free_first":
+        res = ddg_search(query)
+        if res:
+            cache_put("search", query, res)
+            return res
+
     if SERPER_BUDGET and RUN_STATS["serper_calls"] >= SERPER_BUDGET:
         # The budget is spent. Refuse the credit HERE rather than after the
         # row, so the queries still in flight for this SKU cannot overshoot -
@@ -1104,10 +1406,300 @@ def web_search(query):
     if res is not None:      # serper answered (even if empty) - trust Google
         cache_put("search", query, res)
         return res
+    if SEARCH_ORDER == "free_first":
+        return []            # DuckDuckGo was already asked, and gave nothing
     res = ddg_search(query)
     if res:
         cache_put("search", query, res)
     return res
+
+
+def search_is_cached(query):
+    """True when web_search(query) would be answered from the cache - free,
+    no provider asked. Reads only; counts nothing."""
+    return cache_get("search", query) is not None
+
+# ------------------------- tier 0: URLs without a search ------------------
+# Two free sources run BEFORE web_search (url_index.py): the local sitemap
+# index (0a) and the retailers' own search endpoints (0b). Their URLs are
+# only CANDIDATES - lookup_sku puts them through the same URL screens as a
+# search result and the unchanged assess() verdict. Off unless main() turns
+# it on, so --probe, imports and tests behave exactly as before.
+
+URL_INDEX_ON = False          # 0a: the sitemap index
+SITE_SEARCH_ON = False        # 0b: retailer site search
+URL_INDEX_SOURCES = []        # enabled url_index.Source list for this client
+SITE_SEARCH_RULES = []        # enabled url_index.SiteSearchRule list, in order
+INDEX_FETCH_BUDGET = 3        # pages tier 0a may fetch per SKU
+SITE_SEARCH_FETCH_BUDGET = 3  # pages EACH site-search endpoint may fetch per SKU
+# The search tiers keep their full FETCH_BUDGET on top of these, so a wrong
+# index match can never starve the search that would have found the product.
+_SITE_FETCHER = None          # url_index.Fetcher: robots.txt + host politeness
+_SITE_SEARCH_SKIP = set()     # endpoints switched off for the rest of this run
+_SITE_KEYS = {}               # rule name -> page-embedded keys. MEMORY ONLY:
+                              # never cached, logged, reported or written.
+
+
+INDEX_FRESH_DOMAINS = set()   # domains of index sources that are fresh AND
+                              # hold URLs (configure_url_index fills it)
+
+# What the LAST tier-0 call said, read by lookup_sku right after the call to
+# decide whether a paid query only repeats a question a free source already
+# answered "not there". "ok" = it ran and answered; anything else (error,
+# blocked, off, not run) keeps the paid query.
+_INDEX_OUTCOME = {"state": "", "hits": []}
+_SITE_SEARCH_OUTCOME = {"state": ""}
+
+
+def index_candidates(brand, model):
+    """[(url, slug-as-title)] from the local index. Never raises."""
+    _INDEX_OUTCOME.update(state="", hits=[])
+    if not (URL_INDEX_ON and url_index is not None and model):
+        return []
+    RUN_STATS["index_lookups"] += 1
+    site = BRAND_SITES.get(brand.lower()) if brand else None
+    try:
+        hits = url_index.lookup(model, brand, sources=URL_INDEX_SOURCES,
+                                rank=domain_rank,
+                                brand_domains=(site,) if site else ())
+    except Exception as e:
+        log(f"      url index lookup failed ({type(e).__name__}) - skipped")
+        _INDEX_OUTCOME["state"] = "error"
+        return []
+    _INDEX_OUTCOME.update(state="ok", hits=list(hits))
+    return [(h["url"], h["title"]) for h in hits]
+
+
+def _same_site(host, site):
+    """'lg.com' vs 'lg.com' / 'www.lg.com' / 'api.croma.com' vs 'croma.com'."""
+    host, site = str(host or "").lower(), str(site or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return bool(host and site) and (host == site or host.endswith("." + site))
+
+
+def brand_index_says_absent(brand_site):
+    """True when the URL index has a FRESH, non-empty source for the brand's
+    own domain and the lookup just made for this SKU found no URL on it.
+    A lookup that errored, that was cut at its candidate limit (a brand hit
+    may sit beyond it), or a stale / empty / missing source all say False:
+    then the paid brand-site query still runs."""
+    if not brand_site or _INDEX_OUTCOME.get("state") != "ok":
+        return False
+    if not any(_same_site(d, brand_site) or _same_site(brand_site, d)
+               for d in INDEX_FRESH_DOMAINS):
+        return False
+    hits = _INDEX_OUTCOME.get("hits") or []
+    limit = getattr(url_index, "MAX_CANDIDATES", 6) if url_index else 6
+    if len(hits) >= limit:
+        return False
+    return not any(_same_site(h.get("domain") or domain_of(h.get("url", "")),
+                              brand_site) for h in hits)
+
+
+def _site_off(rule, why):
+    """Switch one endpoint off for the rest of the run, with ONE log line."""
+    if rule.name not in _SITE_SEARCH_SKIP:
+        _SITE_SEARCH_SKIP.add(rule.name)
+        log(f"      site search {rule.name} off for this run: {why}")
+
+
+def _site_get(rule, url, keys=None):
+    """One live GET through the robots-aware fetcher, or None when robots.txt
+    does not allow it (the endpoint is then off for the run). Returns
+    (Response, crawl_delay). `keys` are redacted from anything logged."""
+    global _SITE_FETCHER
+    try:
+        if _SITE_FETCHER is None:
+            _SITE_FETCHER = url_index.Fetcher(log=log)
+        robots = _SITE_FETCHER.robots(url)
+        allowed = robots.allowed(url)
+    except Exception as e:
+        _site_off(rule, f"robots.txt check failed ({type(e).__name__})")
+        return None, 0.0
+    if not allowed:
+        parts = urlsplit(url)
+        shown = url_index.redact(f"{parts.netloc}{parts.path}", keys)
+        _site_off(rule, f"robots.txt does not allow {shown}"
+                  + (f" ({robots.reason})" if robots.reason else ""))
+        return None, 0.0
+    try:
+        r = _SITE_FETCHER.get(url)
+    except Exception as e:
+        r = url_index.Response(error=type(e).__name__)
+    return r, float(robots.crawl_delay or 0)
+
+
+def _site_keys(rule):
+    """The keys a rule's url_template needs, read from the hidden inputs of
+    rule.key_page once per run. {} when the rule needs none; None when they
+    cannot be read (the endpoint is then off for the run)."""
+    global NET_CALLS
+    if not rule.key_inputs:
+        return {}
+    if rule.name in _SITE_KEYS:
+        return _SITE_KEYS[rule.name]
+    _net_before = NET_CALLS
+    NET_CALLS += 1
+    r, delay = _site_get(rule, rule.key_page)
+    polite_sleep(max(0.6, delay), max(1.4, delay + 0.5), since=_net_before)
+    if r is None:
+        return None
+    if r.status != 200 or not r.body:
+        _site_off(rule, f"key page {r.error or f'http {r.status}'}")
+        return None
+    keys = url_index.read_hidden_inputs(r.text(), rule.key_inputs)
+    missing = [k for k in rule.key_inputs if not keys.get(k)]
+    if missing:
+        _site_off(rule, f"key page has no {', '.join(missing)} input")
+        return None
+    _SITE_KEYS[rule.name] = keys
+    return keys
+
+
+def site_search(rule, model):
+    """[(url, result name)] from ONE retailer search endpoint, filtered to
+    results that carry the model code. Cached like web_search (namespace
+    'sitesearch'); robots.txt is checked before the first live call to an
+    endpoint, and polite_sleep fires on every live call. Never raises."""
+    global NET_CALLS
+    _SITE_SEARCH_OUTCOME["state"] = "off"
+    if not (SITE_SEARCH_ON and url_index is not None and model):
+        return []
+    if rule.name in _SITE_SEARCH_SKIP:
+        return []
+    _SITE_SEARCH_OUTCOME["state"] = "error"   # until it has really answered
+    ckey = url_index.search_cache_key(rule, model)   # never holds a key value
+    text = cache_get("sitesearch", ckey)
+    if text is not None:
+        CACHE_STATS["sitesearch_hit"] += 1
+        log(f"      (cached site search: {rule.name})")
+    else:
+        keys = _site_keys(rule)
+        if keys is None:
+            return []
+        url = url_index.build_search_url(rule, model, keys)
+        CACHE_STATS["sitesearch_miss"] += 1
+        log(f"    site search: {rule.name} {model}")
+        _net_before = NET_CALLS
+        NET_CALLS += 1
+        r, delay = _site_get(rule, url, keys)
+        if r is None:
+            return []
+        RUN_STATS["sitesearch_calls"] += 1
+        polite_sleep(max(0.6, delay), max(1.4, delay + 0.5), since=_net_before)
+        if r.status != 200 or not r.body:
+            if rule.key_inputs:          # a keyed API that fails has changed
+                _site_off(rule, f"search answered {r.error or f'http {r.status}'}")
+            else:
+                log(f"      site search {rule.name}: {r.error or f'http {r.status}'}")
+            return []
+        text = r.text()
+        if (rule.key_inputs and rule.extract == "json"
+                and not url_index.json_shape_ok(rule, text)):
+            _site_off(rule, "the answer no longer has the expected JSON shape")
+            return []
+        cache_put("sitesearch", ckey, text)
+    try:
+        out = url_index.extract_site_search(rule, text, model)
+        _SITE_SEARCH_OUTCOME["state"] = "ok"
+        return out
+    except Exception as e:
+        log(f"      site search {rule.name}: unreadable answer ({type(e).__name__})")
+        return []
+
+
+def tier0_disabled_reason(args, cfg):
+    """Why tier 0 must stay off for this run, or '' when it may run."""
+    if getattr(args, "crawl_urls", False):
+        return "--crawl-urls crawls the sheet's links and makes no searches"
+    if url_index is None:
+        return "url_index.py is not next to this script"
+    if getattr(args, "no_url_index", False):
+        return "--no-url-index"
+    if os.environ.get("PIPELINE_URL_INDEX", "").strip().lower() in (
+            "off", "0", "false", "no"):
+        return "$PIPELINE_URL_INDEX is off"
+    ui = getattr(cfg, "url_index", None)
+    if ui is not None and not ui.enabled:
+        return f"[url_index] enabled = false in the {cfg.slug} client.toml"
+    return ""
+
+
+def configure_url_index(args, cfg, refresh=True):
+    """Turn tier 0 on or off for this run, and refresh stale sitemap sources
+    before the first SKU. Never raises: a broken index means 'search as
+    before', never a failed batch."""
+    global URL_INDEX_ON, SITE_SEARCH_ON, URL_INDEX_SOURCES, SITE_SEARCH_RULES
+    URL_INDEX_ON = SITE_SEARCH_ON = False
+    URL_INDEX_SOURCES, SITE_SEARCH_RULES = [], []
+    _SITE_SEARCH_SKIP.clear()
+    _SITE_KEYS.clear()
+    INDEX_FRESH_DOMAINS.clear()
+    why = tier0_disabled_reason(args, cfg)
+    if why:
+        log(f"URL index: off ({why})")
+        return False
+    ui = cfg.url_index
+    try:
+        sources, rules = url_index.load_config(extra_sources=ui.extra_sources,
+                                               disable=ui.disable)
+    except Exception as e:
+        log(f"URL index: off ({e})")
+        return False
+    URL_INDEX_SOURCES, SITE_SEARCH_RULES = sources, rules
+    max_age = getattr(args, "index_max_age", None)
+    max_age = ui.max_age_days if max_age is None else max_age
+    if sources and refresh:
+        try:
+            names = ([s.name for s in sources]
+                     if getattr(args, "refresh_index", False)
+                     else url_index.stale_sources(sources, max_age))
+            if names:
+                log(f"URL index: refreshing {len(names)} source(s) "
+                    f"({', '.join(names)}) - one-off, before the first SKU")
+                url_index.refresh(sources, names=names, log=log)
+        except Exception as e:
+            log(f"URL index: refresh failed ({type(e).__name__}: {e}) - "
+                f"using what the index already holds")
+    URL_INDEX_ON, SITE_SEARCH_ON = bool(sources), bool(rules)
+    log(f"URL index: {len(sources)} sitemap source(s), {len(rules)} site "
+        f"search(es) - tried before any paid search")
+    if URL_INDEX_ON or SITE_SEARCH_ON:
+        index_health(sources, max_age)
+    return URL_INDEX_ON or SITE_SEARCH_ON
+
+
+def index_health(sources, max_age_days):
+    """Fill INDEX_FRESH_DOMAINS and warn ONCE when the index is empty.
+
+    An empty index makes tier 0a find nothing, so every row falls through to
+    the paid search - silently, which is how a missing refresh went unseen.
+    Never raises; returns the number of URLs the enabled sources hold."""
+    INDEX_FRESH_DOMAINS.clear()
+    try:
+        rows = url_index.stats() if url_index is not None else []
+    except Exception:
+        rows = []
+    by_name = {r.get("name"): r for r in rows or ()}
+    now, total, with_rows = time.time(), 0, 0
+    for s in sources or ():
+        r = by_name.get(s.name)
+        n = int((r or {}).get("url_count") or 0)
+        total += n
+        if not n:
+            continue
+        with_rows += 1
+        last = (r or {}).get("last_refresh") or 0
+        if max_age_days is not None and last and now - last <= float(max_age_days) * 86400:
+            dom = s.domain or (url_index.domain_of(s.root) if url_index else "")
+            if dom:
+                INDEX_FRESH_DOMAINS.add(dom.lower())
+    if not with_rows or not total:
+        log("  !! WARNING: the URL index is EMPTY (0 sources with URLs, 0 URLs) "
+            "- tier 0 finds nothing and every row falls to the paid search. "
+            r"Fix: .venv\Scripts\python.exe url_index.py refresh")
+    return total
 
 # -------------------------------- fetching -------------------------------
 
@@ -1812,7 +2404,8 @@ def parse_amazon(html, soup):
     title = mrp = sale = ""
     el = soup.select_one("#productTitle")
     if el:
-        title = el.get_text(strip=True)
+        # same title cleaner as every other parser (store suffixes, "Buy ...")
+        title = clean_title(el.get_text(strip=True))
     for sel in ("#corePriceDisplay_desktop_feature_div span.a-price:not(.a-text-price) span.a-offscreen",
                 "#apex_desktop span.a-price:not(.a-text-price) span.a-offscreen",
                 "span.a-price:not(.a-text-price) span.a-offscreen"):
@@ -1880,6 +2473,8 @@ def parse_flipkart(html, soup):
         el = soup.select_one("span.VU-ZEz") or soup.select_one("span.B_NuCI") or soup.find("h1")
         if el:
             title = el.get_text(strip=True)
+    # same title cleaner as every other parser (store suffixes, "Buy ...")
+    title = clean_title(title)
     if not sale:
         el = soup.select_one("div.Nx9bqj")
         if el:
@@ -2053,30 +2648,15 @@ def parse_generic(html, soup, url=""):
 # lower-priority than the title-derived rows, which are normalised per
 # category; a scraped row only fills a label nothing else supplied.
 
-SPEC_LABEL_DENY_RE = re.compile(
-    # marketplace bookkeeping, not product facts
-    r"^(?:asin|item model number|best sellers? rank|date first available|"
-    r"customer reviews?|product dimensions l?x?w?x?h?|packer|importer|"
-    r"manufacturer|country of origin|net quantity|generic name|included "
-    r"components|item weight|package|seller|delivery|return|warranty summary|"
-    r"emi|offers?|price|mrp|discount|availability|share|compare|quantity|"
-    r"add to|buy|description|about this item|highlights?|features?|"
-    r"specifications?|overview|reviews?|ratings?|q ?& ?a|faq)\b", re.I)
+# The label deny list and the promo/commerce wording are the content-firewall
+# block's SPEC_LABEL_DENY_RE / COMMERCE_RE (next to clean_title) - one merged
+# copy, shared with app.py.
 
 # a value that is really a sentence, a price, or page furniture
 SPEC_VALUE_DENY_RE = re.compile(
     r"^(?:₹|rs\.?\s*\d|see more|show more|read more|view all|n/?a|-|—|yes/no|"
     r"click|select|choose|add to|available|\d+\s*(?:ratings?|reviews?))",
     re.I)
-
-# an offer dressed as a spec row ('SuperDost Cashback: 100 for new SuperDost
-# Users* + 3% or 250 Cashback'). The deny lists above only anchor on the START
-# of a label; promo wording disqualifies the pair wherever it appears, in the
-# label OR the value.
-SPEC_PROMO_RE = re.compile(
-    r"cash\s?back|coupon|voucher|promo|superdost|super\s?coin|bank offer|"
-    r"exchange offer|no.?cost emi|instant discount|%\s*off\b|flat\s*off|"
-    r"free gift|t&c|terms apply", re.I)
 
 SPEC_SPLIT_RE = re.compile(r"\s*[:∶]\s+")
 
@@ -2085,10 +2665,13 @@ def clean_spec_text(value):
     return re.sub(r"\s+", " ", str(value or "")).strip().strip(":∶ ​")
 
 
-def usable_spec(label, value):
+def usable_spec(label, value, brand=""):
     """A (label, value) pair is a real spec only if it reads like one. Without
     this the sweep below returns nav links, review counts and whole
-    paragraphs, all of which would go straight onto the storefront."""
+    paragraphs, all of which would go straight onto the storefront.
+
+    The content firewall (spec_row_ok) runs on label AND value: an offer, a
+    seller line, a phone number or a retailer name is not a product fact."""
     if not label or not value:
         return False
     if not (2 <= len(label) <= 40) or not (1 <= len(value) <= 120):
@@ -2097,10 +2680,10 @@ def usable_spec(label, value):
         return False
     if not re.search(r"[A-Za-z]", label):
         return False
-    if SPEC_LABEL_DENY_RE.match(label) or SPEC_VALUE_DENY_RE.match(value):
+    if SPEC_VALUE_DENY_RE.match(value):
         return False
-    if SPEC_PROMO_RE.search(label) or SPEC_PROMO_RE.search(value):
-        return False                      # an offer, not a product fact
+    if not spec_row_ok(label, value, brand=brand):
+        return False                      # retailer content, not a product fact
     if value.count(".") >= 2 and len(value.split()) > 12:
         return False                      # a paragraph, not a spec value
     if "<" in value or "{" in value:
@@ -2126,6 +2709,18 @@ def jsonld_specs(prods):
     return out
 
 
+def is_header_row(row, cells):
+    """A table's HEADING row: every cell is a <th>, or the row sits in <thead>.
+    Its two cells are both column names, so reading them as 'label: value'
+    invents a fact. samsung.com's buy-back popup table ('Model Name' |
+    'Purchase Price', smoke 2026-11-19) became the spec 'Model Name: Purchase
+    Price' and then the storefront attribute 'Model = Purchase Price'. A real
+    spec row is <th>label</th><td>value</td> or two <td>s, so it still passes."""
+    if all(c.name == "th" for c in cells):
+        return True
+    return row.find_parent("thead") is not None
+
+
 def table_specs(soup):
     """Two-column tables and definition lists, which is how essentially every
     retailer marks a spec sheet up once JSON-LD runs out."""
@@ -2137,6 +2732,8 @@ def table_specs(soup):
             row.find_all(["th", "td"])
         if len(cells) != 2:
             continue
+        if is_header_row(row, cells):
+            continue                      # column headings, not a label/value pair
         label = clean_spec_text(cells[0].get_text(" ", strip=True))
         value = clean_spec_text(cells[1].get_text(" ", strip=True))
         if usable_spec(label, value):
@@ -2868,38 +3465,33 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
     close_hits, weak_hits, strong_hits = [], [], []
     fetched, per_dom, fail_reasons, tried = 0, {}, [], set()
     candidates = []           # every URL any tier surfaced, for hunt_donors
+    budget_end = FETCH_BUDGET  # crawl() stops once `fetched` reaches this
 
-    def run_tier(queries):
-        """Search one tier; returns its NEW candidate URLs, best domains first."""
-        found = []
-        for q, dom in queries:
-            if len(found) >= SEARCH_POOL:
-                break         # the fetch budget can never reach more anyway
-            log(f"    searching: {q}")
-            _net_before = NET_CALLS
-            for r in web_search(q):
-                u = r.get("href", "")
-                if not u or is_blocked(u):
-                    continue
-                if dom and not domain_of(u).endswith(dom):
-                    continue
-                u = canonical_url(u)
-                if u in seen:
-                    continue
-                seen.add(u)
-                if not is_product_url(u):
-                    continue
-                if looks_like_accessory(r.get("title", ""), brand):
-                    log(f"      skipped accessory result: {str(r.get('title'))[:70]}")
-                    continue
-                if not result_looks_relevant(r.get("title", ""), sku, model):
-                    log(f"      skipped off-category result: {str(r.get('title'))[:70]}")
-                    continue
-                found.append(u)
-            polite_sleep(0.6, 1.4, since=_net_before)
-        # Round-robin: take the best URL from EACH domain before any domain's
-        # second. Straight domain_rank order let amazon occupy every fetch
-        # slot, so one hostile site could bury a SKU that flipkart had.
+    def admit(u, title, dom=None):
+        """The URL screens EVERY candidate passes - a search result, an index
+        hit and a site-search hit alike. The canonical URL, or '' if refused."""
+        if not u or is_blocked(u):
+            return ""
+        if dom and not domain_of(u).endswith(dom):
+            return ""
+        u = canonical_url(u)
+        if u in seen:
+            return ""
+        seen.add(u)
+        if not is_product_url(u):
+            return ""
+        if looks_like_accessory(title, brand):
+            log(f"      skipped accessory result: {str(title)[:70]}")
+            return ""
+        if not result_looks_relevant(title, sku, model):
+            log(f"      skipped off-category result: {str(title)[:70]}")
+            return ""
+        return u
+
+    def round_robin(urls):
+        """Round-robin: the best URL from EACH domain before any domain's
+        second. Straight domain_rank order let amazon occupy every fetch
+        slot, so one hostile site could bury a SKU that flipkart had."""
         _nth = {}
 
         def _order(u):
@@ -2907,8 +3499,103 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
             _nth[d] = _nth.get(d, 0) + 1
             return (_nth[d], domain_rank(u))
 
-        found.sort(key=_order)
-        return found
+        return sorted(urls, key=_order)
+
+    def answered_not_there(q, dom):
+        """An UNCACHED `site:` query on a domain whose free tier-0 source
+        already said "not there" for this SKU. A cached query is free and is
+        always read, so a warm-cache replay stays byte-identical."""
+        if not dom or not answered_absent:
+            return False
+        if not any(_same_site(a, dom) for a in answered_absent):
+            return False
+        if search_is_cached(q):
+            return False
+        RUN_STATS["queries_skipped_dup"] += 1
+        log(f"    skipped (free source already said not there): {q}")
+        return True
+
+    def search_into(q, dom, found):
+        log(f"    searching: {q}")
+        _net_before = NET_CALLS
+        for r in web_search(q):
+            u = admit(r.get("href", ""), r.get("title", ""), dom)
+            if u:
+                found.append(u)
+        polite_sleep(0.6, 1.4, since=_net_before)
+
+    def run_tier(queries):
+        """BATCH mode: search the whole tier; returns its NEW candidate URLs,
+        best domains first."""
+        found = []
+        for q, dom in queries:
+            if len(found) >= SEARCH_POOL:
+                break         # the fetch budget can never reach more anyway
+            if answered_not_there(q, dom):
+                continue
+            search_into(q, dom, found)
+        return round_robin(found)
+
+    def run_tier_incremental(queries):
+        """INCREMENTAL mode: one tier, paying for as few queries as possible.
+
+        1. Every query already in the cache is read first - free.
+        2. The uncached queries go out ONE AT A TIME, in build_queries order;
+           after each, the new candidates are crawled.
+        3. Sending stops at the first COMPLETE listing (the condition that
+           ends lookup_sku after a tier), or when this SKU's page-fetch budget
+           is spent - a paid result no fetch can reach is a wasted credit.
+
+        Each step crawls only the first candidate of each domain not yet
+        crawled; the seconds wait for the end of the tier. That keeps batch
+        mode's round-robin rule (every domain's best before any domain's
+        second), so one domain cannot eat the fetch budget early. Returns the
+        complete rec or None; adds the tier's URLs to `candidates`."""
+        found, crawled, pending = [], set(), []
+        for q, dom in queries:
+            if search_is_cached(q):
+                if len(found) < SEARCH_POOL:
+                    search_into(q, dom, found)
+            else:
+                pending.append((q, dom))
+
+        def step():
+            firsts, doms = [], set()
+            for u in found:                    # admit order, as round_robin
+                d = domain_of(u)
+                if d not in doms:
+                    doms.add(d)
+                    firsts.append(u)
+            batch = sorted((u for u in firsts if u not in crawled),
+                           key=domain_rank)    # stable: ties keep admit order
+            crawled.update(batch)
+            return crawl(batch)
+
+        winner = step()
+        for i, (q, dom) in enumerate(pending):
+            if winner:
+                stop = "a complete listing is verified"
+            elif fetched >= budget_end:
+                stop = "the page-fetch budget is spent"
+            elif len(found) >= SEARCH_POOL:
+                break         # batch mode stops here too - not a saving
+            else:
+                stop = ""
+            if stop:
+                left = len(pending) - i
+                RUN_STATS["queries_skipped_early"] += left
+                log(f"    {left} uncached quer{'y' if left == 1 else 'ies'} "
+                    f"not sent: {stop}")
+                break
+            if answered_not_there(q, dom):
+                continue
+            search_into(q, dom, found)
+            winner = step()
+        ordered = round_robin(found)
+        candidates.extend(ordered)
+        if winner:
+            return winner
+        return crawl([u for u in ordered if u not in crawled])
 
     def crawl(batch):
         """Fetch and strictly verify, best domains first. Returns a rec only
@@ -2916,7 +3603,7 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
         anything less is banked in the hit lists for the fallback logic."""
         nonlocal best_strong, best_score, fetched
         for u in batch:
-            if fetched >= FETCH_BUDGET:
+            if fetched >= budget_end:
                 break
             dom = domain_of(u)
             if domain_cooling(dom):
@@ -2971,22 +3658,86 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
                 log(f"      rejected: {reason}")
         return None
 
+    # -- tier 0: URLs from the local sitemap index, then from the retailers'
+    # own search - both free. Same screens (admit), same strict verdict
+    # (crawl -> assess) as a search result; an index or site-search hit is a
+    # candidate, never a match. A complete winner returns with zero searches
+    # spent; a verified-but-incomplete one skips the search tiers exactly as
+    # the `break` below does, and goes to hunt_donors/merge_sources.
+    resolved_by = ""          # 'index' | 'sitesearch' when tier 0 set best_strong
+    skip_search = False
+    # restrict-domains whose free source already answered "not there" for
+    # this SKU: an UNCACHED `site:` query on them is not paid for (G2/G4)
+    answered_absent = set()
+    _INDEX_OUTCOME.update(state="", hits=[])
+    if (URL_INDEX_ON or SITE_SEARCH_ON) and model:
+
+        def tier0(pairs, budget):
+            nonlocal budget_end
+            fresh = [u for u in (admit(u, t) for u, t in pairs) if u]
+            candidates.extend(fresh)
+            budget_end = fetched + budget
+            return fresh, crawl(fresh)
+
+        if URL_INDEX_ON:
+            fresh, winner = tier0(index_candidates(brand, model),
+                                  INDEX_FETCH_BUDGET)
+            RUN_STATS["index_candidates"] += len(fresh)
+            if fresh:
+                log(f"    url index: {len(fresh)} candidate(s)")
+            if winner:
+                RUN_STATS["rows_by_index"] += 1
+                return winner
+            if best_strong:
+                resolved_by = "index"
+            brand_site = BRAND_SITES.get(brand.lower(), "") if brand else ""
+            if brand_index_says_absent(brand_site):
+                answered_absent.add(brand_site)
+        if SITE_SEARCH_ON and not best_strong:
+            for rule in SITE_SEARCH_RULES:
+                pairs = site_search(rule, model)
+                if _SITE_SEARCH_OUTCOME.get("state") == "ok" and not pairs:
+                    # the retailer's own search ran cleanly and does not
+                    # carry this model: its `site:` query would ask again
+                    host = domain_of(rule.url_template.replace("{q}", "x"))
+                    answered_absent.add(host)
+                fresh, winner = tier0(pairs, SITE_SEARCH_FETCH_BUDGET)
+                if winner:
+                    RUN_STATS["rows_by_sitesearch"] += 1
+                    return winner
+                if best_strong:
+                    resolved_by = "sitesearch"
+                    break
+        skip_search = bool(best_strong)
+        budget_end = fetched + FETCH_BUDGET   # the search tiers' own budget
+
     # -- tiers run lazily: search a tier, crawl what it found, and only fall
     # to the next tier when nothing was verified. The old shape ran ALL the
     # searches up front, so every SKU paid for the title queries even when
     # the very first model-code search had already found the listing.
-    for tier in tiers:
-        fresh = run_tier(tier)
-        candidates += fresh
-        winner = crawl(fresh)
-        if winner:
-            return winner
-        if best_strong:
-            # verified, just incomplete. The next tier would only re-find the
-            # same listing; hunt_donors/merge_sources below complete the row.
-            break
+    if not skip_search:
+        RUN_STATS["rows_web_search"] += 1
+        for tier in tiers:
+            # A tier that is wholly cached costs nothing either way, so it
+            # takes the batch path: same candidates, same order, same winner -
+            # the warm-cache replay stays byte-identical in both modes.
+            if (QUERY_MODE == "incremental"
+                    and not all(search_is_cached(q) for q, _ in tier)):
+                winner = run_tier_incremental(tier)
+            else:
+                fresh = run_tier(tier)
+                candidates += fresh
+                winner = crawl(fresh)
+            if winner:
+                return winner
+            if best_strong:
+                # verified, just incomplete. The next tier would only re-find
+                # the same listing; hunt_donors/merge_sources complete the row.
+                break
 
     if best_strong:
+        if resolved_by:
+            RUN_STATS[f"rows_by_{resolved_by}"] += 1
         # the winner is verified but incomplete. Before settling for that, go
         # and fetch the missing half from a source the budget never reached -
         # then fill the gaps from every verified hit for this same SKU.
@@ -3609,8 +4360,18 @@ def write_report(path, rows, out_file, started, args, min_images):
         f"- Credits: {RUN_STATS['serper_calls']} this run"
         f" · {RUN_STATS.get('credits_month', RUN_STATS['serper_calls'])}"
         f" month-to-date"
-        f" · budget {RUN_STATS.get('credits_budget', 0)}",
+        f" · budget {RUN_STATS.get('credits_budget', 0)}"
+        f" · queries not sent: {RUN_STATS.get('queries_skipped_dup', 0)}"
+        f" (free source said not there)"
+        f" + {RUN_STATS.get('queries_skipped_early', 0)} (stopped early)",
         f"- Stopped by: {RUN_STATS.get('stopped_by') or 'done'}",
+        # tier 0 (url_index.py): what the free URL sources saved
+        f"- URL index: {RUN_STATS.get('index_lookups', 0)} lookup(s)"
+        f" · {RUN_STATS.get('index_candidates', 0)} candidate URL(s)"
+        f" · {RUN_STATS.get('rows_by_index', 0)} row(s) resolved"
+        f" · site search: {RUN_STATS.get('sitesearch_calls', 0)} call(s),"
+        f" {RUN_STATS.get('rows_by_sitesearch', 0)} row(s) resolved"
+        f" · {RUN_STATS.get('rows_web_search', 0)} row(s) needed web search",
         f"- input: `{args.input}`",
         f"- output: `{out_file.name}`  ({len(rows)} data row(s))",
         f"- flags: `{' '.join(sys.argv[1:]) or '(none)'}`",
@@ -3743,7 +4504,7 @@ def main():
     global PW_ENABLED, PW_MAX_PER_RUN, PW_PROFILE_DIR, CACHE_ENABLED, CACHE_REFRESH
     global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED, DISCOVER_MODE
     global IMAGE_CHECK, IMAGE_MIN_PX, SERPER_KEY_ENV, CATEGORY_CODES
-    global SERPER_BUDGET, _budget_warned
+    global SERPER_BUDGET, _budget_warned, QUERY_MODE, SEARCH_ORDER
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -3769,6 +4530,12 @@ def main():
                          "saved and the report is written, exactly as for "
                          "Ctrl+C. Default: the client's [serper] "
                          "default_run_budget.")
+    ap.add_argument("--search-order", choices=("paid_first", "free_first"),
+                    default=None,
+                    help="paid_first: serper.dev, DuckDuckGo only when serper "
+                         "fails. free_first: DuckDuckGo first, serper only "
+                         "when DuckDuckGo gives no result. Default: the "
+                         "client's [serper] search_order (paid_first).")
     ap.add_argument("--force", action="store_true",
                     help="Re-process every row, even ones already filled")
     ap.add_argument("--retry-missing", action="store_true",
@@ -3857,6 +4624,24 @@ def main():
     cache_group.add_argument("--cache-clear", action="store_true",
                              help="Delete every cached page and search, then exit")
 
+    idx_group = ap.add_argument_group(
+        "url index (tier 0)",
+        "Free URL sources tried BEFORE any paid search: the local sitemap "
+        "index (url_index.py) and the retailers' own search. --crawl-urls "
+        "never uses them.")
+    idx_group.add_argument("--no-url-index", action="store_true",
+                           help="Skip tier 0 entirely - search exactly as before")
+    idx_group.add_argument("--refresh-index", action="store_true",
+                           help="Refresh every enabled sitemap source now, "
+                                "whatever its age (incremental: unchanged "
+                                "sitemaps are skipped). Works without an input "
+                                "file too")
+    idx_group.add_argument("--index-max-age", type=float, default=None,
+                           metavar="DAYS",
+                           help="Refresh sources older than DAYS at start "
+                                "(default: the client's [url_index] "
+                                "max_age_days, else 7)")
+
     ap.add_argument("--report", metavar="PATH",
                     help="Where to write the run summary "
                          "(default: <output>_report.md)")
@@ -3889,6 +4674,11 @@ def main():
     budget = args.budget if args.budget is not None else cfg.serper.default_run_budget
     budget = max(0, int(budget or 0))     # a client.toml value can still be junk
     SERPER_BUDGET, _budget_warned = budget, False
+    QUERY_MODE = getattr(cfg.serper, "query_mode", "incremental")
+    SEARCH_ORDER = args.search_order or getattr(cfg.serper, "search_order",
+                                                "paid_first")
+    if QUERY_MODE != "incremental" or SEARCH_ORDER != "paid_first":
+        log(f"Search: query_mode = {QUERY_MODE}, search_order = {SEARCH_ORDER}")
     RUN_STATS["credits_budget"] = cfg.serper.monthly_budget
     ledger = Ledger(cfg.credits_file)
     ledger.load()
@@ -3938,6 +4728,11 @@ def main():
         return
     if args.probe:
         probe(args.probe, args.min_images)
+        return
+    if args.index_max_age is not None and args.index_max_age < 0:
+        sys.exit("--index-max-age cannot be negative")
+    if args.refresh_index and not args.input:
+        configure_url_index(args, cfg)       # refresh only, no batch
         return
     if not args.input:
         sys.exit("Give an input file, or use --probe URL to test a single page.")
@@ -4026,6 +4821,9 @@ def main():
     if args.discover:
         log("PASS 1 (--discover): finding a link and photos only - no spec "
             "table, no donor pages. Review the sheet, then run --crawl-urls.")
+    # tier 0 - off for --crawl-urls (no searches at all), refreshed here,
+    # before the first SKU, when a sitemap source is stale
+    configure_url_index(args, cfg)
 
     done = found = missed = no_link = 0
     stopped = False
@@ -4214,6 +5012,10 @@ def main():
     if RUN_STATS["serper_calls"]:
         log(f"serper.dev calls this run: {RUN_STATS['serper_calls']} "
             f"(~1 credit each).")
+    if RUN_STATS["queries_skipped_dup"] or RUN_STATS["queries_skipped_early"]:
+        log(f"Uncached queries not sent: {RUN_STATS['queries_skipped_dup']} "
+            f"(a free source already said not there) + "
+            f"{RUN_STATS['queries_skipped_early']} (stopped early).")
     if not args.no_report:
         report_path = (Path(args.report) if args.report
                        else out.with_name(out.stem + "_report.md"))
