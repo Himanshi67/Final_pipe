@@ -24,7 +24,12 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   review mode, image keep/drop, an in-app category-map editor with backups, an SEO
   preview, and the enricher-log/publish-output parsers in `gui_helpers.py` (~640 lines).
   Step 1 offers the two-pass flow; step 2's review table is where `NEEDS LINK` rows get
-  a URL pasted in. Review has three saved states per row (approved / skipped / not
+  a URL pasted in. Step 2 also shows each row's description + short description AS
+  THE BUILD WRITES THEM (`app.description_fields_for_row`, one "Label: value" line per
+  table row) and saves edits as per-SKU overrides in
+  `runs\<name>\description_overrides.json` (never in `_filled.xlsx`);
+  `process_inventory(description_overrides=...)` uses them, re-firewalled, and
+  `build_csv.py --description-overrides FILE` takes the same file. Review has three saved states per row (approved / skipped / not
   reviewed, in `runs\<name>\review_state.json`); the build ALWAYS defaults to
   "Confirmed rows only", is blocked at zero approvals, and never builds a skipped row
   in either scope.

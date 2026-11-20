@@ -39,6 +39,7 @@ import pandas as pd
 import streamlit as st
 
 import client_config
+import gui_helpers
 from client_config import (DEFAULT_CLIENT, ClientConfigError,
                            available_clients, broken_clients,
                            load_client, load_env,
@@ -51,7 +52,7 @@ from gui_helpers import (BADGE, append_events, assemble_pack, batch_summary,
                          csv_signature, eligible_rows, eta_text,
                          filter_review_df, flag_value, found_status,
                          limit_from_flags,
-                         merge_confirm_flags, merge_review_flags,
+                         merge_review_flags,
                          APPROVE as REVIEW_APPROVE, SKIP as REVIEW_SKIP,
                          CLEAR as REVIEW_CLEAR,
                          review_counts, review_counts_text, review_decision,
@@ -897,7 +898,17 @@ EDITABLE_COLS = ["title", "regular price", "sale price", "url_link",
 
 
 def load_filled_df(P) -> pd.DataFrame:
-    df = pd.read_excel(P["filled"], dtype=str).fillna("")
+    """The review sheet as a frame. Every Streamlit rerun (each click) asks
+    for it, so the parse is cached on the file's path + mtime + size: a save,
+    a crawl or a re-enrich rewrites the file and so misses the cache. The
+    cache hands every caller its own copy."""
+    stat = Path(P["filled"]).stat()
+    return _read_filled_df(str(P["filled"]), stat.st_mtime_ns, stat.st_size)
+
+
+@st.cache_data(max_entries=4, show_spinner=False)
+def _read_filled_df(path: str, mtime_ns: int, size: int) -> pd.DataFrame:
+    df = pd.read_excel(path, dtype=str).fillna("")
     df.columns = [str(c).strip() for c in df.columns]
     for col in ["sku", "status"] + EDITABLE_COLS:
         if col not in df.columns:
@@ -1069,6 +1080,293 @@ def validator_flags(P, raw_sku: str, all_raws=None) -> str:
     return ""
 
 
+def _configured_app():
+    """app.py, configured for the current client (same rule as
+    category_options: `app` is a singleton that may hold another client)."""
+    slug = current_client().slug
+    os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+    os.environ[client_config.ENV_VAR] = slug
+    import app
+    if getattr(getattr(app, "CLIENT", None), "slug", slug) != slug:
+        app.configure(slug)
+    return app
+
+
+_FIELD_LABEL = {"short description": "Short description",
+                "description": "Description"}
+
+
+def description_editor(P, row, where="card"):
+    """Show and edit the two description fields of ONE row, as the build
+    will write them. Computed for this row only (app.description_fields_for_row
+    - no image download), so it stays cheap on every rerun.
+
+    The edit is saved as a per-SKU override in runs\\<name>\\
+    description_overrides.json (gui_helpers); _filled.xlsx is not touched.
+    Each line passes the content firewall at save time; a refused line is
+    named and not saved. Empty text saves only with 'publish empty' ticked."""
+    run = P["run"].name
+    sku = str(row["sku"])
+    app = _configured_app()
+    brand = app.compact(row.get("Brands")) or app.infer_brand(
+        app.compact(row.get("title")), row.get("sku"))
+    try:
+        generated = app.description_fields_for_row(row)
+    except Exception as exc:          # a row the builder cannot read yet
+        st.info(f"Descriptions cannot be generated for this row yet "
+                f"({type(exc).__name__}: {exc}).")
+        return
+    ov_file = gui_helpers.overrides_path(P["run"])
+    state = gui_helpers.load_overrides_state(ov_file)
+    gen_key = f"desc_gen_{run}_{sku}"
+    gen = st.session_state.get(gen_key, 0)
+
+    msg_key = f"desc_msg_{run}_{sku}"
+    for kind, text in st.session_state.pop(msg_key, []):
+        getattr(st, kind)(text)
+
+    st.caption("One line per table row, as **Label: value**. Delete a line "
+               "to remove that point. This is the text the CSV will contain "
+               "(content firewall and the key-point limit already applied). "
+               "Edits are saved for this run only; the scraped sheet is not "
+               "changed. Title or price edits above show here after Save.")
+    texts, empties = {}, {}
+    for field in gui_helpers.OVERRIDE_FIELDS:
+        gen_lines = app.description_lines(generated[field])
+        entry = gui_helpers.get_override(state, sku, field)
+        label = _FIELD_LABEL[field]
+        if entry is not None:
+            label += " — EDITED (overrides the generated text)"
+            if gui_helpers.override_is_stale(entry, gen_lines):
+                st.warning(f"{_FIELD_LABEL[field]}: the generated text has "
+                           "changed since this edit was saved (the row was "
+                           "re-enriched or edited). The edit is still used; "
+                           "reset it to see the new text.")
+        shown = entry["lines"] if entry is not None else gen_lines
+        texts[field] = st.text_area(
+            label, "\n".join(shown), height=34 * max(3, len(shown) + 1),
+            key=f"desc_{field[:5]}_{where}_{run}_{sku}_{gen}")
+        empties[field] = st.checkbox(
+            f"Publish {_FIELD_LABEL[field].lower()} EMPTY",
+            value=bool(entry is not None and not entry["lines"]),
+            key=f"desc_empty_{field[:5]}_{where}_{run}_{sku}_{gen}",
+            help="Tick only if this field must be published with no text.")
+        with st.expander(f"Preview: {_FIELD_LABEL[field].lower()} as "
+                         "published"):
+            rows = (app.parse_description_lines(entry["lines"], brand)[0]
+                    if entry is not None else generated[field])
+            html = app.render_description_rows(rows)
+            if html:
+                st.markdown(html, unsafe_allow_html=True)
+            else:
+                st.caption("(empty)")
+        if entry is not None and st.button(
+                f"↺ Reset {_FIELD_LABEL[field].lower()} to generated",
+                key=f"desc_rst_{field[:5]}_{where}_{run}_{sku}"):
+            gui_helpers.reset_override(state, sku, field)
+            gui_helpers.save_overrides_state(ov_file, state)
+            st.session_state[msg_key] = [("success", f"{_FIELD_LABEL[field]}"
+                                          " reset to the generated text.")]
+            st.session_state[gen_key] = gen + 1
+            st.rerun()
+
+    b1, b2 = st.columns(2)
+    if b1.button("💾 Save description edits", key=f"desc_save_{where}_{run}_{sku}"):
+        notes = []
+        for field in gui_helpers.OVERRIDE_FIELDS:
+            gen_lines = app.description_lines(generated[field])
+            rows, refused = app.parse_description_lines(texts[field], brand)
+            name = _FIELD_LABEL[field]
+            for line, why in refused:
+                notes.append(("error", f"{name}: NOT saved — “{line}” — {why}."))
+            if not rows and not empties[field]:
+                if texts[field].strip():
+                    notes.append(("error", f"{name}: no line can be "
+                                  "published, so nothing was saved. Fix the "
+                                  "lines, or tick 'publish empty'."))
+                elif gui_helpers.get_override(state, sku, field) is None:
+                    notes.append(("warning", f"{name}: the text is empty. "
+                                  "Tick 'publish empty' to save an empty "
+                                  "field; nothing was saved."))
+                continue
+            lines = [] if empties[field] else app.description_lines(rows)
+            done = gui_helpers.set_override(state, sku, field, lines,
+                                            gen_lines)
+            notes.append(("success", f"{name}: " + (
+                "same as the generated text — no override kept."
+                if done == "removed" else
+                "saved as EMPTY." if not lines else
+                f"saved ({len(lines)} line(s)).")))
+        try:
+            gui_helpers.save_overrides_state(ov_file, state)
+        except OSError as exc:
+            notes.append(("error", f"Could not write {ov_file.name}: {exc}"))
+        log_review_events(P, [review_event(sku, "edit", where, 0.0)])
+        st.session_state[msg_key] = notes
+        st.session_state[gen_key] = gen + 1
+        st.rerun()
+    if b2.button("↺ Reset both to generated",
+                 key=f"desc_reset_{where}_{run}_{sku}",
+                 disabled=not any(gui_helpers.get_override(state, sku, f)
+                                  for f in gui_helpers.OVERRIDE_FIELDS)):
+        gui_helpers.reset_override(state, sku)
+        gui_helpers.save_overrides_state(ov_file, state)
+        st.session_state[msg_key] = [("success", "Descriptions reset to the "
+                                      "generated text.")]
+        st.session_state[gen_key] = gen + 1
+        st.rerun()
+
+
+_SOURCE_MARK = {"specification": "specification", "description": "description",
+                "title": "title", "brand": "brand", "reviewer": "reviewer ✎"}
+
+
+def price_attribute_editor(P, row, where="card"):
+    """Price and attributes of ONE row as the build will publish them, with
+    the source of each attribute, and an editor (owner request 2026-11-19,
+    late). Computed for this row only (app.review_summary - no image
+    download). Edits are per-SKU overrides in runs\\<name>\\
+    description_overrides.json (keys 'price' / 'attributes', gui_helpers);
+    _filled.xlsx is never written. Refused entries are shown in red and not
+    saved."""
+    run = P["run"].name
+    sku = str(row["sku"])
+    app = _configured_app()
+    ov_file = gui_helpers.overrides_path(P["run"])
+    state = gui_helpers.load_overrides_state(ov_file)
+    build_ov = gui_helpers.overrides_for_build(state).get(sku)
+    try:
+        info = app.review_summary(row, build_ov)
+    except Exception as exc:          # a row the builder cannot read yet
+        st.info(f"Price and attributes cannot be computed for this row yet "
+                f"({type(exc).__name__}: {exc}).")
+        return
+    brand = app.compact(row.get("Brands")) or app.infer_brand(
+        app.compact(row.get("title")), row.get("sku"))
+    gen_key = f"pa_gen_{run}_{sku}"
+    gen = st.session_state.get(gen_key, 0)
+    msg_key = f"pa_msg_{run}_{sku}"
+    for kind, text in st.session_state.pop(msg_key, []):
+        getattr(st, kind)(text)
+
+    # ---- price -------------------------------------------------------------
+    price_entry = gui_helpers.get_price_override(state, sku)
+    kind = info["kind"] or "kind not recorded"
+    published = app._money(info["published"]) or "—"
+    hand = " — ✎ HAND-ENTERED by the reviewer" if info["hand_price"] else ""
+    st.markdown(
+        f"**Price** · MRP on the page: **{app._money(info['mrp']) or '—'}** · "
+        f"selling price on the page: **{app._money(info['sale']) or '—'}** "
+        f"({kind}) · published: **{published}**{hand}  \n"
+        f"Rule: {info['rule']}")
+    c1, c2, c3 = st.columns(3)
+    sheet = {"regular price": row.get("regular price"),
+             "sale price": row.get("sale price")}
+    shown = {k: gui_helpers._price_text(
+        (price_entry or {}).get("values", {}).get(k, sheet.get(k)))
+        for k in ("regular price", "sale price", "publish price")}
+    mrp_in = c1.text_input("Page MRP", shown["regular price"],
+                           key=f"pa_mrp_{where}_{run}_{sku}_{gen}")
+    sale_in = c2.text_input("Page selling price", shown["sale price"],
+                            key=f"pa_sale_{where}_{run}_{sku}_{gen}")
+    pub_in = c3.text_input("Publish this exact price (empty = rule)",
+                           shown["publish price"],
+                           key=f"pa_pub_{where}_{run}_{sku}_{gen}")
+
+    # ---- attributes --------------------------------------------------------
+    rows = info["attributes"]
+    table = pd.DataFrame(
+        [{"attribute": n, "value": v,
+          "source": _SOURCE_MARK.get(s, s),
+          "filter": "✔" if f else ""} for n, v, s, f in rows],
+        columns=["attribute", "value", "source", "filter"])
+    st.markdown("**Attributes as published** (✔ = store filter). Change a "
+                "value, delete a row, or add a row; then Save.")
+    edited = st.data_editor(
+        table, num_rows="dynamic", hide_index=True, width="stretch",
+        disabled=["source", "filter"],
+        key=f"pa_attr_{where}_{run}_{sku}_{gen}")
+    if info["missing"]:
+        st.warning("⚠ Required attribute(s) still missing: "
+                   + ", ".join(info["missing"]))
+    for note in info["unmatched"]:
+        st.caption(f"Filter note: {note}")
+    for why in info["refused"]:
+        st.error(f"Stored edit not used: {why}")
+
+    attr_entry = gui_helpers.get_attribute_override(state, sku)
+    b1, b2, b3 = st.columns(3)
+    if b1.button("💾 Save price & attributes",
+                 key=f"pa_save_{where}_{run}_{sku}"):
+        notes = []
+        # price: every entry is checked; a refused one is NOT saved
+        mrp_after = mrp_in
+        bad = False
+        for label, text in (("Page MRP", mrp_in),
+                            ("Page selling price", sale_in)):
+            why = app.check_price_input(text)
+            if why:
+                notes.append(("error", f"{label} NOT saved — “{text}” — {why}."))
+                bad = True
+        if not app.check_price_input(mrp_in):
+            _n, why = app.check_publish_price(
+                pub_in, app.number_or_blank(mrp_after))
+            if why:
+                notes.append(("error", f"Publish price NOT saved — “{pub_in}”"
+                              f" — {why}."))
+                bad = True
+        if not bad:
+            done = gui_helpers.set_price_override(
+                state, sku, {"regular price": mrp_in, "sale price": sale_in,
+                             "publish price": pub_in}, sheet)
+            notes.append(("success", "Price: " + (
+                "same as the page — no override kept." if done == "removed"
+                else "saved.")))
+        # attributes
+        current = [(n, v) for n, v, _s, _f in rows]
+        new_rows = [(r.get("attribute"), r.get("value"))
+                    for r in edited.to_dict("records")]
+        sets, removes = gui_helpers.attribute_edits(current, new_rows)
+        accepted = {}
+        for name, value in sets.items():
+            why = app.check_attribute_edit(name, value, brand)
+            if why:
+                notes.append(("error", f"Attribute NOT saved — “{name}: "
+                              f"{value}” — {why}."))
+            else:
+                accepted[name] = value
+        if accepted or removes:
+            m_sets, m_removes = gui_helpers.merge_attribute_edits(
+                attr_entry, accepted, removes)
+            gui_helpers.set_attribute_override(state, sku, m_sets, m_removes)
+            notes.append(("success", f"Attributes: {len(accepted)} set, "
+                          f"{len(removes)} removed."))
+        try:
+            gui_helpers.save_overrides_state(ov_file, state)
+        except OSError as exc:
+            notes.append(("error", f"Could not write {ov_file.name}: {exc}"))
+        log_review_events(P, [review_event(sku, "edit", where, 0.0)])
+        st.session_state[msg_key] = notes
+        st.session_state[gen_key] = gen + 1
+        st.rerun()
+    if b2.button("↺ Reset price to the page", key=f"pa_rprice_{where}_{run}_{sku}",
+                 disabled=price_entry is None):
+        gui_helpers.reset_override(state, sku, gui_helpers.PRICE_FIELD)
+        gui_helpers.save_overrides_state(ov_file, state)
+        st.session_state[msg_key] = [("success", "Price reset to the page.")]
+        st.session_state[gen_key] = gen + 1
+        st.rerun()
+    if b3.button("↺ Reset attributes to generated",
+                 key=f"pa_rattr_{where}_{run}_{sku}",
+                 disabled=attr_entry is None):
+        gui_helpers.reset_override(state, sku, gui_helpers.ATTRIBUTE_FIELD)
+        gui_helpers.save_overrides_state(ov_file, state)
+        st.session_state[msg_key] = [("success",
+                                      "Attributes reset to generated.")]
+        st.session_state[gen_key] = gen + 1
+        st.rerun()
+
+
 def card_review(P, df, cat_opts, all_raws=None):
     """One SKU per screen: gallery with keep/drop, editable fields, an
     approve/skip queue. df is the (possibly filtered) review dataframe -
@@ -1171,6 +1469,13 @@ def card_review(P, df, cat_opts, all_raws=None):
     if pairs:
         with st.expander(f"Scraped specs ({len(pairs)})"):
             st.table(pd.DataFrame(pairs, columns=["spec", "value"]))
+
+    with st.expander("💰 Price & attributes (as published — editable)",
+                     expanded=True):
+        price_attribute_editor(P, row, "card")
+    with st.expander("📝 Description & short description (as published — "
+                     "editable)", expanded=True):
+        description_editor(P, row, "card")
 
     def _num(s):
         return pd.to_numeric(str(s).replace(",", "").replace("₹", "")
@@ -1406,6 +1711,20 @@ def step_review(P):
     with tabs[4]:
         parts.append(review_editor(fdf, f"ed_all_{fsig}", cat_opts))
 
+    # the same editor as the card view, for one chosen row at a time (it is
+    # computed only for that row). Saving here reruns the page, so unsaved
+    # table edits are lost - the caption says so.
+    with st.expander("📝 Price, attributes & descriptions — one SKU"):
+        st.caption("Save the table edits first: saving here reloads the "
+                   "page.")
+        pick_opts = [""] + fdf["sku"].astype(str).tolist()
+        pick = st.selectbox("SKU", pick_opts,
+                            key=f"desc_pick_{P['run'].name}")
+        if pick:
+            picked = fdf[fdf["sku"].astype(str) == pick].iloc[0]
+            price_attribute_editor(P, picked, "table")
+            description_editor(P, picked, "table")
+
     # the All tab duplicates the bucket rows; parts is in TAB order - review,
     # failed, pending, found, all - so All is the last one and goes first.
     # merge_confirm_flags applies a part's value only when it CHANGES that
@@ -1576,18 +1895,28 @@ def step_build(P):
         st.warning("All FOUND rows includes rows nobody approved "
                    f"({counts['not_reviewed']} not reviewed). Skipped rows "
                    "stay out.")
+    n_desc = len(gui_helpers.overrides_for_build(
+        gui_helpers.load_overrides_state(gui_helpers.overrides_path(P["run"]))))
+    if n_desc:
+        st.info(f"{n_desc} SKU(s) have edited descriptions from step 2; the "
+                "build uses those edits.")
     month = st.text_input("WordPress uploads folder (YYYY/MM)",
                           value=f"{datetime.now():%Y/%m}")
     c1, c2 = st.columns(2)
-    # [pricing] single_price: the build writes ONE price (the higher of MRP
-    # and selling price) and never an MRP, so an estimated MRP has no place
-    single_price = bool(getattr(getattr(st.session_state.get(_CFG_KEY),
-                                        "pricing", None),
-                                "single_price", False))
+    # [pricing] single_price: the build writes ONE price (basis/markup rule,
+    # client_config.one_price) and never an MRP, so an estimated MRP has no
+    # place
+    _pricing = getattr(st.session_state.get(_CFG_KEY), "pricing", None)
+    single_price = bool(getattr(_pricing, "single_price", False))
+    if getattr(_pricing, "basis", "higher") == "lower":
+        _rule = (f"the lower price + Rs {getattr(_pricing, 'markup', 0):,g}, "
+                 "never above the MRP")
+    else:
+        _rule = "the higher of MRP and selling price"
     estimate_mrp = c1.checkbox(
         "Estimate missing MRP (sale price × 1.25)", disabled=single_price,
-        help=("This client builds ONE price (the higher of MRP and selling "
-              "price); no MRP is estimated." if single_price else None))
+        help=(f"This client builds ONE price ({_rule}); no MRP is "
+              "estimated." if single_price else None))
     if single_price:
         estimate_mrp = False
     seo = c2.checkbox("SEO meta columns (opt-in)")
@@ -1682,11 +2011,16 @@ def step_build(P):
     with st.spinner(f"Building CSV for {len(df)} product(s) — images are "
                     "downloaded and converted, this can take a while…"):
         with contextlib.redirect_stdout(buf):
-            result = app.process_inventory(df, media_base=media_base,
-                                           estimate_mrp=estimate_mrp,
-                                           seo=seo, seo_plugin=seo_plugin)
+            result = app.process_inventory(
+                df, media_base=media_base, estimate_mrp=estimate_mrp,
+                seo=seo, seo_plugin=seo_plugin,
+                # the reviewer's description edits from step 2 (same file
+                # build_csv.py --description-overrides takes)
+                description_overrides=gui_helpers.overrides_for_build(
+                    gui_helpers.load_overrides_state(
+                        gui_helpers.overrides_path(P["run"]))))
         try:
-            result.to_csv(P["csv"], index=False, quoting=1)
+            app.write_csv(result, P["csv"])
         except PermissionError:
             # P3-50: the build has already downloaded every image by now, but
             # nothing is recorded - no update_meta, so the run stays at its

@@ -39,7 +39,8 @@ Public API:
                  query_mode, search_order)          [serper] - item 4
     UrlIndexConfig(enabled, max_age_days, extra_sources, disable)
                                                     [url_index] - tier 0
-    PricingConfig(single_price)                     [pricing] - one price only
+    PricingConfig(single_price, basis, markup)      [pricing] - one price only
+    one_price(regular, sale, pricing)               the one-price rule
     available_clients() · broken_clients() · resolve_slug(argv, explicit)
     load_client(slug, argv)
     load_env(cfg) -> dict                           clients/<slug>/.env
@@ -150,12 +151,23 @@ class PricingConfig:
 
     single_price = false (default): 'regular price' is the MRP (struck
     through) and 'sale price' the selling price, as scraped.
-    single_price = true: ONE price only. 'regular price' = the HIGHER of the
-    row's MRP and selling price (whichever exist), 'sale price' = empty. No
-    discount, "save" or "% off" text is written. The enricher's _filled.xlsx
-    still records both values; only the build output is single-price.
+    single_price = true: ONE price only, in 'regular price'; 'sale price' =
+    empty. No discount, "save" or "% off" text is written. The enricher's
+    _filled.xlsx still records both values; only the build output is
+    single-price. Which price: see `one_price()`.
+      basis = "higher" (code default): the higher of MRP and selling price.
+      basis = "lower": the lower price + `markup` rupees, capped at the
+        higher price. A row with only one price ships it unchanged.
+      markup (code default 0): rupees added to the lower price.
+    The defaults keep a client that sets only `single_price = true` on the
+    behaviour it had before basis/markup existed.
     """
     single_price: bool = False
+    basis: str = "higher"
+    markup: float = 0
+
+
+PRICE_BASES = ("higher", "lower")
 
 
 @dataclass(frozen=True)
@@ -500,12 +512,61 @@ def _load_pricing(data, where) -> PricingConfig:
     table = data.get("pricing") or {}
     if not isinstance(table, dict):
         raise ClientConfigError(f"{where}: [pricing] must be a table.")
-    single = table.get("single_price", PricingConfig().single_price)
+    default = PricingConfig()
+    single = table.get("single_price", default.single_price)
     if not isinstance(single, bool):
         raise ClientConfigError(
             f"{where}: [pricing] single_price must be true or false, "
             f"got {single!r}")
-    return PricingConfig(single_price=single)
+    basis = table.get("basis", default.basis)
+    if basis not in PRICE_BASES:
+        raise ClientConfigError(
+            f"{where}: [pricing] basis must be one of "
+            f"{', '.join(repr(b) for b in PRICE_BASES)}, got {basis!r}")
+    markup = table.get("markup", default.markup)
+    if (isinstance(markup, bool) or not isinstance(markup, (int, float))
+            or markup < 0):
+        raise ClientConfigError(
+            f"{where}: [pricing] markup must be a number >= 0 (rupees), "
+            f"got {markup!r}")
+    return PricingConfig(single_price=single, basis=basis, markup=markup)
+
+
+def _positive_number(raw):
+    """float(raw) when raw is a number > 0, else None ('' / None / text)."""
+    if raw is None or raw == "" or isinstance(raw, bool):
+        return None
+    try:
+        number = float(str(raw).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+    if number != number or number <= 0:          # NaN or not positive
+        return None
+    return number
+
+
+def one_price(regular_price, sale_price, pricing=None):
+    """The ONE price a single-price build ships, from a row's MRP
+    (`regular_price`) and selling price (`sale_price`). None when neither is a
+    positive number. This is the ONLY definition of the rule: app.py,
+    validate_csv.py, wc_publish.py and wc_seo.py all call it.
+
+    - Only one price (or both equal): that price, unchanged - no markup.
+    - Two different prices, basis "higher": the higher one.
+    - Two different prices, basis "lower": the lower one + `markup`, capped at
+      the higher one (never above the MRP).
+    """
+    pricing = pricing if pricing is not None else PricingConfig()
+    values = [v for v in (_positive_number(regular_price),
+                          _positive_number(sale_price)) if v is not None]
+    if not values:
+        return None
+    high, low = max(values), min(values)
+    if high == low:
+        return high
+    if pricing.basis == "lower":
+        return min(low + float(pricing.markup or 0), high)
+    return high
 
 
 def load_client(slug=None, argv=None) -> ClientConfig:

@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import re
+import functools
 import io
 import os
 import shutil
@@ -283,10 +284,17 @@ KETTLE_BODY_RE = re.compile(
     re.IGNORECASE)
 
 
+_WS_RUN_RE = re.compile(r'\s+')
+
+
 def compact(value):
+    # called ~1,400 times per built row: a plain str skips pd.isna (always
+    # False for a str) and the pattern is compiled once
+    if type(value) is str:
+        return _WS_RUN_RE.sub(' ', value).strip()
     if value is None or pd.isna(value):
         return ''
-    return re.sub(r'\s+', ' ', str(value)).strip()
+    return _WS_RUN_RE.sub(' ', str(value)).strip()
 
 
 def number_or_blank(value):
@@ -1186,7 +1194,8 @@ def spec_tags(title):
     which of these are relevant."""
     t = compact(title)
     found = {}
-    m = re.search(r'(\d{2,3})\s*(?:inch|inches|")', t, re.IGNORECASE)
+    m = (re.search(r'(\d{2,3})\s*(?:inch|inches|")', t, re.IGNORECASE)
+         or re.search(r'(\d{2,3})(?= inch\s*\))', _with_cm_inches(t)))
     if m:
         found['screen'] = f'{m.group(1)} Inch'
     m = re.search(r'(\d+(?:\.\d+)?)\s*kg\b', t, re.IGNORECASE)
@@ -1401,27 +1410,45 @@ AXIS_SPEC_LABELS = {
 }
 
 
-def missing_spec_axes(sub, title, category_family, scraped=(), parent=''):
+def missing_spec_axes(sub, title, category_family, scraped=(), parent='',
+                      description='', filters=(), removed=()):
     """Axes the taxonomy declares for this sub-category that this product
     cannot fill from anywhere. Empty tuple means complete.
+
+    Sources, as for the filter attributes: the scraped spec rows, the page's
+    description text (`description`), the title. A filter attribute written
+    for the axis (`filters`, a FilterHit with that axis) fills it. An axis in
+    `removed` (the reviewer deleted that attribute) is missing whatever the
+    sources say.
 
     `parent` only matters for a product filed under the bare parent - see
     attribute_axes()."""
     axes = attribute_axes(sub, parent)
     if not axes:
         return []
-    specs = spec_tags(title)
+    texts = [compact(t) for t in (title, description) if compact(t)]
+    specs = {}
+    for text in reversed(texts):
+        specs.update(spec_tags(text))
     labels = {label.lower() for label, _ in scraped}
-    text = compact(title)
+    hit_axes = {hit.axis for hit in filters}
+    removed = set(removed)
     missing = []
     for axis, allowed in axes.items():
         if axis in OPTIONAL_AXES:        # the sheet's second 'type' column
             continue
-        # 1. the sheet's own vocabulary ('Inverter, Fixed Speed') is in the title
-        if any(v and re.search(r'\b' + re.escape(v) + r'\b', text, re.IGNORECASE)
-               for v in allowed):
+        if axis in removed:
+            missing.append(axis)
             continue
-        # 2. the title carries the measurement the axis names
+        # 0. a filter attribute was written for the axis
+        if axis in hit_axes:
+            continue
+        # 1. the sheet's own vocabulary ('Inverter, Fixed Speed') is in the
+        #    title or the description
+        if any(v and re.search(r'\b' + re.escape(v) + r'\b', text, re.IGNORECASE)
+               for v in allowed for text in texts):
+            continue
+        # 2. the title / description carries the measurement the axis names
         if any(k in specs for k in AXIS_SPEC_KEYS.get(axis, ())):
             continue
         # 3. the retailer's spec table names it
@@ -1591,10 +1618,23 @@ FILTER_VALUE_ALIASES = {
 }
 
 
+# The Indian TV convention 'centimetres (inches)': '80 cm (32)', '80cm(32)',
+# '108 cm (43 inches)'. The bracketed number IS the stated screen size in
+# inches (never computed from the cm figure); a bare one gets its unit word
+# so _QUANTITY_RE reads it. '(32 inch)' / '(43")' already carry the unit.
+CM_INCH_RE = re.compile(
+    r'(\d+(?:\.\d+)?\s*cm\s*\(\s*)(\d{2,3}(?:\.\d+)?)(\s*\))', re.IGNORECASE)
+
+
+def _with_cm_inches(text):
+    return CM_INCH_RE.sub(lambda m: f'{m.group(1)}{m.group(2)} inch{m.group(3)}',
+                          text)
+
+
 def _quantities(text):
     """[(number, unit, matched text)] for every number + unit in `text`, in
     order. TB is folded into GB (1 TB = 1024 GB) so storage lists compare."""
-    text = compact(text)
+    text = _with_cm_inches(compact(text))
     text = re.sub(r'\b(one|two|three|four|five)\b(?=\s*-?\s*stars?\b)',
                   lambda m: _STAR_WORDS[m.group(1).lower()], text,
                   flags=re.IGNORECASE)
@@ -1625,7 +1665,19 @@ def _single_quantity(text):
 
 def _allowed_entry(value):
     """Classify one allowed value: ('exact', n, unit, text),
-    ('band', lo, hi, lo_incl, hi_incl, unit, text) or ('text', norm, text)."""
+    ('band', lo, hi, lo_incl, hi_incl, unit, text) or ('text', norm, text).
+
+    Memoised: the allowed values are the filter sheet's fixed options, and
+    snap_filter_matches re-classified every option of every axis for every
+    row (~80 calls a row, each ~15 regex passes). typed=True keeps 1 and 1.0
+    apart, because compact() spells them differently."""
+    try:
+        return _allowed_entry_memo(value)
+    except TypeError:                   # an unhashable value: classify uncached
+        return _classify_allowed(value)
+
+
+def _classify_allowed(value):
     text = compact(value)
     low = text.lower()
     for pattern, shape in (
@@ -1653,6 +1705,10 @@ def _allowed_entry(value):
     if q and q[1]:
         return ('exact', q[0], q[1], text)
     return ('text', _norm_filter_text(text), text)
+
+
+_allowed_entry_memo = functools.lru_cache(maxsize=8192, typed=True)(
+    _classify_allowed)
 
 
 def _in_band(entry, number):
@@ -2053,14 +2109,45 @@ GROUP_SPEC_LABELS = {
 SUB_TYPE_SPEC_LABELS = ('motor type', 'motor', 'installation type',
                         'mounting type', 'installation')
 
-FilterHit = namedtuple('FilterHit', 'group value axis labels kind')
+FilterHit = namedtuple('FilterHit', 'group value axis labels kind source',
+                       defaults=('',))
 FilterHit.__doc__ = ("One filter attribute for one product: group (the "
                      "attribute name), value (allowed spelling), axis, the "
-                     "spec labels that fed it, and kind 'exact' / 'band' / "
+                     "spec labels that fed it, kind 'exact' / 'band' / "
                      "'text' / 'free' / 'new' (a value the lists do not "
-                     "hold, written as scraped - owner decision 2026-11-19).")
+                     "hold, written as scraped - owner decision 2026-11-19), "
+                     "and source: where the value was read (SOURCE_*).")
 # the `axis` of a FilterHit from DIRECT_FILTER_GROUPS (no sub-category axis)
 DIRECT_AXIS = '(direct)'
+# Where an attribute value was read, in the fixed order every filter group
+# and required attribute looks (owner request 2026-11-19, late): the scraped
+# specification rows, then the page's description text (`page_text`), then
+# the product title. The first source that STATES the value wins.
+SOURCE_SPEC = 'specification'
+SOURCE_DESCRIPTION = 'description'
+SOURCE_TITLE = 'title'
+SOURCE_REVIEWER = 'reviewer'
+# the `label` that marks the description in a filter source list (the title
+# is None); never a real spec label, so never a "dedicated" label
+_DESC_LABEL = '(description)'
+
+
+def _attribute_sources(scraped_rows, description, title):
+    """[(raw text, label)] in the fixed source order (see SOURCE_SPEC)."""
+    sources = list(scraped_rows)
+    if compact(description):
+        sources.append((compact(description), _DESC_LABEL))
+    if compact(title):
+        sources.append((compact(title), None))
+    return sources
+
+
+def _source_name(label):
+    if label is None:
+        return SOURCE_TITLE
+    if label == _DESC_LABEL:
+        return SOURCE_DESCRIPTION
+    return SOURCE_SPEC
 
 
 def filter_axes(sub, parent='', table=None):
@@ -2120,8 +2207,10 @@ def _direct_plan(sub, parent='', table=None, groups=None):
 
 
 def _direct_parts(raw):
-    """A scraped value / title split into its listed parts (',', ';', '|')."""
-    return [p for p in (compact(x) for x in re.split(r'[,;|]', raw or '')) if p]
+    """A scraped value / title split into its listed parts (',', ';', '|').
+    A thousands comma is not a separator: 'HD (1,366 x 768)' is one part."""
+    raw = re.sub(r'(?<=\d),(?=\d{3}(?!\d))', '', raw or '')
+    return [p for p in (compact(x) for x in re.split(r'[,;|]', raw)) if p]
 
 
 def _direct_matches(part, options):
@@ -2159,10 +2248,12 @@ def _snap_direct(raw, options, pick=None):
     return sorted(found, key=lambda f: order.get(f[0], len(order)))
 
 
-def _direct_filter_hits(sub, parent, title, scraped, table, groups, done):
+def _direct_filter_hits(sub, parent, title, scraped, table, groups, done,
+                        description=''):
     """([FilterHit], [notes]) for the DIRECT_FILTER_GROUPS of one product.
-    Scraped values under the group's labels first, then the title; the first
-    source that gives a value wins. A value the list does not hold is WRITTEN
+    Scraped values under the group's labels first, then the page's
+    description text, then the title (the description and the title only
+    when `use_title`); the first source that gives a value wins. A value the list does not hold is WRITTEN
     as scraped (owner decision 2026-11-19, see _new_filter_value) with a
     "new value" note, but only from a dedicated label (note_labels) or, for a
     numeric group, a number in the group's unit - never a text value from the
@@ -2174,8 +2265,8 @@ def _direct_filter_hits(sub, parent, title, scraped, table, groups, done):
         labels = frozenset(entry.labels)
         sources = [(compact(v), compact(label).lower()) for label, v in scraped
                    if compact(label).lower() in labels and compact(v)]
-        if entry.use_title and compact(title):
-            sources.append((compact(title), None))
+        if entry.use_title:
+            sources = _attribute_sources(sources, description, title)
         unit = _values_unit(options)
         numeric = bool(unit)
         dedicated = frozenset(entry.note_labels)
@@ -2203,7 +2294,8 @@ def _direct_filter_hits(sub, parent, title, scraped, table, groups, done):
                     if quantity:
                         value, kind, new = quantity, 'new', [quantity]
             if value:
-                hits.append(FilterHit(group, value, DIRECT_AXIS, labels, kind))
+                hits.append(FilterHit(group, value, DIRECT_AXIS, labels, kind,
+                                      _source_name(label)))
                 done.add(group.lower())
                 for part in new:
                     note = new_value_note(group, part)
@@ -2381,12 +2473,15 @@ def _evidence(raw, spec, numeric):
     return ''
 
 
-def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
+def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None,
+                      description=''):
     """The product's filter attributes: ([FilterHit], [notes]).
 
     Per axis of the product's sub-category row: the value comes from the
     scraped spec table (the labels that carry that axis), else from the
-    title; it is snapped onto the filter group's list first (its spelling
+    page's description text (`description`, the sheet's `page_text`), else
+    from the title - the first source that states it; each hit records its
+    `source`. It is snapped onto the filter group's list first (its spelling
     wins), then onto the sub-category row's list. Snapped -> a FilterHit
     named by the filter group.
 
@@ -2406,7 +2501,7 @@ def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
         scraped_rows = [(compact(v), compact(label).lower())
                         for label, v in scraped
                         if compact(label).lower() in labels and compact(v)]
-        sources = scraped_rows + [(compact(title), None)]
+        sources = _attribute_sources(scraped_rows, description, title)
         numeric = bool(spec.unit) or any(
             _allowed_entry(v)[0] != 'text'
             for g in mapped for v in groups.get(g, ()))
@@ -2447,7 +2542,8 @@ def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
                             value, kind, new = quantity, 'new', [quantity]
                 if value:
                     hits.append(FilterHit(group, value, axis,
-                                          frozenset(labels), kind))
+                                          frozenset(labels), kind,
+                                          _source_name(label)))
                     done.add(group.lower())
                     for part in new:
                         note = new_value_note(group, part)
@@ -2456,20 +2552,21 @@ def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
                     written = True
                     break
                 if not evidence:
-                    if label is None:
+                    if label is None or label == _DESC_LABEL:
                         evidence = _evidence(raw, spec, numeric)
                     elif not _only_empty_words(raw, group):
                         evidence = raw
         if len(targets) > 1 and spec.values and derived.lower() not in done:
             # values only the sub-category row lists ('Hot & Cold') go to the
             # axis's own name, unless a mapped group already holds them
-            for raw, _is_scraped in sources:
+            for raw, label in sources:
                 extra = [t for t in snap_filter_values(raw, spec.values, spec.unit)
                          if not any(snap_filter_values(t, groups.get(g, ()))
                                     for g in mapped)]
                 if extra:
                     hits.append(FilterHit(derived, ', '.join(extra), axis,
-                                          frozenset(labels), 'text'))
+                                          frozenset(labels), 'text',
+                                          _source_name(label)))
                     done.add(derived.lower())
                     written = True
                     break
@@ -2478,11 +2575,12 @@ def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
         group = targets[0]
         if (spec.free and not mapped and spec.unit
                 and group.lower() not in done):
-            for raw, _is_scraped in sources:
+            for raw, label in sources:
                 value = normalise_quantity(raw, spec.unit)
                 if value:
                     hits.append(FilterHit(group, value, axis,
-                                          frozenset(labels), 'free'))
+                                          frozenset(labels), 'free',
+                                          _source_name(label)))
                     done.add(group.lower())
                     written = True
                     break
@@ -2494,7 +2592,8 @@ def filter_attributes(sub, parent, title, scraped=(), table=None, groups=None):
                 unmatched.append(note)
     # the filter groups no sub-category axis feeds (DIRECT_FILTER_GROUPS)
     direct, direct_unmatched = _direct_filter_hits(sub, parent, title, scraped,
-                                                   table, groups, done)
+                                                   table, groups, done,
+                                                   description)
     hits.extend(direct)
     unmatched.extend(n for n in direct_unmatched if n not in unmatched)
     return hits, unmatched
@@ -2842,33 +2941,387 @@ def build_descriptions(sku, title, brand, category, scraped=(), sub='',
     KEY_POINTS_MAX relevant points for this `sub`-category. Nothing is written
     that was not scraped or read off the title (no invented "230 V / 50 Hz").
     """
-    tagged = _spec_rows(title, brand, category, scraped, filters)
-    rows = [(label, value) for label, value, _origin in tagged]
-    points = _firewall_rows(key_points(tagged, sub, parent), brand)
-    brand_rows = _firewall_rows([(label, value) for label, value, origin
-                                 in tagged if origin == 'brand'], brand)
+    lists = description_row_lists(sku, title, brand, category, scraped,
+                                  sub=sub, parent=parent, filters=filters)
+    feature_rows = lists['feature_rows']
 
     # Paragraph, not a bullet list: the storefront renders this inline under the
     # title, where a <ul> broke the flow. Still one sentence per VERIFIED spec
     # pair - nothing is written here that product_specs() did not produce, so a
     # missing spec stays missing instead of being smoothed over with prose.
-    feature_rows = brand_rows + points
     configuration_points = compact(
         '<p class="product-key-features">'
         + ' '.join(f'{label}: {value}.' for label, value in feature_rows)
         + '</p>'
     ) if feature_rows else ''
-    short_desc = html_block(_firewall_rows([
+    short_desc = html_block(lists['short description'])
+    long_desc = html_block(lists['description'])
+    return configuration_points, short_desc, long_desc, lists['rows']
+
+
+def description_row_lists(sku, title, brand, category, scraped=(), sub='',
+                          parent='', filters=()):
+    """The (label, value) rows behind build_descriptions' three fields, after
+    the content firewall and the KEY_POINTS_MAX cap. ONE definition: the
+    builder renders these rows, and the GUI review step shows (and lets the
+    reviewer edit) exactly these rows for 'short description' and
+    'description'.
+
+    Returns {'rows': every spec row (the attributes), 'feature_rows',
+    'short description', 'description'}."""
+    tagged = _spec_rows(title, brand, category, scraped, filters)
+    rows = [(label, value) for label, value, _origin in tagged]
+    points = _firewall_rows(key_points(tagged, sub, parent), brand)
+    brand_rows = _firewall_rows([(label, value) for label, value, origin
+                                 in tagged if origin == 'brand'], brand)
+    short_rows = _firewall_rows([
         ('Brand', brand),
         ('Product SKU', sku),
-    ] + points, brand))
-    long_desc = html_block(_firewall_rows([
+    ] + points, brand)
+    long_rows = _firewall_rows([
         ('Brand Designation', brand),
         ('Model Identifier Code', sku),
         ('Title', title),
         ('Categories', category),
-    ] + points, brand))
-    return configuration_points, short_desc, long_desc, rows
+    ] + points, brand)
+    return {'rows': rows, 'feature_rows': brand_rows + points,
+            'short description': short_rows, 'description': long_rows}
+
+
+# ------------------- reviewer edits of the two description fields -------------
+# Step 2 of gui.py shows 'short description' and 'description' as the build
+# will write them - one "Label: Value" line per table row - and lets the
+# reviewer edit them. An edit is a per-SKU OVERRIDE (runs\<name>\
+# description_overrides.json, gui_helpers owns the file); process_inventory
+# uses it instead of the generated rows. The override passes the content
+# firewall again at build time, so a line the firewall refuses never ships.
+
+DESCRIPTION_FIELDS = ('short description', 'description')
+_BULLET_RE = re.compile(r'^\s*(?:[-*•·]|\d+[.)])\s+')
+LINE_FORM_REASON = "not in 'Label: value' form"
+LINE_FIREWALL_REASON = ('refused by the content firewall (retailer or seller '
+                        'name, URL, phone, EMI, offer, delivery or rating '
+                        'text)')
+
+
+def override_key(raw_sku):
+    """The key a description override is stored under: the sheet's raw sku as
+    text. A numeric sku read by pandas (12345 or 12345.0) keys as '12345'."""
+    if raw_sku is None:
+        return ''
+    if isinstance(raw_sku, float):
+        if raw_sku != raw_sku:
+            return ''
+        if raw_sku.is_integer():
+            return str(int(raw_sku))
+    text = compact(raw_sku)
+    if re.fullmatch(r'\d+\.0+', text):
+        text = text.split('.', 1)[0]
+    return text
+
+
+def description_lines(rows):
+    """(label, value) rows -> the editor's text lines, 'Label: Value'."""
+    return [f'{compact(label)}: {compact(value)}' for label, value in rows]
+
+
+def description_fields_for_row(row, estimate_mrp=False):
+    """{'short description': rows, 'description': rows} - what the build
+    writes for this ONE input row before any override. Cheap (no image
+    download): the GUI calls it for the row on screen only."""
+    ctx = row_context(row, estimate_mrp=estimate_mrp)
+    lists = description_row_lists(
+        ctx['sku'], ctx['title'], ctx['brand'], ctx['category_family'],
+        ctx['scraped'], sub=ctx['sub'], parent=ctx['parent'],
+        filters=ctx['filters'])
+    return {field: lists[field] for field in DESCRIPTION_FIELDS}
+
+
+def parse_description_lines(lines, brand=''):
+    """Reviewer text -> (rows, refused).
+
+    `lines` is the editor text (str) or a list of lines. Blank lines are
+    ignored; a leading bullet ('-', '*', '•', '1.') is removed. A line must be
+    'Label: value' (split on the FIRST colon). `rows` are the accepted
+    (label, value) pairs in order; `refused` is [(line, reason)] for every
+    line that is not published - wrong form, or refused by content_ok."""
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    rows, refused = [], []
+    for raw in lines or ():
+        line = compact(_BULLET_RE.sub('', str(raw or '')))
+        if not line:
+            continue
+        label, sep, value = line.partition(':')
+        label, value = compact(label), compact(value)
+        if not sep or not label or not value:
+            refused.append((line, LINE_FORM_REASON))
+            continue
+        if not (content_ok(label, brand=brand) and content_ok(value, brand=brand)):
+            refused.append((line, LINE_FIREWALL_REASON))
+            continue
+        rows.append((label, value))
+    return rows, refused
+
+
+def render_description_rows(rows):
+    """Accepted override rows -> the same <table> shape html_block writes.
+    Reviewer text is plain text: '<' and '>' are escaped. No rows = ''."""
+    if not rows:
+        return ''
+    safe = [(str(label).replace('<', '&lt;').replace('>', '&gt;'),
+             str(value).replace('<', '&lt;').replace('>', '&gt;'))
+            for label, value in rows]
+    return html_block(safe)
+
+
+def normalise_overrides(overrides):
+    """{sku: {field: [lines]}} with every key through override_key and only
+    the two description fields kept, plus the reviewer's 'price' and
+    'attributes' edits (see apply_price_override / apply_attribute_override).
+    None / {} -> {}."""
+    out = {}
+    for sku, fields in (overrides or {}).items():
+        key = override_key(sku)
+        if not key or not isinstance(fields, dict):
+            continue
+        kept = {f: list(v) for f, v in fields.items()
+                if f in DESCRIPTION_FIELDS and isinstance(v, (list, tuple))}
+        price = fields.get(PRICE_OVERRIDE_FIELD)
+        if isinstance(price, dict):
+            price = {k: compact(v) for k, v in price.items()
+                     if k in PRICE_OVERRIDE_KEYS and v is not None}
+            if price:
+                kept[PRICE_OVERRIDE_FIELD] = price
+        attrs = fields.get(ATTRIBUTE_OVERRIDE_FIELD)
+        if isinstance(attrs, dict):
+            sets = {compact(k): compact(v) for k, v in
+                    (attrs.get('set') or {}).items()
+                    if compact(k) and compact(v)}
+            removed = [compact(n) for n in attrs.get('remove') or ()
+                       if compact(n)]
+            if sets or removed:
+                kept[ATTRIBUTE_OVERRIDE_FIELD] = {'set': sets,
+                                                  'remove': removed}
+        if kept:
+            out[key] = kept
+    return out
+
+
+# ------------- reviewer edits of the price and the attributes ----------------
+# Owner request 2026-11-19 (late): step 2 of gui.py lets the reviewer edit
+# the page MRP, the page selling price, an explicit "publish this exact
+# price", and the attributes (change a value, remove one, add one). Stored per
+# SKU next to the description edits (gui_helpers, description_overrides.json,
+# keys 'price' and 'attributes'); process_inventory applies them, so the GUI
+# build and build_csv.py --description-overrides give the same CSV. Without
+# an override nothing here runs and the output is byte-identical.
+PRICE_OVERRIDE_FIELD = 'price'
+ATTRIBUTE_OVERRIDE_FIELD = 'attributes'
+# 'regular price' / 'sale price' replace the page MRP / selling price (the
+# INPUTS of client_config.one_price; '' = the page has none). 'publish
+# price' replaces the computed price itself ('' / absent = no override).
+PRICE_OVERRIDE_KEYS = ('regular price', 'sale price', 'publish price')
+PRICE_NOT_NUMBER = 'not a positive number'
+PRICE_ABOVE_MRP = 'above the MRP in effect'
+ATTR_FORM_REASON = 'needs a name and a value'
+ATTR_EMPTY_WORD_REASON = "says nothing about the product ('Yes', 'No', 'N/A')"
+ATTR_TOO_LONG_REASON = f'longer than {NEW_TEXT_VALUE_MAX} characters'
+
+
+def _price_number(text):
+    """A positive number typed by the reviewer ('20,590', '₹ 20590'), or
+    None. The whole text must be the number."""
+    cleaned = re.sub(r'[,\s₹]', '', compact(text)).replace('Rs.', '')
+    if not re.fullmatch(r'\d+(?:\.\d+)?', cleaned):
+        return None
+    value = float(cleaned)
+    return value if value > 0 else None
+
+
+def check_price_input(text):
+    """'' when `text` may be saved as a page MRP / selling price (a positive
+    number, or empty = none), else the reason it is refused."""
+    if not compact(text):
+        return ''
+    return '' if _price_number(text) is not None else PRICE_NOT_NUMBER
+
+
+def check_publish_price(text, mrp):
+    """(price or None, reason) for the reviewer's "publish this exact price".
+    Empty -> (None, '') = no override. Refused (None, reason) when it is not
+    a positive number or is above `mrp` (the MRP in effect, '' = none)."""
+    if not compact(text):
+        return None, ''
+    value = _price_number(text)
+    if value is None:
+        return None, PRICE_NOT_NUMBER
+    cap = number_or_blank(mrp)
+    if cap != '' and value > cap + 1e-9:
+        return None, PRICE_ABOVE_MRP
+    return value, ''
+
+
+def _whole(value):
+    return int(value) if float(value).is_integer() else round(value, 2)
+
+
+def apply_price_override(regular, sale, override):
+    """(page MRP, page selling price, publish price or None, refused reasons)
+    after the reviewer's price edits. `regular` / `sale` are the sheet cells
+    (number_or_blank); a refused entry is ignored and named."""
+    refused = []
+    override = override or {}
+    for key in ('regular price', 'sale price'):
+        if key not in override:
+            continue
+        text = override[key]
+        why = check_price_input(text)
+        if why:
+            refused.append(f'{key}: {why}')
+            continue
+        value = _price_number(text)
+        if key == 'regular price':
+            regular = _whole(value) if value is not None else ''
+        else:
+            sale = _whole(value) if value is not None else ''
+    published, why = check_publish_price(override.get('publish price', ''),
+                                         regular)
+    if why:
+        refused.append(f'publish price: {why}')
+    return regular, sale, (_whole(published) if published is not None
+                           else None), refused
+
+
+def check_attribute_edit(name, value, brand=''):
+    """'' when the reviewer's (name, value) may be saved, else the reason:
+    both present, the content firewall (content_ok / spec_row_ok), not a
+    never-a-value word, at most NEW_TEXT_VALUE_MAX characters of value."""
+    name, value = compact(name), compact(value)
+    if not name or not value:
+        return ATTR_FORM_REASON
+    if not (content_ok(name, brand=brand) and content_ok(value, brand=brand)
+            and spec_row_ok(name, value)):
+        return LINE_FIREWALL_REASON
+    if _empty_word('', value):
+        return ATTR_EMPTY_WORD_REASON
+    if len(value) > NEW_TEXT_VALUE_MAX:
+        return ATTR_TOO_LONG_REASON
+    return ''
+
+
+def _group_targets(sub, parent='', table=None, groups=None):
+    """{lower-case filter group name: (group, axis, unit, sheet options,
+    sub-category values, labels)} - every filter group this product can
+    carry, as filter_attributes plans it."""
+    groups = FILTER_GROUPS if groups is None else groups
+    out = {}
+    for axis, spec, mapped, derived in _filter_plan(sub, parent, table, groups):
+        targets = mapped or [derived]
+        labels = frozenset(_axis_source_labels(axis, spec, mapped))
+        for group in targets:
+            options = list(groups.get(group, ())) if mapped else []
+            subvals = list(spec.values) if len(targets) == 1 else []
+            out.setdefault(group.lower(), (group, axis, spec.unit, options,
+                                           subvals, labels))
+    for entry, group, options in _direct_plan(sub, parent, table, groups):
+        out.setdefault(group.lower(), (group, DIRECT_AXIS, None, options, [],
+                                       frozenset(entry.labels)))
+    return out
+
+
+def reviewer_filter_hit(target, value):
+    """(FilterHit, [notes]) for a reviewer value typed for a filter group:
+    the same snap / new-value rule as a scraped value - the sheet's spelling
+    when it matches, a number in the group's unit as number + the list's own
+    suffix, else the value as typed, with the "new value" note."""
+    group, axis, unit, options, subvals, labels = target
+    value = compact(value)
+    found = (snap_filter_matches(value, options, unit)
+             or snap_filter_matches(value, subvals, unit))
+    if found:
+        return FilterHit(group, ', '.join(t for t, _k in found), axis, labels,
+                         found[0][1], SOURCE_REVIEWER), []
+    listed = options + [v for v in subvals if v not in options]
+    unit = unit or _values_unit(listed)
+    written = (_new_quantity(value, unit, listed) if unit else None) or value
+    return (FilterHit(group, written, axis, labels, 'new', SOURCE_REVIEWER),
+            [new_value_note(group, written)])
+
+
+def apply_attribute_override(sub, parent, filters, unmatched, override,
+                             brand='', table=None, groups=None):
+    """The reviewer's attribute edits on one product's filter attributes.
+
+    Returns {'filters', 'unmatched', 'rows' ({lower name: (name, value)} of
+    the non-filter attributes set), 'removed' (lower names),
+    'removed_axes', 'refused' ([(name, value, reason)])}. A name that is one
+    of the product's filter groups replaces / adds that FilterHit (source
+    'reviewer') and its old `_filter_unmatched` note; any other name is a
+    plain attribute row. A refused edit is ignored and named."""
+    override = override or {}
+    targets = _group_targets(sub, parent, table, groups)
+    filters, unmatched = list(filters), list(unmatched)
+    removed = {compact(n).lower() for n in override.get('remove') or ()
+               if compact(n)}
+    removed_axes = set()
+    for hit in filters:
+        if hit.group.lower() in removed and hit.axis != DIRECT_AXIS:
+            removed_axes.add(hit.axis)
+    for key in removed:
+        target = targets.get(key)
+        if target and target[1] != DIRECT_AXIS:
+            removed_axes.add(target[1])
+        for axis in attribute_axes(sub, parent):
+            if key == axis.lower() or key in AXIS_SPEC_LABELS.get(axis, ()):
+                removed_axes.add(axis)
+    filters = [h for h in filters if h.group.lower() not in removed]
+    rows, refused = {}, []
+    for name, value in (override.get('set') or {}).items():
+        why = check_attribute_edit(name, value, brand)
+        if why:
+            refused.append((name, value, why))
+            continue
+        key = compact(name).lower()
+        target = targets.get(key)
+        if target is None:
+            rows[key] = (woo_attribute_name(compact(name)), compact(value))
+            continue
+        hit, notes = reviewer_filter_hit(target, value)
+        group = target[0]
+        at = next((i for i, h in enumerate(filters)
+                   if h.group.lower() == group.lower()), None)
+        if at is None:
+            filters.append(hit)
+        else:
+            filters[at] = hit           # same place: attribute order kept
+        unmatched = [n for n in unmatched
+                     if not re.match(re.escape(group) + r'\b', n)]
+        unmatched.extend(n for n in notes if n not in unmatched)
+        removed_axes.discard(hit.axis)
+    return {'filters': filters, 'unmatched': unmatched, 'rows': rows,
+            'removed': removed, 'removed_axes': removed_axes,
+            'refused': refused}
+
+
+def apply_attribute_rows(attrs, edit):
+    """The attribute list after the reviewer's non-filter edits: a removed
+    name is dropped, a set name gets the reviewer's value in place, a new
+    name is added at the end. `edit` is apply_attribute_override's dict."""
+    if not edit:
+        return list(attrs)
+    out, done = [], set()
+    for label, value in attrs:
+        key = compact(label).lower()
+        if key in edit['removed']:
+            continue
+        if key in edit['rows']:
+            out.append(edit['rows'][key])
+            done.add(key)
+            continue
+        out.append((label, value))
+    out.extend(row for key, row in edit['rows'].items() if key not in done)
+    return out
 
 
 # -------------------------- SEO meta (item 8, OPT-IN) -------------------------
@@ -3160,13 +3613,6 @@ def white_share(image):
         total += sum(hist)
         white += sum(hist[WHITE_MIN:])
     return white / total if total else 0.0
-
-
-def is_white_background(image):
-    """True when the photo sits on a white (or transparent) backdrop: at least
-    WHITE_SHARE of its border strip is white (see white_share). A lifestyle
-    shot fails because its scene runs to the frame edge."""
-    return white_share(image) >= WHITE_SHARE
 
 
 _BBOX_LUT = [255 if (255 - v) > BBOX_TOL else 0 for v in range(256)]
@@ -3545,27 +3991,25 @@ def single_price_mode(client=None):
     return bool(getattr(pricing, 'single_price', False))
 
 
-def single_price_pair(regular_price, sale_price):
-    """(price, '') for single-price mode: the HIGHER of the MRP and the
-    selling price, whichever exist. ('', '') when neither exists. The price
-    goes in 'regular price'; 'sale price' is always empty."""
-    values = []
-    for raw in (regular_price, sale_price):
-        if raw == '' or raw is None:
-            continue
-        try:
-            number = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if number > 0:
-            values.append(number)
-    if not values:
+def single_price_pair(regular_price, sale_price, client=None):
+    """(price, '') for single-price mode. The price is
+    client_config.one_price() under this client's [pricing] basis/markup:
+    basis "higher" = the higher of MRP and selling price; basis "lower" =
+    the lower + markup, capped at the higher; one price alone = unchanged.
+    ('', '') when neither exists. The price goes in 'regular price'; 'sale
+    price' is always empty.
+
+    Idempotent: a pair that is already (one price, '') returns the same price,
+    so seo_description can normalise again without adding a second markup."""
+    cfg = client or CLIENT
+    best = client_config.one_price(regular_price, sale_price,
+                                   getattr(cfg, 'pricing', None))
+    if best is None:
         return '', ''
-    best = max(values)
-    return (int(best) if best.is_integer() else round(best, 2)), ''
+    return (int(best) if float(best).is_integer() else round(best, 2)), ''
 
 
-def row_context(row, estimate_mrp=False):
+def row_context(row, estimate_mrp=False, override=None):
     """Everything process_inventory derives from ONE input row before it starts
     writing output columns: brand, category, family, prefixed sku, scraped
     specs, attribute rows and the two prices.
@@ -3597,11 +4041,23 @@ def row_context(row, estimate_mrp=False):
     # siblings got the real code
     sku = prefixed_sku(raw_sku, parent_guess)
 
+    override = override or {}
     sale_price = number_or_blank(row.get('sale price'))
     regular_price = number_or_blank(row.get('regular price'))
-    if single_price_mode():
-        # [pricing] single_price: ONE price, the higher of the two. No
-        # struck-through MRP, no sale price, no estimated MRP.
+    published, price_refused = None, []
+    if override.get(PRICE_OVERRIDE_FIELD):
+        regular_price, sale_price, published, price_refused = \
+            apply_price_override(regular_price, sale_price,
+                                 override[PRICE_OVERRIDE_FIELD])
+    page_regular, page_sale = regular_price, sale_price
+    if published is not None:
+        # the reviewer's "publish this exact price" (checked against the
+        # MRP in effect): ONE price, empty sale price, whatever the mode
+        regular_price, sale_price = published, ''
+    elif single_price_mode():
+        # [pricing] single_price: ONE price (basis/markup rule in
+        # client_config.one_price). No struck-through MRP, no sale price, no
+        # estimated MRP.
         regular_price, sale_price = single_price_pair(regular_price,
                                                       sale_price)
     else:
@@ -3614,14 +4070,34 @@ def row_context(row, estimate_mrp=False):
             regular_price = round(float(sale_price) * 1.25, 2)
 
     scraped = parse_scraped_specs(row.get('specs'), brand=brand)
+    # the page's description text (enricher column `page_text`, never
+    # published): read for attribute values after the spec rows, before the
+    # title
+    description = compact(row.get('page_text'))
     # filter attributes: named by the store's filter group, value snapped
     # onto the sheet's own spelling (see filter_attributes)
     filters, filter_unmatched = filter_attributes(sub_guess, parent_guess,
-                                                  title, scraped)
-    dynamic_attrs = product_specs(title, brand, category_family, scraped,
-                                  filters)
+                                                  title, scraped,
+                                                  description=description)
+    attribute_edit = None
+    if override.get(ATTRIBUTE_OVERRIDE_FIELD):
+        attribute_edit = apply_attribute_override(
+            sub_guess, parent_guess, filters, filter_unmatched,
+            override[ATTRIBUTE_OVERRIDE_FIELD], brand=brand)
+        filters = attribute_edit['filters']
+        filter_unmatched = attribute_edit['unmatched']
+    dynamic_attrs = apply_attribute_rows(
+        product_specs(title, brand, category_family, scraped, filters),
+        attribute_edit)
 
     return {
+        'description': description,
+        'page regular price': page_regular,
+        'page sale price': page_sale,
+        'price_kind': compact(row.get('price_kind')),
+        'published_override': published,
+        'price_refused': price_refused,
+        'attribute_edit': attribute_edit,
         'raw_sku': raw_sku,
         'title': title,
         'brand': brand,
@@ -3640,11 +4116,125 @@ def row_context(row, estimate_mrp=False):
     }
 
 
+def row_spec_gaps(ctx):
+    """`_spec_gaps` for one row_context(): the required axes nothing states
+    (spec rows, description, title, a filter attribute, a reviewer row); an
+    axis whose attribute the reviewer removed is missing."""
+    edit = ctx.get('attribute_edit') or {}
+    scraped = list(ctx['scraped']) + list((edit.get('rows') or {}).values())
+    return missing_spec_axes(ctx['sub'], ctx['title'], ctx['category_family'],
+                             scraped, parent=ctx['parent'],
+                             description=ctx.get('description', ''),
+                             filters=ctx.get('filters', ()),
+                             removed=edit.get('removed_axes', ()))
+
+
+def _money(value):
+    number = number_or_blank(value)
+    if number == '':
+        return ''
+    return f'{number:,.0f}' if float(number).is_integer() else f'{number:,.2f}'
+
+
+def price_rule_text(ctx, client=None):
+    """The published price and the rule that made it, in words, for the
+    review step: '18,590 + 2,000 = 20,590, cap 37,790'. Uses the same
+    client_config.one_price as the build; nothing is recomputed here."""
+    cfg = client or CLIENT
+    pricing = getattr(cfg, 'pricing', None)
+    mrp, sale = ctx['page regular price'], ctx['page sale price']
+    if ctx.get('published_override') is not None:
+        return f"{_money(ctx['published_override'])} (entered by the reviewer)"
+    if not single_price_mode(cfg):
+        parts = [f'sale {_money(sale)}' if sale != '' else '',
+                 f'regular {_money(mrp)}' if mrp != '' else '']
+        return ', '.join(p for p in parts if p) or 'no price'
+    best = client_config.one_price(mrp, sale, pricing)
+    if best is None:
+        return 'no price on the page - nothing is published'
+    values = [v for v in (mrp, sale) if v != '']
+    if len(values) == 1 or max(values) == min(values):
+        return f'{_money(best)} (one price on the page, unchanged)'
+    low, high = min(values), max(values)
+    if getattr(pricing, 'basis', 'higher') == 'lower':
+        markup = float(getattr(pricing, 'markup', 0) or 0)
+        capped = ' (capped)' if low + markup > high else ''
+        return (f'{_money(low)} + {_money(markup)} = {_money(low + markup)}, '
+                f'cap {_money(high)} -> {_money(best)}{capped}'
+                if capped else
+                f'{_money(low)} + {_money(markup)} = {_money(best)}, '
+                f'cap {_money(high)}')
+    return f'{_money(best)} (the higher of the two page prices)'
+
+
+def review_summary(row, override=None, estimate_mrp=False):
+    """What step 2 of the GUI shows for ONE row: {'mrp', 'sale', 'kind',
+    'published', 'rule', 'hand_price' (bool), 'attributes' [(name, value,
+    source, is_filter)], 'missing' [axes], 'unmatched' [notes], 'refused'
+    [text]}. Computed with row_context and build_descriptions, the build's
+    own functions, for this row only (no image download)."""
+    ctx = row_context(row, estimate_mrp=estimate_mrp, override=override)
+    _c, _s, _l, attrs = build_descriptions(
+        ctx['sku'], ctx['title'], ctx['brand'], ctx['category_family'],
+        ctx['scraped'], sub=ctx['sub'], parent=ctx['parent'],
+        filters=ctx['filters'])
+    edit = ctx['attribute_edit']
+    attrs = apply_attribute_rows(attrs, edit)
+    tagged = _spec_rows(ctx['title'], ctx['brand'], ctx['category_family'],
+                        ctx['scraped'], ctx['filters'])
+    origin = {compact(label).lower(): kind for label, _v, kind in tagged}
+    hit_source = {woo_attribute_name(h.group).lower(): h.source
+                  for h in ctx['filters']}
+    scraped_labels = {compact(label).lower() for label, _v in ctx['scraped']}
+    reviewer_rows = set((edit or {}).get('rows', {}))
+    origin_names = {'brand': 'brand', 'core': SOURCE_TITLE,
+                    'scraped': SOURCE_SPEC}
+    rows = []
+    for name, value in attrs:
+        key = compact(name).lower()
+        if key in reviewer_rows:
+            source, is_filter = SOURCE_REVIEWER, False
+        elif key in hit_source:
+            source, is_filter = hit_source[key] or SOURCE_SPEC, True
+        else:
+            source = origin_names.get(origin.get(key), SOURCE_SPEC)
+            if source == SOURCE_TITLE and key in scraped_labels:
+                source = SOURCE_SPEC
+            is_filter = False
+        rows.append((name, value, source, is_filter))
+    refused = list(ctx['price_refused']) + [
+        f'{name}: {value} - {why}' for name, value, why
+        in ((edit or {}).get('refused') or ())]
+    published = ctx['regular price'] if ctx['regular price'] != '' else ''
+    return {
+        'mrp': ctx['page regular price'], 'sale': ctx['page sale price'],
+        'kind': ctx['price_kind'],
+        'published': published,
+        'rule': price_rule_text(ctx),
+        'hand_price': ctx['published_override'] is not None or bool(
+            (override or {}).get(PRICE_OVERRIDE_FIELD)),
+        'attributes': rows,
+        'missing': row_spec_gaps(ctx),
+        'unmatched': list(ctx['filter_unmatched']),
+        'refused': refused,
+    }
+
+
 def process_inventory(df, media_base=None, estimate_mrp=False,
-                      seo=False, seo_plugin='yoast'):
+                      seo=False, seo_plugin='yoast',
+                      description_overrides=None):
     """`seo` is OPT-IN. While it is off the output is byte-identical to what
-    this function produced before the SEO columns existed."""
+    this function produced before the SEO columns existed.
+
+    `description_overrides` = {raw sheet sku: {'short description' |
+    'description': [lines]}} (gui_helpers.overrides_for_build). For a SKU
+    with an override, that field is the reviewer's lines instead of the
+    generated rows; each line passes the content firewall again and a refused
+    line is not written. An empty list writes the field empty. None / {} =
+    no overrides (the default): the output is unchanged."""
     require_input_columns(df)
+    overrides = normalise_overrides(description_overrides)
+    overrides_used = 0
     working = df.copy()
     working['title'] = working['title'].map(compact)
     working = working[working['title'] != '']
@@ -3670,7 +4260,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
     total = len(working)
     for idx, (_, row) in enumerate(working.iterrows(), start=1):
-        ctx = row_context(row, estimate_mrp=estimate_mrp)
+        override = overrides.get(override_key(row.get('sku')))
+        ctx = row_context(row, estimate_mrp=estimate_mrp, override=override)
         title = ctx['title']
         brand = ctx['brand']
         parent_guess, sub_guess = ctx['parent'], ctx['sub']
@@ -3718,12 +4309,21 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
         config, short_desc, long_desc, dynamic_attrs = build_descriptions(
             sku, title, brand, category_family, scraped,
             sub=sub_guess, parent=parent_guess, filters=ctx['filters'])
+        attribute_edit = ctx['attribute_edit']
+        dynamic_attrs = apply_attribute_rows(dynamic_attrs, attribute_edit)
+        if override:
+            overrides_used += 1
+            if 'short description' in override:
+                short_desc = render_description_rows(parse_description_lines(
+                    override['short description'], brand)[0])
+            if 'description' in override:
+                long_desc = render_description_rows(parse_description_lines(
+                    override['description'], brand)[0])
         filter_unmatched = ctx['filter_unmatched']
         if filter_unmatched:
             unmatched_rows += 1
 
-        gaps = missing_spec_axes(sub_guess, title, category_family, scraped,
-                                 parent=parent_guess)
+        gaps = row_spec_gaps(ctx)
         for axis in gaps:
             gap_counts[axis] = gap_counts.get(axis, 0) + 1
 
@@ -3777,6 +4377,10 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
         processed_rows.append(output_row)
 
+    if overrides_used:
+        ui.info(f'{overrides_used} product(s) use the reviewer\'s edits '
+                '(description / short description / price / attributes, '
+                'description_overrides).')
     if skipped_duplicates:
         ui.warning(f'Skipped {skipped_duplicates} duplicate SKU row(s) after normalization.')
     if case_only_duplicates:
@@ -3822,6 +4426,38 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
                        + (seo_columns(seo_plugin) if seo else [])
                        + sorted(attribute_columns, key=attribute_sort_key))
     return pd.DataFrame(processed_rows).reindex(columns=ordered_columns)
+
+
+PRICE_COLUMNS = ('regular price', 'sale price')
+
+
+def _price_cell_text(value):
+    """'20590' for 20590.0, '1299.5' for 1299.5, '' for a missing value."""
+    if value is None or value == '':
+        return ''
+    try:
+        if pd.isna(value):
+            return ''
+        number = float(value)
+    except (TypeError, ValueError):
+        return compact(value)
+    if number.is_integer():
+        return str(int(number))
+    return f'{round(number, 2):g}'
+
+
+def write_csv(frame, target):
+    """Write the WooCommerce CSV. pandas stores a price column that has a
+    missing value as float64 and would write '37790.0'; the price columns are
+    written as plain text instead ('37790', '1299.5', ''). The frame passed in
+    is not changed. Every CSV writer of the build (app.py, gui.py,
+    build_csv.py) goes through here."""
+    out = frame.copy()
+    for column in PRICE_COLUMNS:
+        if column in out.columns:
+            out[column] = pd.Series([_price_cell_text(v) for v in out[column]],
+                                    index=out.index, dtype=object)
+    out.to_csv(target, index=False, quoting=1)
 
 
 def main():
@@ -3942,7 +4578,7 @@ def main():
                 st.info(f'Quality check unavailable ({type(exc).__name__}). '
                         f'Run validate_csv.py on the downloaded file.')
         buffer = io.StringIO()
-        result.to_csv(buffer, index=False, quoting=1)
+        write_csv(result, buffer)
         st.download_button(
             label='Download wordpress_ready_clean_repaired.csv',
             data=buffer.getvalue(),

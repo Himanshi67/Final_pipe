@@ -324,36 +324,56 @@ disable = []            # source and site-search names to switch off for this cl
   inputs at run time, once per run, in memory only: they are never committed, cached
   (the cache key is `<name>:<code>`), logged or reported.
 
-## One price only (`[pricing]` table, owner decision 2026-11-19)
+## One price only (`[pricing]` table, owner decisions 2026-11-19)
 
 ```toml
 [pricing]
 single_price = true     # shreejee: ONE price. Code default (table absent): false
+basis = "lower"         # shreejee. Code default: "higher"
+markup = 2000           # rupees, >= 0. shreejee: 2000. Code default: 0
 ```
 
 - Optional; loaded by `client_config._load_pricing` into `ClientConfig.pricing`
-  (`PricingConfig`). A value that is not `true`/`false` raises `ClientConfigError`.
-- `false` (default): today's output. `regular price` = MRP (struck through),
-  `sale price` = the selling price; an MRP at or below the price is dropped.
-- `true`: the BUILD OUTPUT has one price. `regular price` = the HIGHER of the row's
-  MRP and selling price (whichever exist); `sale price` = empty. If only one exists,
-  that one is the price. `_filled.xlsx` is not changed: the enricher still records both.
+  (`PricingConfig(single_price, basis, markup)`). `single_price` not `true`/`false`,
+  `basis` not `"higher"`/`"lower"`, or `markup` not a number >= 0 raises
+  `ClientConfigError`.
+- `single_price = false` (default): two prices. `regular price` = MRP (struck
+  through), `sale price` = the selling price; an MRP at or below the price is dropped.
+  `basis` and `markup` are not used.
+- `single_price = true`: the BUILD OUTPUT has one price, in `regular price`;
+  `sale price` = empty. `_filled.xlsx` is not changed: the enricher still records both.
+  The one price is `client_config.one_price(mrp, selling, pricing)` - the ONLY
+  definition of the rule; app.py, validate_csv.py, wc_publish.py and wc_seo.py call it:
+  - only one price on the row (or both equal): that price, UNCHANGED (no markup);
+  - two different prices, `basis = "higher"`: the higher one (the first rule);
+  - two different prices, `basis = "lower"`: the lower one + `markup`, capped at the
+    higher one (never above the MRP). Example: MRP 37,790, price 18,590 -> 20,590.
+- Defaults: `basis = "higher"`, `markup = 0`. A client that sets only
+  `single_price = true` keeps the first rule (the higher price); a new rule is never
+  applied to a client that did not ask for it.
+- The rule is idempotent: a one-price pair `(20590, "")` returns 20590, so a second
+  normalisation (seo_description, wc_publish) never adds a second markup.
 - What follows the switch:
   - `app.row_context` (`single_price_pair`): the two prices; `--estimate-mrp` and the
     GUI "Estimate missing MRP" box do nothing (the box is disabled).
   - `app.build_tags`: the price-band tag uses the one price.
   - `app.seo_description` (CSV `--seo`, GUI SEO preview, `wc_seo.py`): "Price Rs N." only.
     No "MRP", no saving, no "% off".
+  - `app.write_csv` (every CSV writer): prices are written as whole numbers
+    (`"20590"`, not `"20590.0"`).
   - `validate_csv.py` export check: the one price drives `missing_price` and the
     category floor / ceiling / TV price checks; the MRP-ratio checks are off (no pair);
     a non-empty `sale price` is `sale_price_in_single_price_mode` (BLOCKING, a stale
     or hand-edited CSV). Stage-1 check (`_filled.xlsx`): an MRP alone is a price (no
-    `verified_but_no_price`), the TV price check reads the higher value, and the
-    MRP-ratio checks STAY (a wrong MRP becomes the price in this mode).
-  - `wc_publish.payload_prices`: `regular_price` = the higher of the two CSV values,
-    `sale_price` is SENT as `""`. On an update this CLEARS a sale price the live
-    product had - only for the products in that CSV. The dry run names it
+    `verified_but_no_price`), the TV price check reads `one_price()`, and the
+    MRP-ratio checks STAY (a wrong MRP can become, or cap, the price in this mode).
+  - `wc_publish.payload_prices`: a CSV from the build has one price and sends it
+    UNCHANGED as `regular_price`; only a stale CSV with both values is recomputed by
+    `one_price()`. `sale_price` is SENT as `""`. On an update this CLEARS a sale price
+    the live product had - only for the products in that CSV. The dry run names it
     (`sale_price 28990 -> -`).
+  - `wc_seo.py`: a live product with only `regular_price` is quoted unchanged; a stale
+    live product with both prices is quoted by `one_price()`.
 
 ## Item 5 — review instrumentation (`gui.py` step_review / card_review, `gui_helpers.py`)
 

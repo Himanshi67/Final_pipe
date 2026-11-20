@@ -59,11 +59,17 @@ AC = ["Air Conditioner", ""]
 TV = ["LED", ""]
 
 # How the build output states the price (owner decision, 2026-11-19):
-# single_price = true writes ONE price: 'regular price' = the higher of the
-# MRP and the selling price, 'sale price' = empty, and no "save" / "% off"
-# text. _filled.xlsx still records both values. Code default: false.
+# single_price = true writes ONE price in 'regular price', 'sale price' =
+# empty, and no "save" / "% off" text. _filled.xlsx still records both values.
+# basis = "lower": a row with an MRP and a lower selling price ships the
+# selling price + markup, capped at the MRP (MRP 37,790 / price 18,590 ->
+# 20,590). A row with only one price ships it unchanged. basis = "higher"
+# ships the higher of the two (the first rule). Code defaults: single_price
+# false, basis "higher", markup 0.
 [pricing]
 single_price = true
+basis = "lower"
+markup = 2000
 
 [serper]
 api_key_env = "SERPER_API_KEY"   # BYOK: the env var (in the client's .env) that holds the key

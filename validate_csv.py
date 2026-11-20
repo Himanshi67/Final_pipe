@@ -716,14 +716,15 @@ def validate_filled(df, path):
         if verified:
             sale = to_number(row.get(c_sale, ''))
             reg = to_number(row.get(c_reg, ''))
-            # [pricing] single_price: the build writes the HIGHER of the two,
-            # so an MRP alone is a price, and the TV price check reads the
-            # number that will ship. The MRP-ratio checks stay: a wrong MRP
-            # in this mode BECOMES the price.
+            # [pricing] single_price: the build writes ONE price
+            # (client_config.one_price - basis/markup), so an MRP alone is a
+            # price, and the TV price check reads the number that will ship.
+            # The MRP-ratio checks stay: a wrong MRP can become (or cap) the
+            # price in this mode.
             shipped = sale
             if single_price_mode():
-                both = [v for v in (reg, sale) if v is not None]
-                shipped = max(both) if both else None
+                shipped = client_config.one_price(
+                    reg, sale, getattr(CLIENT, 'pricing', None))
             if shipped is None:
                 reasons.append('verified_but_no_price')
             if len(images) < MIN_IMAGES:

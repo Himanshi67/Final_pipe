@@ -425,6 +425,53 @@ built in either scope, so they never reach the CSV, the images or the store.
 When a re-enrichment changes a row, its ✔ is dropped (P3-53) but its skip is
 KEPT: an explicit "no" must not turn back into "not reviewed".
 
+**Description and short description (review step).** Card review shows a
+"Description & short description" panel for the row on screen (the table view has
+the same panel for one SKU chosen from a list). It shows the text the CSV WILL
+contain for those two WooCommerce fields - `app.description_fields_for_row`, the same
+rows `build_descriptions` renders, after the content firewall and `KEY_POINTS_MAX` -
+as one **Label: value** line per table row. Delete a line to remove that point, or
+edit it. *Save description edits* stores the lines as a per-SKU override in
+`runs\<name>\description_overrides.json`; `_filled.xlsx` is not changed. Each line
+passes the content firewall when it is saved: a refused line (retailer or seller name,
+URL, phone, EMI, offer, delivery, rating) or a line that is not `Label: value` is named
+in red and is not saved. Empty text is saved only with *Publish ... EMPTY* ticked. An
+edit equal to the generated text is no override. *Reset ... to generated* removes it.
+If the row is re-enriched or edited later, the panel says the generated text has
+changed; the edit is still used until it is reset. The build (step 3, and
+`build_csv.py --description-overrides runs\<name>\description_overrides.json`) writes
+the override in place of the generated rows and applies the firewall again. The
+key-features paragraph (`configuration`) is not edited here.
+
+**Price and attributes (review step, 2026-11-19 late).** A second panel, *Price &
+attributes*, sits above the description panel (card view, and in the table view's
+one-SKU expander). It shows, for the row on screen only (`app.review_summary`):
+- the MRP on the page, the selling price on the page and its kind (`MOP` or `sale
+  price`, from the non-published `price_kind` column), the price that will be
+  published and the rule in words (`18,590 + 2,000 = 20,590, cap 37,790`, from
+  `client_config.one_price`);
+- every attribute that will be published, with its source (`specification`,
+  `description`, `title`, `brand`, `reviewer`), filter attributes marked ✔, and the
+  required attributes still missing as a warning.
+
+Edits are saved in the same `runs\<name>\description_overrides.json`, per SKU, keys
+`price` (`values`: only the changed `regular price` / `sale price` and a non-empty
+`publish price`) and `attributes` (`set` {name: value}, `remove` [names]).
+`_filled.xlsx` is not changed. Refusal rules: a page price that is not a positive
+number; a publish price that is not a positive number or is above the MRP in effect;
+an attribute value that fails the content firewall (`content_ok` / `spec_row_ok`), is
+empty, is a never-a-value word (`Yes`, `No`, `N/A`) or is longer than 40 characters.
+A refused entry is named in red and not saved. An empty publish price means no
+override. With a publish price the output still has ONE price and an empty sale
+price; the screen marks it HAND-ENTERED. A value typed for a filter group goes
+through the same snap / new-value rule as a scraped value; a reviewer value that
+fills a required attribute clears its `_spec_gaps` entry, and a removed one shows as
+missing. *Reset price to the page* / *Reset attributes to generated* remove the
+edits. The build (`build_csv.py --description-overrides ...` too) applies them;
+without overrides the output is byte-identical. Limit: a changed non-filter
+attribute changes the attribute columns, not the description tables (they have
+their own editor).
+
 **Review instrumentation.** `runs\<name>\review_state.json` records an `events`
 list beside `confirmed` — one entry per approve / unapprove / edit / url_pasted /
 drop_image / skip, with the mode (table or card), an ISO timestamp and the wall
@@ -509,14 +556,26 @@ optional "estimate MRP as sale x 1.25" (off by default); optional
 that needs a look, so QA is part of generating the file rather than a separate
 step to remember.
 
-**One price only (`[pricing] single_price`, owner decision 2026-11-19).** When a
-client's `client.toml` sets `[pricing] single_price = true` (shreejee does; the code
-default is false), the CSV has ONE price: `regular price` = the higher of the row's
-MRP and selling price (whichever exist), `sale price` = empty. Price-band tags and
-the SEO description use that one price; no "MRP", saving or "% off" text is written;
-"estimate MRP" does nothing. The `_filled.xlsx` still records both values. The
-validator, `wc_publish.py` (sends `sale_price: ""`, which clears a live sale price on
-the products it writes) and `wc_seo.py` follow. Details: docs/CLIENT_CONFIG.md.
+**Selling price priority (owner decision 2026-11-19, late).** The enricher takes a
+labelled MOP on the page (`MOP` / `M.O.P.` / `Market Operating Price` + a currency
+sign) as the selling price FIRST; with no MOP it uses the page's sale price
+(site parser / JSON-LD / meta). The MRP stays the MRP (guards unchanged:
+`bogus_mrp`, foreign-currency strikes ignored). The non-published sheet column
+`price_kind` records `MOP` or `sale price` (a donor price carries its own kind).
+
+**One price only (`[pricing]`, owner decisions 2026-11-19).** When a client's
+`client.toml` sets `[pricing] single_price = true` (shreejee does; the code default is
+false), the CSV has ONE price in `regular price` and `sale price` is empty. Which
+price: `basis` and `markup` (`client_config.one_price`). shreejee has `basis =
+"lower"`, `markup = 2000`: a row with an MRP and a lower selling price ships the
+selling price + 2,000, capped at the MRP (MRP 37,790, price 18,590 -> 20,590); a row
+with only one price ships it unchanged. `basis = "higher"` (the code default, with
+`markup = 0`) ships the higher of the two. Price-band tags and the SEO description
+use that one price; no "MRP", saving or "% off" text is written; "estimate MRP" does
+nothing. The CSV writes whole prices as `20590`, not `20590.0`. The `_filled.xlsx`
+still records both values. The validator, `wc_publish.py` (sends the CSV price
+unchanged and `sale_price: ""`, which clears a live sale price on the products it
+writes) and `wc_seo.py` follow. Details: docs/CLIENT_CONFIG.md.
 
 **Gross Weight is not written** (owner decision 2026-11-19): the content firewall's
 label deny list refuses it. Product / Item / Net Weight are written as `Weight`.
@@ -537,12 +596,25 @@ CSV stays a usable width.
 **Attribute completeness gate:** the `Sub-Category Attributes` sheet already
 declares which axes matter per sub-category (an AC has a Ton, a TV has a Size).
 Read as a checklist, it becomes a gate: any axis a product cannot fill from its
-title, its specs or the sheet's own vocabulary is written to a `_spec_gaps`
-column, summarised in a warning, and reported by validate_csv.py as
+spec rows, its description text (`page_text`), its title, a filter attribute or the
+sheet's own vocabulary is written to a `_spec_gaps` column, summarised in a warning, and reported by validate_csv.py as
 `missing_required_attribute`. It **flags, it does not block** — a missing axis
 is often just a terse title, and the human review step decides.
 
 #### Filter groups (owner rule, 2026-11-19)
+
+**Source order (2026-11-19, late).** Every filter group and every required
+attribute looks, in this order, in: (1) the scraped specification rows, (2) the
+page's description text (the enricher's non-published `page_text` column: JSON-LD
+`description` and the meta / og description, each segment through the content
+firewall), (3) the product title. The first source that STATES the value wins; each
+filter hit records its source (`FilterHit.source`). The existing axis parsers are
+used on every source; the title wording is not rewritten. Screen size reads
+`80 cm (32)`, `80cm(32)`, `80 cm (32 inch)`, `108 cm (43 inches)`, `32 inch`, `32"`;
+the bracketed number is the stated inch size, and a cm figure alone is never
+converted. A thousands comma is not a list separator (`HD (1,366 x 768)` snaps to
+`HD Ready`). The enricher also reads label/value sibling pairs (samsung.com spec
+lists, `pair_specs`; a compare widget and sentence-long values are skipped).
 
 The store's filter groups decide the product attributes. A customer filters
 by attribute, so an attribute that feeds a filter must use the filter's own
@@ -829,6 +901,7 @@ a batch can run unattended and so the formatter can be asserted on by tests.
 | `--seo` | Add the SEO meta columns (OFF by default) |
 | `--seo-plugin` | `yoast` (default) · `rankmath` · `both` |
 | `--no-validate` | Skip the QA pass that otherwise runs on the file just written |
+| `--description-overrides JSON` | The reviewer's edits per SKU: description / short description, page MRP / selling price / publish price, attributes (`runs\<name>\description_overrides.json`, written by the GUI review step). Default: none - every field is generated |
 | `--pack` | Also write `<out stem>_pack\` — CSV, the images the CSV references and a README (never the `_filled.xlsx`, the report or a log) — and zip it. The same client pack the GUI's Archive button zips |
 | `--client SLUG` | Which client's config to use (default: `PIPELINE_CLIENT`, then `shreejee`) |
 

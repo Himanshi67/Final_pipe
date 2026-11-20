@@ -8,6 +8,7 @@ into product_images_for_upload\\ exactly as they are in the app.
     .venv\\Scripts\\python.exe build_csv.py "LED_filled.xlsx"
     .venv\\Scripts\\python.exe build_csv.py "LED_filled.xlsx" -o out.csv --month 2026/08
     .venv\\Scripts\\python.exe build_csv.py "LED_filled.xlsx" --all-rows
+    .venv\\Scripts\\python.exe build_csv.py "LED_filled.xlsx" --description-overrides runs\\x\\description_overrides.json
 
 Exists so the pipeline can run unattended and so the formatter is testable -
 the Streamlit-only version could not be asserted on by any script.
@@ -86,6 +87,12 @@ def main():
     ap.add_argument("--seo-plugin", default="yoast",
                     choices=["yoast", "rankmath", "both"],
                     help="Which plugin's meta keys to write (default: yoast)")
+    ap.add_argument("--description-overrides", metavar="JSON",
+                    help="The reviewer's edits per SKU: description, short "
+                         "description, page MRP / selling price / publish "
+                         "price, attributes (description_overrides.json "
+                         "in the GUI run folder, written by the review "
+                         "step). Default: none - every field is generated.")
     ap.add_argument("--no-validate", action="store_true",
                     help="Skip the QA pass that normally runs on the file this "
                          "writes")
@@ -130,10 +137,23 @@ def main():
     folder = args.month.strip().strip("/") or f"{datetime.now():%Y/%m}"
     media_base = app.CLIENT.media_base(folder)
 
+    overrides = None
+    if args.description_overrides:
+        import gui_helpers
+        ov_path = Path(args.description_overrides)
+        if not ov_path.exists():
+            sys.exit(f"Overrides file not found: {ov_path}")
+        overrides = gui_helpers.overrides_for_build(
+            gui_helpers.load_overrides_state(ov_path))
+        # (covers description, price and attribute edits)
+        print(f"Description overrides: {len(overrides)} SKU(s) from "
+              f"{ov_path.name}")
+
     result = app.process_inventory(df, media_base=media_base,
                                    estimate_mrp=args.estimate_mrp,
-                                   seo=args.seo, seo_plugin=args.seo_plugin)
-    result.to_csv(out, index=False, quoting=1)
+                                   seo=args.seo, seo_plugin=args.seo_plugin,
+                                   description_overrides=overrides)
+    app.write_csv(result, out)
 
     images = result["Images"].map(app.compact)
     with_images = int((images != "").sum())

@@ -26,6 +26,7 @@ One-time install:
 import argparse
 import json
 import atexit
+import functools
 import gzip
 import hashlib
 import os
@@ -662,7 +663,15 @@ def content_hits(text, *, brand=""):
     text = str(text or "")
     if not text.strip():
         return []
-    own = _alnum(brand)
+    return list(_content_hits_for(text, _alnum(brand)))
+
+
+# Pure in (text, own brand) and the regexes are module constants, so the
+# result is memoised: one 3-row build checked 652 strings of which only 125
+# were distinct ('Yes', 'Screen Size' ...), and a 300-row build + validation
+# made ~90,000 calls. A tuple is cached; content_hits hands out a new list.
+@functools.lru_cache(maxsize=16384)
+def _content_hits_for(text, own):
     hits = []
     for m in RETAILER_RE.finditer(text):
         name = _alnum(m.group(0))
@@ -671,7 +680,7 @@ def content_hits(text, *, brand=""):
         hits.append(m.group(0))
     for pattern in (COMMERCE_RE, SERVICE_RE, URL_RE, EMAIL_RE, PHONE_RE):
         hits.extend(m.group(0).strip() for m in pattern.finditer(text))
-    return hits
+    return tuple(hits)
 
 
 def content_ok(text, *, brand=""):
@@ -996,7 +1005,7 @@ def collect_images(soup, html, base_url=""):
         tier1.append(el.get("content") or el.get("src") or el.get("href") or "")
 
     buckets = {key: [] for key in META_IMAGE_KEYS}
-    for meta in soup.find_all("meta"):
+    for meta in _soup_find_all(soup, "meta", "meta"):
         for key in META_IMAGE_KEYS:
             if meta.get(key[0]) == key[1]:
                 buckets[key].append(meta.get("content", ""))
@@ -1061,13 +1070,44 @@ def collect_images(soup, html, base_url=""):
 # a short window of tags, whitespace and ':' / '-' only (no text, no other
 # number) - structural, not a haier-specific selector. Each window is
 # `\s*((tag|punct)\s*){0,N}`, which cannot backtrack exponentially.
-# 'MOP' (market operating price) is deliberately NOT a label here: owner
-# decision 2026-11-19, MOP is not used as a price.
+# 'MOP' (market operating price) is NOT an MRP label: it is the SELLING price
+# (owner decision 2026-11-19, revised: the store prices from the lower page
+# price), read by SALE_LABEL_RE below.
 _MRP_GAP = r"\s*(?:(?:<[^>]{0,120}>|[:\-])\s*){0,%d}"
 MRP_LABEL_RE = re.compile(
     r"\b(?:M\.?R\.?P\.?|Maximum Retail Price|List Price|Was)(?![A-Za-z])\s*"
     r"(?:\([^)]{0,40}\))?" + (_MRP_GAP % 10)
     + r"(?:₹|Rs\.?|INR)" + (_MRP_GAP % 8) + r"([\d][\d,.]*)", re.I)
+
+# Selling price by its LABEL: 'MOP' / 'M.O.P.' / 'Market Operating Price'
+# (haier.com shows "MOP : ₹ 18590" beside "MRP : ₹ 37790"). Same structural
+# gap windows as MRP_LABEL_RE, so no text and no other number may sit between
+# label, currency sign and digits - a number is taken only when its label is
+# there. Case-SENSITIVE for the abbreviation: a lowercase 'Mop' is a cleaning
+# mop (robot-vacuum pages sell mop pads with a price beside them), not a
+# price label. The class names are not used: haier.com puts the MRP in
+# class="js_mop" and the MOP in class="js_price".
+SALE_LABEL_RE = re.compile(
+    r"\b(?:M\.?O\.?P\.?|[Mm]arket [Oo]perating [Pp]rice)(?![A-Za-z])\s*"
+    r"(?:\([^)]{0,40}\))?" + (_MRP_GAP % 10)
+    + r"(?:₹|Rs\.?|INR)" + (_MRP_GAP % 8) + r"([\d][\d,.]*)")
+
+# What the row's selling price is, in the non-published `price_kind` column:
+# the labelled MOP, or the page's plain sale / selling price.
+PRICE_KIND_MOP = "MOP"
+PRICE_KIND_SALE = "sale price"
+
+
+def sale_near_label(html):
+    """Selling price by the WORD 'MOP' (market operating price). The first
+    labelled positive number wins; '' when no such label carries a price.
+    Since 2026-11-19 (late) a MOP found here WINS over the JSON-LD / meta /
+    site-parser selling price (see extract())."""
+    for m in SALE_LABEL_RE.finditer(str(html or "")):
+        v = clean_price(m.group(1))
+        if price_value(v):
+            return v
+    return ""
 
 # Substrings that mark a strike-through price in a class name. Matched
 # case-sensitively against the raw class string, which is what the CSS
@@ -2310,9 +2350,37 @@ atexit.register(_close_sessions)
 
 # -------------------------------- parsing --------------------------------
 
+def _soup_find_all(soup, key, *args, **kwargs):
+    """soup.find_all(*args, **kwargs), walked ONCE per soup and kept in the
+    soup's own __dict__ (so it dies with the soup). extract() builds one soup
+    per page and nothing in this file mutates it, but jsonld_products ran 4x
+    and the meta lookups 5-8x per page, each a full document walk.
+    Returns the SAME list every call - callers only read it."""
+    memo = getattr(soup, "__dict__", None)
+    if memo is None:
+        return soup.find_all(*args, **kwargs)
+    cache = memo.get("_se_find_all")
+    if cache is None:
+        cache = memo["_se_find_all"] = {}
+    if key not in cache:
+        cache[key] = soup.find_all(*args, **kwargs)
+    return cache[key]
+
+
+def first_meta(soup, attr, value):
+    """The first <meta> whose `attr` equals `value` - the element
+    soup.select_one(f'meta[{attr}="{value}"]') returns (document order, exact
+    case-sensitive value; lxml already lower-cases tag and attribute names),
+    without a soupsieve walk of the whole document per call."""
+    for el in _soup_find_all(soup, "meta", "meta"):
+        if el.get(attr) == value:
+            return el
+    return None
+
+
 def jsonld_products(soup):
     prods = []
-    for sc in soup.find_all("script", type="application/ld+json"):
+    for sc in _soup_find_all(soup, "ldjson", "script", type="application/ld+json"):
         try:
             data = json.loads(sc.string or sc.get_text() or "", strict=False)
         except Exception:
@@ -2501,7 +2569,7 @@ def parse_croma(html, soup, url):
     but the full image gallery and title ARE in the static page."""
     title = mrp = sale = ""
     imgs = []
-    el = soup.select_one('meta[property="og:title"]')
+    el = first_meta(soup, "property", "og:title")
     if el and el.get("content"):
         title = el.get("content").strip()
     elif soup.title:
@@ -2522,7 +2590,7 @@ def parse_croma(html, soup, url):
             if k not in by_idx:
                 by_idx[k] = u
         imgs = [by_idx[k] for k in sorted(by_idx)]
-    el = soup.select_one('meta[property="og:image"]')
+    el = first_meta(soup, "property", "og:image")
     if el and el.get("content"):
         imgs = imgs + [el.get("content")]     # append rather than fall back
 
@@ -2551,14 +2619,14 @@ def parse_reliance(html, soup):
     if el:
         title = el.get_text(strip=True)
     if not title:
-        el = soup.select_one('meta[property="og:title"]')
+        el = first_meta(soup, "property", "og:title")
         if el and el.get("content"):
             title = el.get("content")
     title = clean_title(title)
     m = re.search(r"MRP[^₹]{0,120}₹\s*([\d,]+(?:\.\d+)?)", h)
     if m:
         mrp = clean_price(m.group(1))
-    og = soup.select_one('meta[property="og:image"]')
+    og = first_meta(soup, "property", "og:image")
     og_url = og.get("content", "") if og else ""
     item = ""
     m = re.search(r"/(\d{6,})/\d+/", og_url)
@@ -2588,7 +2656,7 @@ def parse_ifb(html, soup):
     before the 'MRP (Incl. of all taxes)' label (verified); gallery = adobe
     asset URNs that repeat across the page (related products appear once)."""
     title = mrp = sale = ""
-    el = soup.select_one('meta[property="og:title"]')
+    el = first_meta(soup, "property", "og:title")
     if el and el.get("content"):
         title = clean_title(el.get("content"))
     elif soup.title:
@@ -2616,22 +2684,22 @@ def parse_generic(html, soup, url=""):
         title = str(p.get("name", "")).strip()
         mrp, sale = offer_prices(p)         # MRP was never read here before
     if not title:
-        el = soup.select_one('meta[property="og:title"]')
+        el = first_meta(soup, "property", "og:title")
         if el and el.get("content"):
             title = el.get("content").strip()
         elif soup.title:
             title = soup.title.get_text(strip=True)
     title = clean_title(title)
     if not sale:
-        for sel in ('meta[property="product:price:amount"]',
-                    'meta[itemprop="price"]'):
-            el = soup.select_one(sel)
+        for attr, value in (("property", "product:price:amount"),
+                            ("itemprop", "price")):
+            el = first_meta(soup, attr, value)
             if el and el.get("content"):
                 sale = clean_price(el.get("content"))
                 if sale:
                     break
     if not mrp:
-        el = soup.select_one('meta[property="product:original_price:amount"]')
+        el = first_meta(soup, "property", "product:original_price:amount")
         if el and el.get("content"):
             mrp = clean_price(el.get("content"))
     return title, mrp, sale, collect_images(soup, html, url)
@@ -2769,6 +2837,98 @@ def bullet_specs(soup):
     return out
 
 
+# A spec row laid out as two sibling elements whose CLASS names say "label"
+# and "value" (samsung.com 2026-11-19: <li><p class="...-item-title">Screen
+# Size</p><p class="...-item-desc">80 cm</p></li>). No colon, no table, so
+# neither table_specs nor bullet_specs saw it, and the samsung.com rows came
+# out with no spec table at all. Structural, not a samsung selector: the
+# value element's class ends in desc/value, its only element sibling's class
+# ends in title/label/name/key, and the pair is the whole parent. A product
+# COMPARE widget (other products' values) is never read.
+_PAIR_VALUE_CLASS_RE = re.compile(r"(?:^|[-_])(?:desc|description|value|val)$",
+                                  re.I)
+_PAIR_LABEL_CLASS_RE = re.compile(r"(?:^|[-_])(?:title|label|name|key|term)$",
+                                  re.I)
+
+
+def _in_compare_widget(tag):
+    for parent in tag.parents:
+        cls = " ".join(parent.get("class") or []) if hasattr(parent, "get") else ""
+        if "compare" in cls.lower():
+            return True
+    return False
+
+
+def pair_specs(soup):
+    """(label, value) rows from label/value sibling pairs (see above)."""
+    out = []
+    for value_el in soup.find_all(class_=_PAIR_VALUE_CLASS_RE, limit=400):
+        parent = value_el.parent
+        if parent is None:
+            continue
+        kids = [c for c in parent.find_all(recursive=False)]
+        if len(kids) != 2 or kids[1] is not value_el:
+            continue
+        label_cls = " ".join(kids[0].get("class") or [])
+        if not any(_PAIR_LABEL_CLASS_RE.search(c)
+                   for c in (kids[0].get("class") or [])) or not label_cls:
+            continue
+        if _in_compare_widget(parent):
+            continue
+        label = clean_spec_text(kids[0].get_text(" ", strip=True))
+        value = clean_spec_text(value_el.get_text(" ", strip=True)
+                                .replace("�", "").replace("™", ""))
+        # a marketing sentence ('The new Beveled type bezel design offers
+        # ...') sits in the same layout; a spec value is short
+        if len(value.split()) > PAIR_VALUE_MAX_WORDS:
+            continue
+        if usable_spec(label, value):
+            out.append((label, value))
+    return out
+
+
+PAIR_VALUE_MAX_WORDS = 10
+
+
+# The page's own description / key-feature text, kept in the NON-published
+# `page_text` column so app.py can read an attribute value the spec table
+# does not state (owner request 2026-11-19: "crawl it from the description").
+# Sources: JSON-LD Product.description and the meta / og description. (A
+# "highlights" block was tried and dropped: on samsung.com the class also
+# marks the shop navigation - 'Black Friday', 'Trade-in'.) Each segment
+# passes the content firewall or is dropped; the whole is capped.
+PAGE_TEXT_MAX = 1500
+
+
+def page_text(soup, prods=None):
+    """' | '-joined description segments for one page ('' when none)."""
+    raw = []
+    for prod in (prods if prods is not None else jsonld_products(soup)):
+        desc = prod.get("description")
+        if isinstance(desc, str):
+            raw.append(BeautifulSoup(desc, "lxml").get_text(" ", strip=True)
+                       if "<" in desc else desc)
+    for attr, value in (("name", "description"),
+                        ("property", "og:description")):
+        tag = first_meta(soup, attr, value)
+        if tag and tag.get("content"):
+            raw.append(tag["content"])
+    out, seen, size = [], set(), 0
+    for chunk in raw:
+        for seg in re.split(r"\s*[|\n]\s*|(?<=[.!?])\s+", str(chunk or "")):
+            seg = re.sub(r"\s+", " ", seg).strip(" .;,-")
+            key = seg.lower()
+            if (len(seg) < 3 or key in seen or "{{" in seg
+                    or not content_ok(seg)):
+                continue
+            if size + len(seg) + 3 > PAGE_TEXT_MAX:
+                return " | ".join(out)
+            seen.add(key)
+            out.append(seg)
+            size += len(seg) + 3
+    return " | ".join(out)
+
+
 def extract_specs(soup, prods=None):
     """The product's specification table as an ordered list of (label, value).
 
@@ -2784,6 +2944,7 @@ def extract_specs(soup, prods=None):
     for make_source in (
             lambda: jsonld_specs(prods if prods is not None else jsonld_products(soup)),
             lambda: table_specs(soup),
+            lambda: pair_specs(soup),
             lambda: bullet_specs(soup)):
         if len(rows) >= MAX_SPECS:
             break
@@ -2839,6 +3000,17 @@ def extract(url, html):
         # site-parser images stay FIRST (higher confidence), and this is a merge
         # rather than a replace, so the primary image of a working row is unchanged
         t, m, s, i = t or t2, m or m2, s or s2, list(i) + list(i2)
+    # Selling-price priority (owner decision 2026-11-19, late): a labelled
+    # MOP on the page ('MOP : ₹ 18590', haier.com) WINS over every other
+    # selling price; with no MOP, the page's sale price (site parser /
+    # JSON-LD / meta) is used. Before the MRP sweep, so mrp_near_label() can
+    # require the MRP to be above it. `price_kind` records which one it was
+    # (a non-published sheet column, shown in the GUI review step).
+    mop = sale_near_label(html)
+    if mop:
+        s, kind = mop, PRICE_KIND_MOP
+    else:
+        kind = PRICE_KIND_SALE if s else ""
     if not m:
         m = mrp_near_label(html, s) or mrp_from_strike(soup, s)
     # MRP sanity (<= sale, or many times it) is judged once, downstream, by
@@ -2852,7 +3024,9 @@ def extract(url, html):
             # a POOL, not the final gallery - upgrade_gallery() measures these
             # and drops the small ones, then the caller trims to MAX_IMAGES
             "image_url": ",".join(dedupe_images(i, url, limit=IMAGE_POOL)),
-            "specs": specs}
+            "specs": specs,
+            "price_kind": kind if s else "",
+            "page_text": page_text(soup) if SPECS_ENABLED else ""}
 
 # ------------------------------ per-SKU flow ------------------------------
 
@@ -3245,9 +3419,18 @@ def merge_sources(best, hits, min_images=MIN_IMAGES):
             if h.get("sale price") and not bogus_mrp(h.get("regular price"),
                                                      h.get("sale price")):
                 best["sale price"] = h["sale price"]
+                best["price_kind"] = h.get("price_kind", "")
                 if not best.get("regular price"):
                     best["regular price"] = h.get("regular price", "")
                 donors.append(f"price from {domain_of(h['url_link'])}")
+                break
+
+    # the page's description / key-feature text (not published; app.py reads
+    # attribute values from it when the spec table does not state them)
+    if not best.get("page_text"):
+        for h in others:
+            if h.get("page_text"):
+                best["page_text"] = h["page_text"]
                 break
 
     # An MRP is only meaningful beside a price - and unjudgeable without one,
@@ -3936,6 +4119,12 @@ COL_ALIASES = {
     # simply gets it appended on the next run.
     "specs": ["specs", "specifications", "spectable", "attributes"],
     "status": ["status", "lookupstatus"],
+    # NOT published (app.py never copies them to the CSV): which kind of
+    # selling price the row holds ('MOP' / 'sale price'), and the page's own
+    # description / key-feature text, which app.py reads attribute values
+    # from after the spec table and before the title (2026-11-19, late)
+    "price_kind": ["pricekind"],
+    "page_text": ["pagetext"],
 }
 
 
@@ -4948,7 +5137,8 @@ def main():
                 elif rec.get(key):
                     ws.cell(row=r, column=col, value=safe_cell(rec[key]))
                 elif relisted and key in ("regular price", "sale price",
-                                          "image_url", "specs"):
+                                          "image_url", "specs", "price_kind",
+                                          "page_text"):
                     ws.cell(row=r, column=col, value=None)
             st = keep_status or rec.get("status", "")
             if args.discover:

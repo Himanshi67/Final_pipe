@@ -8,6 +8,12 @@ is written; price-band tags use the one price; the validator, the REST
 payload (sale_price sent as "") and the stage-1 check follow. Code default
 is false, so other clients keep two prices. _filled.xlsx is not changed.
 
+Second owner decision (2026-11-19): `basis = "lower"` + `markup = 2000`. A
+row with two different prices ships the LOWER + 2,000, capped at the higher
+(never above the MRP); a row with one price ships it unchanged. Code
+defaults basis "higher" / markup 0 keep the first rule for any client that
+sets only single_price. The "lower" tests are at the end of this file.
+
     .venv\\Scripts\\python.exe -m pytest tests\\test_single_price.py -q
 """
 import contextlib
@@ -31,12 +37,13 @@ import wc_publish as W                             # noqa: E402
 
 
 @contextlib.contextmanager
-def pricing(single):
+def pricing(single, basis="higher", markup=0):
     saved = (app.CLIENT, V.CLIENT, W.CLIENT)
     try:
         for mod in (app, V, W):
             mod.CLIENT = dataclasses.replace(
-                mod.CLIENT, pricing=client_config.PricingConfig(single))
+                mod.CLIENT, pricing=client_config.PricingConfig(
+                    single, basis=basis, markup=markup))
         yield
     finally:
         app.CLIENT, V.CLIENT, W.CLIENT = saved
@@ -75,12 +82,13 @@ def test_shreejee_is_single_price():
 @pytest.mark.parametrize("mrp,sale,want", [
     (45990, 28990, 45990),          # MRP above price: the MRP
     ("", 18999, 18999),             # only a selling price
-    (37790, "", 37790),             # only an MRP (haier.com, MOP not used)
+    (37790, "", 37790),             # only an MRP
     (10000, 12000, 12000),          # a bogus MRP below the price: the higher
     (999.5, "", 999.5),
 ])
 def test_single_price_pair_is_the_higher(mrp, sale, want):
-    assert app.single_price_pair(mrp, sale) == (want, "")
+    with pricing(True, basis="higher"):
+        assert app.single_price_pair(mrp, sale) == (want, "")
 
 
 def test_single_price_pair_with_no_price():
@@ -219,3 +227,146 @@ def test_dry_run_names_the_sale_price_it_clears():
     text = W.describe(payload, {"name": "X", "regular_price": "45990",
                                 "sale_price": "28990"})
     assert "sale_price 28990 -> -" in text
+
+
+# ------------------------------------------- basis = "lower" + markup (rule 2)
+def test_pricing_table_defaults_basis_and_markup():
+    cfg = client_config._load_pricing({"pricing": {"single_price": True}}, "t")
+    assert (cfg.basis, cfg.markup) == ("higher", 0)
+    cfg = client_config._load_pricing(
+        {"pricing": {"single_price": True, "basis": "lower",
+                     "markup": 2000}}, "t")
+    assert (cfg.basis, cfg.markup) == ("lower", 2000)
+    assert client_config._load_pricing(
+        {"pricing": {"basis": "lower", "markup": 0}}, "t").markup == 0
+
+
+@pytest.mark.parametrize("table", [
+    {"basis": "lowest"}, {"basis": 1}, {"markup": -1}, {"markup": "2000"},
+    {"markup": True},
+])
+def test_pricing_table_refuses_bad_basis_or_markup(table):
+    with pytest.raises(client_config.ClientConfigError):
+        client_config._load_pricing({"pricing": table}, "t")
+
+
+def test_shreejee_is_lower_plus_2000():
+    cfg = client_config.load_client("shreejee").pricing
+    assert (cfg.single_price, cfg.basis, cfg.markup) == (True, "lower", 2000)
+
+
+LOWER = client_config.PricingConfig(True, basis="lower", markup=2000)
+
+
+@pytest.mark.parametrize("mrp,sale,want", [
+    (37790, 18590, 20590),          # the owner's example: Haier H32K82FX
+    ("37,790", "18,590", 20590),    # text with thousands separators
+    (45990, 28990, 30990),
+    (19990, 18990, 19990),          # lower + markup above the MRP: capped
+    (20590, 18590, 20590),          # exactly at the cap
+    (37790, "", 37790),             # one price only: unchanged, no markup
+    ("", 18590, 18590),
+    (18590, 18590, 18590),          # both equal = one price: no markup
+    (10000, 12000, 12000),          # bogus MRP below the price: still capped
+    ("", "", None), (None, 0, None), ("n/a", "", None),
+])
+def test_one_price_lower_plus_markup(mrp, sale, want):
+    assert client_config.one_price(mrp, sale, LOWER) == want
+
+
+def test_one_price_lower_with_zero_markup_is_the_lower():
+    cfg = client_config.PricingConfig(True, basis="lower", markup=0)
+    assert client_config.one_price(37790, 18590, cfg) == 18590
+
+
+def test_one_price_default_is_the_higher():
+    assert client_config.one_price(37790, 18590) == 37790
+    assert client_config.one_price(37790, 18590,
+                                   client_config.PricingConfig(True)) == 37790
+
+
+def test_single_price_pair_lower_is_idempotent():
+    with pricing(True, basis="lower", markup=2000):
+        first = app.single_price_pair(37790, 18590)
+        assert first == (20590, "")
+        # normalising the one price again (seo_description does) adds nothing
+        assert app.single_price_pair(*first) == (20590, "")
+
+
+def test_row_context_and_seo_lower_plus_markup():
+    haier = row(sku="H32K82FX", title="Haier 80 cm (32 Inch) HD Ready "
+                "Smart Google TV H32K82FX", **{"regular price": "37,790",
+                                                "sale price": "18,590"})
+    with pricing(True, basis="lower", markup=2000):
+        ctx = app.row_context(haier)
+        assert (ctx["regular price"], ctx["sale price"]) == (20590, "")
+        # the build hands seo_description the one price; no second markup
+        text = app.seo_description(ctx["title"], "Haier", "LED", [],
+                                   ctx["regular price"], ctx["sale price"])
+        assert "Price Rs 20,590." in text
+        assert "37,790" not in text and "18,590" not in text
+        # a caller passing the raw pair gets the same one price
+        text = app.seo_description("Haier 32 TV", "Haier", "LED", [],
+                                   37790, 18590)
+        assert "Price Rs 20,590." in text
+
+
+def test_build_output_lower_plus_markup_and_whole_number_csv(monkeypatch,
+                                                              tmp_path):
+    monkeypatch.setattr(app, "download_urls_for_sku",
+                        lambda sku, urls, flags=None: [])
+    df = pd.DataFrame([row(**{"regular price": "37,790",
+                              "sale price": "18,590"})])
+    with pricing(True, basis="lower", markup=2000):
+        out = app.process_inventory(df, media_base="https://x.test/m",
+                                    seo=True)
+    got = out.iloc[0]
+    assert got["regular price"] == 20590
+    assert got["sale price"] is None or pd.isna(got["sale price"])
+    assert "20000 to 30000" in got["Tags"]
+    # the CSV writes "20590", never "20590.0", and an empty sale price
+    target = tmp_path / "out.csv"
+    app.write_csv(out, target)
+    back = pd.read_csv(target, dtype=str, keep_default_na=False)
+    assert back.loc[0, "regular price"] == "20590"
+    assert back.loc[0, "sale price"] == ""
+    raw = target.read_text(encoding="utf-8")
+    assert '"20590"' in raw and '"20590.0"' not in raw
+
+
+def test_write_csv_price_text():
+    assert app._price_cell_text(37790.0) == "37790"
+    assert app._price_cell_text(1299.5) == "1299.5"
+    assert app._price_cell_text(None) == ""
+    assert app._price_cell_text(float("nan")) == ""
+    assert app._price_cell_text("") == ""
+
+
+def test_payload_sends_the_csv_price_unchanged_in_lower_mode():
+    cfg = dataclasses.replace(W.CLIENT, pricing=LOWER)
+    # the CSV from app.py: one price, no sale price -> exactly that, no markup
+    assert W.payload_prices({"regular price": "20590", "sale price": ""},
+                            cfg) == ("20590", "")
+    assert W.payload_prices({"regular price": 20590.0, "sale price": ""},
+                            cfg) == ("20590", "")
+    # a stale CSV with both values: the same rule as the build
+    assert W.payload_prices({"regular price": 37790, "sale price": 18590},
+                            cfg) == ("20590", "")
+
+
+def test_stage1_validator_reads_the_lower_plus_markup_price(tmp_path):
+    # HD Ready TV over 25,000 is flagged; the shipped price decides it
+    df = pd.DataFrame([{"sku": "HAIER-H32K82FX",
+                        "title": "Haier 80 cm (32 Inch) HD Ready Smart Google "
+                                 "TV H32K82FX",
+                        "status": "FOUND (haier.com)",
+                        "url_link": "https://www.haier.com/in/x.shtml",
+                        "image_url": "a.jpg,b.jpg,c.jpg",
+                        "regular price": 37790, "sale price": 18590}])
+    path = str(tmp_path / "x_filled.xlsx")
+    with pricing(True, basis="lower", markup=2000):
+        text = " ".join(str(i) for i in (V.validate_filled(df, path) or []))
+    assert "hd_ready_priced_like_premium" not in text
+    with pricing(True, basis="higher"):
+        text = " ".join(str(i) for i in (V.validate_filled(df, path) or []))
+    assert "hd_ready_priced_like_premium" in text

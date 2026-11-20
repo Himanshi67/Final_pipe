@@ -184,8 +184,12 @@ def desired_meta(product, plugin):
     sale = product.get("sale_price") or ""
     # WooCommerce keeps the struck-through price in regular_price and the
     # charged one in sale_price; with no sale, regular IS what you pay
-    # With [pricing] single_price, app.seo_description quotes ONE price (the
-    # higher of the two) and never an MRP or a saving, whatever is live.
+    # With [pricing] single_price, app.seo_description quotes ONE price and
+    # never an MRP or a saving, whatever is live. A product published in
+    # single-price mode has only regular_price, which is quoted UNCHANGED (one
+    # price = no markup); a stale live product with both prices is quoted by
+    # the same basis/markup rule (client_config.one_price) that the next
+    # wc_publish.py run will write.
     charged = sale or regular
     struck = regular if sale else ""
 

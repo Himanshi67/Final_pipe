@@ -843,15 +843,19 @@ def payload_prices(row, client=None):
     # one charged. With no MRP the selling price IS the regular price.
     if not regular:
         regular, sale = sale, ""
-    # [pricing] single_price: ONE price. regular_price = the higher of the
-    # two (a CSV from app.py already has sale empty; this also covers a stale
-    # or hand-edited CSV), and sale_price is SENT as "" - on an update that
-    # CLEARS any sale price the live product had, for the products this run
-    # writes only. Products not in the CSV are not touched.
-    if getattr(getattr(cfg, "pricing", None), "single_price", False):
-        values = [float(v) for v in (regular, sale) if v]
-        if values:
-            regular = price_str(max(values))
+    # [pricing] single_price: ONE price, and sale_price is SENT as "" - on an
+    # update that CLEARS any sale price the live product had, for the products
+    # this run writes only. Products not in the CSV are not touched.
+    # A CSV from app.py already holds the one price in 'regular price' and an
+    # empty sale price: one_price() returns that value UNCHANGED (one price =
+    # no markup), so publish sends exactly what the CSV says. Only a stale or
+    # hand-edited CSV with both values is recomputed, by the same rule
+    # (client_config.one_price: basis/markup) the build uses.
+    pricing = getattr(cfg, "pricing", None)
+    if getattr(pricing, "single_price", False):
+        one = client_config.one_price(regular, sale, pricing)
+        if one is not None:
+            regular = price_str(one)
         sale = ""
     return regular, sale
 

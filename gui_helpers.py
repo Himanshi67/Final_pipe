@@ -744,21 +744,24 @@ def stale_confirmations(state, df) -> set:
     choice is to keep the skip until a human clears it."""
     if df is None or "sku" not in getattr(df, "columns", []):
         return set()
-    current = {}
-    for _, row in df.iterrows():
-        sku = str(row["sku"])
-        if sku not in current:
-            current[sku] = row_fingerprint(row)
-    stale = set()
+    ticks = {}                          # the ticks that CAN go stale
     for sku, v in (state or {}).get("confirmed", {}).items():
         if not isinstance(v, dict) or not v.get("confirmed") \
                 or v.get("skipped"):
             continue
-        fp = v.get("fp")
-        sku = str(sku)
-        if fp and sku in current and current[sku] != fp:
-            stale.add(sku)
-    return stale
+        if v.get("fp"):
+            ticks[str(sku)] = v.get("fp")
+    if not ticks:
+        return set()
+    # hash only the rows a tick names (first row per sku, as before): step 2
+    # calls this on every rerun, and hashing all 300 rows cost ~0.1 s a click
+    current = {}
+    for _, row in df[df["sku"].astype(str).isin(ticks)].iterrows():
+        sku = str(row["sku"])
+        if sku not in current:
+            current[sku] = row_fingerprint(row)
+    return {sku for sku, fp in ticks.items()
+            if sku in current and current[sku] != fp}
 
 
 def merge_confirm_flags(existing, original, parts):
@@ -1535,3 +1538,265 @@ def render_batch_readme(name, meta, coverage, review_metrics=None,
     else:
         body.append("- (nothing was copied)\n")
     return "".join(body)
+
+
+# ------------- reviewer edits of the description fields (step 2) -------------
+# runs\<name>\description_overrides.json, next to review_state.json. A
+# separate file (not a key in review_state.json) so build_csv.py can take it
+# with one flag and nothing else of the review state. Shape:
+#   {"version": 1,
+#    "skus": {"<raw sheet sku>": {
+#        "short description": {"lines": [...], "generated": [...],
+#                              "saved": "<iso time>"},
+#        "description": {...}}}}
+# `lines` are the accepted "Label: Value" lines (the firewall has already
+# refused the others at save time); an EMPTY list means the reviewer cleared
+# the field on purpose. `generated` is what the build made at save time, so
+# the GUI can say when the scrape has changed under an edit. The scraped
+# columns of _filled.xlsx are never touched.
+
+DESCRIPTION_OVERRIDES_FILE = "description_overrides.json"
+OVERRIDE_FIELDS = ("short description", "description")
+
+
+def overrides_path(run_dir) -> Path:
+    return Path(run_dir) / DESCRIPTION_OVERRIDES_FILE
+
+
+def load_overrides_state(path) -> dict:
+    """The overrides file as a state dict. A missing or unreadable file is an
+    empty state (no overrides), never an error."""
+    import json
+    state = {"version": 1, "skus": {}}
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return state
+    if isinstance(data, dict) and isinstance(data.get("skus"), dict):
+        state["skus"] = {str(k): v for k, v in data["skus"].items()
+                         if isinstance(v, dict)}
+    return state
+
+
+def save_overrides_state(path, state) -> None:
+    import json
+    Path(path).write_text(json.dumps(state, indent=2, ensure_ascii=False),
+                          encoding="utf-8")
+
+
+def get_override(state, sku, field):
+    """The stored entry {"lines", "generated", "saved"} or None."""
+    entry = ((state or {}).get("skus", {}).get(str(sku)) or {}).get(field)
+    if isinstance(entry, dict) and isinstance(entry.get("lines"), list):
+        return entry
+    return None
+
+
+def set_override(state, sku, field, lines, generated, at=None) -> str:
+    """Store the reviewer's accepted `lines` for one field. Returns what was
+    done: "saved", or "removed" when `lines` equal the generated lines (an
+    edit that changes nothing is no override). An empty `lines` list is
+    stored as an explicit "publish this field empty"; the CALLER decides
+    whether the reviewer really asked for that."""
+    if field not in OVERRIDE_FIELDS:
+        raise ValueError(f"not a description field: {field!r}")
+    lines = [str(x) for x in lines]
+    generated = [str(x) for x in (generated or [])]
+    if lines == generated:
+        reset_override(state, sku, field)
+        return "removed"
+    skus = state.setdefault("skus", {})
+    skus.setdefault(str(sku), {})[field] = {
+        "lines": lines, "generated": generated,
+        "saved": str(at) if at else datetime.now().isoformat(
+            timespec="seconds")}
+    return "saved"
+
+
+def reset_override(state, sku, field=None) -> bool:
+    """'Reset to generated': drop the override of one field (or both when
+    `field` is None). Returns True when something was removed."""
+    skus = (state or {}).get("skus", {})
+    entry = skus.get(str(sku))
+    if not entry:
+        return False
+    fields = [field] if field else list(OVERRIDE_FIELDS)
+    removed = False
+    for f in fields:
+        if f in entry:
+            del entry[f]
+            removed = True
+    if not entry:
+        skus.pop(str(sku), None)
+    return removed
+
+
+def override_is_stale(entry, generated_lines) -> bool:
+    """True when the build would now generate different lines than it did
+    when the reviewer saved the edit (the row was re-enriched or edited)."""
+    if not entry:
+        return False
+    return list(entry.get("generated") or []) != [str(x) for x in
+                                                  generated_lines]
+
+
+def overrides_for_build(state) -> dict:
+    """{sku: {field: [lines], 'price': {...}, 'attributes': {'set', 'remove'}}}
+    - the form app.process_inventory takes."""
+    out = {}
+    for sku, fields in ((state or {}).get("skus") or {}).items():
+        kept = {f: list(e["lines"]) for f, e in (fields or {}).items()
+                if f in OVERRIDE_FIELDS and isinstance(e, dict)
+                and isinstance(e.get("lines"), list)}
+        price = get_price_override(state, sku)
+        if price:
+            kept[PRICE_FIELD] = dict(price["values"])
+        attrs = get_attribute_override(state, sku)
+        if attrs:
+            kept[ATTRIBUTE_FIELD] = {"set": dict(attrs["set"]),
+                                     "remove": list(attrs["remove"])}
+        if kept:
+            out[str(sku)] = kept
+    return out
+
+
+# ------------- reviewer edits of the price and the attributes (step 2) -------
+# Same file, same SKU entry, two more keys (owner request 2026-11-19, late):
+#   "price": {"values": {"regular price": "37790", "sale price": "18590",
+#                        "publish price": "20000"},
+#             "generated": {"regular price": ..., "sale price": ...},
+#             "saved": "<iso time>"}
+#     `values` holds only what the reviewer CHANGED: a page MRP / selling
+#     price that differs from the sheet ('' = "the page has none"), and an
+#     explicit publish price (absent = no override). app.apply_price_override
+#     reads it; the price is still client_config.one_price unless a publish
+#     price is set.
+#   "attributes": {"set": {"<name>": "<value>"}, "remove": ["<name>"],
+#                  "saved": "<iso time>"}
+#     `set` changes a value or adds an attribute; `remove` drops one.
+#     app.apply_attribute_override reads it.
+# The caller validates first (app.check_price_input / check_publish_price /
+# check_attribute_edit) and stores only accepted entries.
+PRICE_FIELD = "price"
+ATTRIBUTE_FIELD = "attributes"
+PRICE_KEYS = ("regular price", "sale price", "publish price")
+
+
+def _now(at=None):
+    return str(at) if at else datetime.now().isoformat(timespec="seconds")
+
+
+def get_price_override(state, sku):
+    """The stored price entry {"values", "generated", "saved"} or None."""
+    entry = ((state or {}).get("skus", {}).get(str(sku)) or {}).get(PRICE_FIELD)
+    if isinstance(entry, dict) and isinstance(entry.get("values"), dict) \
+            and entry["values"]:
+        return entry
+    return None
+
+
+def _price_text(value) -> str:
+    text = "" if value is None else str(value).strip()
+    if text.lower() == "nan":
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text.replace(",", "")
+
+
+def set_price_override(state, sku, values, generated, at=None) -> str:
+    """Store the reviewer's price inputs. `values` = {"regular price",
+    "sale price", "publish price"} as typed; `generated` = the sheet's
+    {"regular price", "sale price"}. Only a page price that DIFFERS from the
+    sheet, and a non-empty publish price, is kept. Returns "saved" or
+    "removed" (nothing differs = no override)."""
+    generated = {k: _price_text((generated or {}).get(k)) for k in PRICE_KEYS[:2]}
+    kept = {}
+    for key in PRICE_KEYS[:2]:
+        if key in (values or {}):
+            text = _price_text(values[key])
+            if text != generated[key]:
+                kept[key] = text
+    publish = _price_text((values or {}).get("publish price"))
+    if publish:
+        kept["publish price"] = publish
+    if not kept:
+        reset_override(state, sku, PRICE_FIELD)
+        return "removed"
+    state.setdefault("skus", {}).setdefault(str(sku), {})[PRICE_FIELD] = {
+        "values": kept, "generated": generated, "saved": _now(at)}
+    return "saved"
+
+
+def get_attribute_override(state, sku):
+    """The stored attribute entry {"set", "remove", "saved"} or None."""
+    entry = ((state or {}).get("skus", {}).get(str(sku)) or {}).get(
+        ATTRIBUTE_FIELD)
+    if isinstance(entry, dict) and (entry.get("set") or entry.get("remove")):
+        entry.setdefault("set", {})
+        entry.setdefault("remove", [])
+        return entry
+    return None
+
+
+def set_attribute_override(state, sku, sets, removes, at=None) -> str:
+    """Store the reviewer's attribute edits: `sets` {name: value} (changed
+    or added), `removes` [names]. A name both set and removed is set. Empty
+    edits remove the entry. Returns "saved" or "removed"."""
+    sets = {str(k).strip(): str(v).strip() for k, v in (sets or {}).items()
+            if str(k).strip() and str(v).strip()}
+    low = {k.lower() for k in sets}
+    kept = []
+    for name in _names(removes):
+        if name.lower() not in low and name.lower() not in \
+                [r.lower() for r in kept]:
+            kept.append(name)
+    removes = kept
+    if not sets and not removes:
+        reset_override(state, sku, ATTRIBUTE_FIELD)
+        return "removed"
+    state.setdefault("skus", {}).setdefault(str(sku), {})[ATTRIBUTE_FIELD] = {
+        "set": sets, "remove": removes, "saved": _now(at)}
+    return "saved"
+
+
+def _names(names):
+    return [str(n).strip() for n in (names or ()) if str(n).strip()]
+
+
+def attribute_edits(current, edited):
+    """(sets, removes) from the review screen's attribute table: `current`
+    = [(name, value)] as the build would write them now (reviewer edits
+    included), `edited` = [(name, value)] after the reviewer's changes in the
+    editor. A row whose value changed or that is new -> set; a current name
+    missing from `edited`, or emptied -> remove."""
+    now = {str(n).strip().lower(): (str(n).strip(), str(v).strip())
+           for n, v in current}
+    sets, filled = {}, set()
+    for name, value in edited:
+        name = "" if name is None else str(name).strip()
+        value = "" if value is None else str(value).strip()
+        if not name or not value or value.lower() == "nan":
+            continue
+        filled.add(name.lower())
+        if name.lower() not in now or now[name.lower()][1] != value:
+            sets[name] = value
+    removes = [now[k][0] for k in now if k not in filled]
+    return sets, removes
+
+
+def merge_attribute_edits(entry, sets, removes):
+    """The stored edits (`entry`, or None) plus a new save: a newly set name
+    leaves the remove list, a newly removed name leaves the set list.
+    Returns (sets, removes) to pass to set_attribute_override."""
+    old_sets = dict((entry or {}).get("set") or {})
+    old_removes = _names((entry or {}).get("remove"))
+    new_low = {k.lower() for k in sets}
+    rem_low = {r.lower() for r in _names(removes)}
+    merged_sets = {k: v for k, v in old_sets.items()
+                   if k.lower() not in new_low and k.lower() not in rem_low}
+    merged_sets.update(sets)
+    merged_removes = [r for r in old_removes if r.lower() not in new_low]
+    merged_removes += [r for r in _names(removes)
+                       if r.lower() not in {m.lower() for m in merged_removes}]
+    return merged_sets, merged_removes
