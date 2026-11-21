@@ -14,6 +14,7 @@ step renders against seeded artifacts without raising.
 """
 
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -26,6 +27,10 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from streamlit.testing.v1 import AppTest  # noqa: E402
+
+# the seeded rows carry example.com image URLs: never download them for the
+# card review's final-image preview (conftest.py sets the same under pytest)
+os.environ.setdefault("PIPELINE_REVIEW_IMAGE_PREVIEW", "off")
 
 FILLED_HEADERS = ["sku", "title", "regular price", "sale price", "url_link",
                   "image_url", "specs", "status", "categories", "Brands"]

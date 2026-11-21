@@ -668,7 +668,9 @@ def detect_category(raw_item_name, raw_categories='', detected_brand='',
     if has('mattress'):
         return 'Home Appliances', 'mattress'
     if has('trolly bag', 'trolley bag'):
-        return 'Home Appliances', 'Trolly Bag'
+        # 'Trolly' is a common misspelling in titles, so both match; the
+        # taxonomy (and the attribute sheet) spells it 'Trolley Bag'
+        return 'Home Appliances', 'Trolley Bag'
     if word('fan') or word('fans'):
         # The taxonomy separates 'Electronics & Computing > Electronic Fans'
         # from 'Home Appliances > Fans', and category_seo.xlsx shows what it
@@ -2949,14 +2951,21 @@ def build_descriptions(sku, title, brand, category, scraped=(), sub='',
     # title, where a <ul> broke the flow. Still one sentence per VERIFIED spec
     # pair - nothing is written here that product_specs() did not produce, so a
     # missing spec stays missing instead of being smoothed over with prose.
-    configuration_points = compact(
-        '<p class="product-key-features">'
-        + ' '.join(f'{label}: {value}.' for label, value in feature_rows)
-        + '</p>'
-    ) if feature_rows else ''
+    configuration_points = key_features_paragraph(feature_rows)
     short_desc = html_block(lists['short description'])
     long_desc = html_block(lists['description'])
     return configuration_points, short_desc, long_desc, lists['rows']
+
+
+def key_features_paragraph(rows):
+    """(label, value) rows -> the key-features paragraph (the CSV's
+    'configuration' column): one 'Label: value.' sentence per row inside
+    <p class="product-key-features">. No rows = ''."""
+    return compact(
+        '<p class="product-key-features">'
+        + ' '.join(f'{label}: {value}.' for label, value in rows)
+        + '</p>'
+    ) if rows else ''
 
 
 def description_row_lists(sku, title, brand, category, scraped=(), sub='',
@@ -2968,7 +2977,8 @@ def description_row_lists(sku, title, brand, category, scraped=(), sub='',
     'description'.
 
     Returns {'rows': every spec row (the attributes), 'feature_rows',
-    'short description', 'description'}."""
+    'short description', 'description', 'key features'} ('key features' is
+    the same list as 'feature_rows', under its override name)."""
     tagged = _spec_rows(title, brand, category, scraped, filters)
     rows = [(label, value) for label, value, _origin in tagged]
     points = _firewall_rows(key_points(tagged, sub, parent), brand)
@@ -2984,8 +2994,10 @@ def description_row_lists(sku, title, brand, category, scraped=(), sub='',
         ('Title', title),
         ('Categories', category),
     ] + points, brand)
-    return {'rows': rows, 'feature_rows': brand_rows + points,
-            'short description': short_rows, 'description': long_rows}
+    feature_rows = brand_rows + points
+    return {'rows': rows, 'feature_rows': feature_rows,
+            'short description': short_rows, 'description': long_rows,
+            KEY_FEATURES_FIELD: list(feature_rows)}
 
 
 # ------------------- reviewer edits of the two description fields -------------
@@ -2996,7 +3008,15 @@ def description_row_lists(sku, title, brand, category, scraped=(), sub='',
 # uses it instead of the generated rows. The override passes the content
 # firewall again at build time, so a line the firewall refuses never ships.
 
-DESCRIPTION_FIELDS = ('short description', 'description')
+# Owner request 2026-11-20: the key-features paragraph (CSV column
+# 'configuration', built by key_features_paragraph) is the third editable
+# field. Same contract: "Label: value" lines, re-firewalled at build time.
+KEY_FEATURES_FIELD = 'key features'
+DESCRIPTION_FIELDS = ('short description', 'description', KEY_FEATURES_FIELD)
+# which output column each overridable field writes
+DESCRIPTION_FIELD_COLUMNS = {'short description': 'short description',
+                             'description': 'description',
+                             KEY_FEATURES_FIELD: 'configuration'}
 _BULLET_RE = re.compile(r'^\s*(?:[-*•·]|\d+[.)])\s+')
 LINE_FORM_REASON = "not in 'Label: value' form"
 LINE_FIREWALL_REASON = ('refused by the content firewall (retailer or seller '
@@ -3026,7 +3046,8 @@ def description_lines(rows):
 
 
 def description_fields_for_row(row, estimate_mrp=False):
-    """{'short description': rows, 'description': rows} - what the build
+    """{'short description': rows, 'description': rows, 'key features':
+    rows} - what the build
     writes for this ONE input row before any override. Cheap (no image
     download): the GUI calls it for the row on screen only."""
     ctx = row_context(row, estimate_mrp=estimate_mrp)
@@ -3069,16 +3090,28 @@ def render_description_rows(rows):
     Reviewer text is plain text: '<' and '>' are escaped. No rows = ''."""
     if not rows:
         return ''
-    safe = [(str(label).replace('<', '&lt;').replace('>', '&gt;'),
+    return html_block(_escape_rows(rows))
+
+
+def _escape_rows(rows):
+    return [(str(label).replace('<', '&lt;').replace('>', '&gt;'),
              str(value).replace('<', '&lt;').replace('>', '&gt;'))
             for label, value in rows]
-    return html_block(safe)
+
+
+def render_override_field(field, rows):
+    """Accepted override rows -> the HTML the build writes for `field`:
+    the key-features paragraph for KEY_FEATURES_FIELD, else the <table> of
+    render_description_rows. Reviewer text is escaped. No rows = ''."""
+    if field == KEY_FEATURES_FIELD:
+        return key_features_paragraph(_escape_rows(rows))
+    return render_description_rows(rows)
 
 
 def normalise_overrides(overrides):
     """{sku: {field: [lines]}} with every key through override_key and only
-    the two description fields kept, plus the reviewer's 'price' and
-    'attributes' edits (see apply_price_override / apply_attribute_override).
+    the three description fields (DESCRIPTION_FIELDS) kept, plus the
+    reviewer's 'price' and 'attributes' edits (see apply_price_override / apply_attribute_override).
     None / {} -> {}."""
     out = {}
     for sku, fields in (overrides or {}).items():
@@ -3758,6 +3791,135 @@ def retire_stale_images(sku, written_indexes, root=None, today=None):
     return moved
 
 
+# ------------- one image path for the build AND the review preview -----------
+# Owner request 2026-11-20: card review in gui.py shows the final 1500 x 1500
+# canvas of every kept photo, in the order the build will number them. The
+# build (_download_urls_for_sku) and the preview (preview_images_for_row) both
+# call open_source_image -> square_image -> order_square_results, so the two
+# cannot drift. Only the build writes files or calls retire_stale_images.
+IMAGE_BELOW_FLOOR = 'below the minimum resolution'
+
+
+class ImageBelowFloor(ValueError):
+    """A source photo under MIN_IMAGE_EDGE. str() stays IMAGE_BELOW_FLOOR,
+    which _download_urls_for_sku uses to tell it from a download failure."""
+
+    def __init__(self, size):
+        super().__init__(IMAGE_BELOW_FLOOR)
+        self.size = tuple(size)
+
+
+def open_source_image(url, fetch=None):
+    """Fetch the CDN's largest rendition of `url`, refuse it under
+    MIN_IMAGE_EDGE (ImageBelowFloor) and normalise the mode to RGB / RGBA.
+    `fetch(url) -> bytes` defaults to fetch_image_bytes (looked up at call
+    time, so a test's monkeypatch applies). Other failures propagate."""
+    fetch = fetch or fetch_image_bytes
+    image = Image.open(io.BytesIO(fetch(largest_rendition(url))))
+    if max(image.size) < MIN_IMAGE_EDGE:
+        # a soft, blocky product photo is worse than one image fewer
+        raise ImageBelowFloor(image.size)
+    if image.mode == 'P':
+        # palette images: keep transparency when present (silences the
+        # PIL 'Palette images with Transparency' warning correctly)
+        image = image.convert('RGBA' if 'transparency' in image.info else 'RGB')
+    elif image.mode not in ('RGB', 'RGBA'):
+        image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
+    return image
+
+
+def square_image(url, fetch=None):
+    """(white, share, webp bytes) for one photo in the house layout - the
+    exact bytes the build writes as `<sku>_<n>.webp`. Whiteness is measured
+    on the SOURCE, before layout_on_canvas() pads it with white (measured
+    after, every photo would pass). Raises like open_source_image."""
+    image = open_source_image(url, fetch)
+    share = white_share(image)
+    white = share >= WHITE_SHARE
+    buf = io.BytesIO()
+    layout_on_canvas(image, white).save(
+        buf, format='WEBP', quality=WEBP_QUALITY, method=WEBP_METHOD)
+    return white, share, buf.getvalue()
+
+
+def order_square_results(results):
+    """[(url index, white, share, data)] in any order -> (ordered, main_white).
+
+    Main image = the WHITEST white-background photo (highest border white
+    share); a tie goes to the earlier URL position. The rest keep URL order.
+    No white photo: the first one stays main and main_white is False.
+    Empty input -> ([], True)."""
+    results = sorted(results, key=lambda r: r[0])
+    if not results:
+        return [], True
+    whites = [r for r in results if r[1]]
+    main = max(whites, key=lambda r: (r[2], -r[0])) if whites else results[0]
+    return [main] + [r for r in results if r is not main], bool(whites)
+
+
+PREVIEW_FLOOR = 'floor'
+PREVIEW_FAILED = 'failed'
+
+
+class ImageFetchFailed(Exception):
+    """A download failure that is already described (the GUI's cached
+    preview re-raises a stored failure with this); its text is the reason."""
+
+
+def preview_images_for_row(urls, dropped_cell='', fetch_one=None):
+    """What the build would make of ONE row's photos, without writing
+    anything: no file, no folder, no retire_stale_images.
+
+    `urls` are the row's image URLs; `dropped_cell` is its dropped_images
+    cell (filter_dropped_urls). `fetch_one(url) -> (white, share, data)`
+    defaults to square_image; the GUI passes a cached version. Returns
+    {'images': [{'position', 'index', 'url', 'white', 'share', 'data'}] in
+    the build's final order (position 1 = `<sku>_1.webp`),
+    'rejected': [{'index', 'url', 'kind', 'reason'}] in URL order (kind
+    PREVIEW_FLOOR or PREVIEW_FAILED), 'main_not_white': bool}."""
+    fetch_one = fetch_one or square_image
+    kept = filter_dropped_urls(list(urls or ()), dropped_cell)
+    results, rejected = [], []
+    for index, url in enumerate(kept, start=1):
+        try:
+            white, share, data = fetch_one(url)
+        except ImageBelowFloor as exc:
+            w, h = (exc.size + (0, 0))[:2]
+            rejected.append({'index': index, 'url': url, 'kind': PREVIEW_FLOOR,
+                             'reason': f'below the {MIN_IMAGE_EDGE} px floor '
+                                       f'({w} x {h} px) - the build skips it'})
+            continue
+        except Exception as exc:
+            why = (str(exc) if isinstance(exc, ImageFetchFailed)
+                   else f'{type(exc).__name__}: {exc}')
+            rejected.append({'index': index, 'url': url,
+                             'kind': PREVIEW_FAILED,
+                             'reason': f'download failed ({why[:100]}) - '
+                                       'the build skips it'})
+            continue
+        results.append((index, white, share, data))
+    ordered, main_white = order_square_results(results)
+    images = [{'position': n, 'index': index, 'url': kept[index - 1],
+               'white': white, 'share': share, 'data': data}
+              for n, (index, white, share, data) in enumerate(ordered, start=1)]
+    return {'images': images, 'rejected': rejected,
+            'main_not_white': bool(ordered) and not main_white}
+
+
+PREVIEW_EDGE = 600
+
+
+def preview_thumbnail(data, edge=PREVIEW_EDGE):
+    """Canvas WebP bytes -> a smaller WebP (at most `edge` px) for display.
+    The full 1500 px canvas is never kept in the GUI's cache."""
+    with Image.open(io.BytesIO(data)) as image:
+        small = image.convert('RGB')
+        small.thumbnail((edge, edge), Image.LANCZOS)
+        buf = io.BytesIO()
+        small.save(buf, format='WEBP', quality=85)
+        return buf.getvalue()
+
+
 def download_urls_for_sku(sku, urls, flags=None):
     """Download and convert images, then retire this SKU's old files (see
     retire_stale_images). Returns the list of indexes saved."""
@@ -3793,29 +3955,17 @@ def _download_urls_for_sku(sku, urls, flags=None):
     # Save all images into a single root folder (no per-SKU subfolders)
     def _fetch(pair):
         index, url = pair
-        image = Image.open(io.BytesIO(fetch_image_bytes(largest_rendition(url))))
-        if max(image.size) < MIN_IMAGE_EDGE:
-            # a soft, blocky product photo is worse than one image fewer
+        try:
+            if SQUARE_IMAGES:
+                # the file name depends on which photo wins the main slot, so
+                # encode here (in parallel) and write after every result is
+                # in. square_image is the SAME code the review preview runs.
+                return (index,) + square_image(url)
+            image = open_source_image(url)
+        except ImageBelowFloor as exc:
             rejected.append(f'{os.path.basename(url)[:40]} '
-                            f'({image.size[0]}x{image.size[1]})')
-            raise ValueError('below the minimum resolution')
-        if image.mode == 'P':
-            # palette images: keep transparency when present (silences the
-            # PIL 'Palette images with Transparency' warning correctly)
-            image = image.convert('RGBA' if 'transparency' in image.info else 'RGB')
-        elif image.mode not in ('RGB', 'RGBA'):
-            image = image.convert('RGBA' if 'A' in image.getbands() else 'RGB')
-        if SQUARE_IMAGES:
-            # the file name depends on which photo wins the main slot, so
-            # encode here (in parallel) and write after every result is in.
-            # Whiteness is measured on the SOURCE, before layout_on_canvas()
-            # pads it with white - measured after, every photo would pass.
-            share = white_share(image)
-            white = share >= WHITE_SHARE
-            buf = io.BytesIO()
-            layout_on_canvas(image, white).save(
-                buf, format='WEBP', quality=WEBP_QUALITY, method=WEBP_METHOD)
-            return index, white, share, buf.getvalue()
+                            f'({exc.size[0]}x{exc.size[1]})')
+            raise
         # downscale only - enlarging a small source invents detail and looks
         # worse than the original did
         if max(image.size) > MAX_IMAGE_EDGE:
@@ -3841,7 +3991,7 @@ def _download_urls_for_sku(sku, urls, flags=None):
             try:
                 results.append(future.result())
             except ValueError as exc:
-                if str(exc) != 'below the minimum resolution':
+                if str(exc) != IMAGE_BELOW_FLOOR:
                     failed.append((futures[future], f'{type(exc).__name__}: {exc}'))
             except Exception as exc:
                 failed.append((futures[future], f'{type(exc).__name__}: {exc}'))
@@ -3858,20 +4008,14 @@ def _download_urls_for_sku(sku, urls, flags=None):
     if not SQUARE_IMAGES:
         return sorted(results)
 
-    # threads finish in any order: sort by URL position so the main-image
-    # choice and the numbering are the same on every run
-    results.sort(key=lambda r: r[0])
-    if not results:
+    # threads finish in any order: order_square_results sorts by URL position
+    # so the main-image choice and the numbering are the same on every run
+    # (and the same as the review preview's)
+    ordered, main_white = order_square_results(results)
+    if not ordered:
         return []
-    # main image = the WHITEST white-background photo (highest border white
-    # share); a tie goes to the earlier URL position. The rest keep URL order.
-    whites = [r for r in results if r[1]]
-    main = max(whites, key=lambda r: (r[2], -r[0])) if whites else None
-    if main is None:
-        main = results[0]
-        if flags is not None:
-            flags.append(FLAG_MAIN_NOT_WHITE)
-    ordered = [main] + [r for r in results if r is not main]
+    if not main_white and flags is not None:
+        flags.append(FLAG_MAIN_NOT_WHITE)
     for number, (_, _, _, data) in enumerate(ordered, start=1):
         with open(os.path.join(root, f'{sku}_{number}.webp'), 'wb') as fh:
             fh.write(data)
@@ -4227,7 +4371,9 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
     this function produced before the SEO columns existed.
 
     `description_overrides` = {raw sheet sku: {'short description' |
-    'description': [lines]}} (gui_helpers.overrides_for_build). For a SKU
+    'description' | 'key features': [lines]}}
+    (gui_helpers.overrides_for_build); 'key features' replaces the
+    'configuration' column (the key-features paragraph). For a SKU
     with an override, that field is the reviewer's lines instead of the
     generated rows; each line passes the content firewall again and a refused
     line is not written. An empty list writes the field empty. None / {} =
@@ -4319,6 +4465,10 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
             if 'description' in override:
                 long_desc = render_description_rows(parse_description_lines(
                     override['description'], brand)[0])
+            if KEY_FEATURES_FIELD in override:
+                config = render_override_field(
+                    KEY_FEATURES_FIELD, parse_description_lines(
+                        override[KEY_FEATURES_FIELD], brand)[0])
         filter_unmatched = ctx['filter_unmatched']
         if filter_unmatched:
             unmatched_rows += 1
@@ -4379,7 +4529,8 @@ def process_inventory(df, media_base=None, estimate_mrp=False,
 
     if overrides_used:
         ui.info(f'{overrides_used} product(s) use the reviewer\'s edits '
-                '(description / short description / price / attributes, '
+                '(description / short description / key features / price / '
+                'attributes, '
                 'description_overrides).')
     if skipped_duplicates:
         ui.warning(f'Skipped {skipped_duplicates} duplicate SKU row(s) after normalization.')

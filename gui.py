@@ -102,6 +102,78 @@ _SKU_HEADER_LOOKUP = None
 STILL_ACTIVE = 259
 
 
+# -------------------------------------------------------------- share mode --
+# GUI_SHARE_MODE / GUI_SHARE_PASSWORD / GUI_SHARE_BUDGET are read only by the
+# gui_helpers.share_* functions. Each dangerous action is guarded twice: the
+# control is not rendered, AND the function that does the work refuses
+# (ShareModeRefused, or exit code 4 for run_publish), so a crafted widget
+# state cannot get through. tools\share_gui.ps1 starts this mode.
+
+SHARE_AUTH_KEY = "_share_authenticated"
+
+
+def share_mode() -> bool:
+    return gui_helpers.share_mode_on()
+
+
+def refuse_in_share_mode(action: str):
+    """Raise ShareModeRefused when share mode is on. Called first thing by
+    every function that publishes, deletes, archives, saves the taxonomy or
+    switches the client."""
+    if share_mode():
+        raise gui_helpers.ShareModeRefused(
+            f"{action} is off in share mode.")
+
+
+def share_gate() -> bool:
+    """The password gate. Runs right after st.set_page_config and before any
+    other widget, sidebar or file access. Returns True when the page may
+    render; otherwise it renders only the gate and calls st.stop().
+
+    With share mode off it renders nothing and returns True. With share mode
+    on but no usable password (unset or < 12 characters) it renders only an
+    error. The guess throttle is process-wide (gui_helpers.SHARE_THROTTLE):
+    8 wrong attempts in total, across all sessions, lock every login for 15
+    minutes. The password is never echoed, logged or kept in session_state."""
+    if not share_mode():
+        return True
+    problem = gui_helpers.share_password_problem()
+    if problem:
+        st.error(problem)
+        st.stop()
+    if st.session_state.get(SHARE_AUTH_KEY) is True:
+        st.info(gui_helpers.SHARE_BANNER, icon="🔒")
+        return True
+
+    throttle = gui_helpers.SHARE_THROTTLE
+    st.title("Catalogue pipeline")
+    st.caption("This page is password-protected.")
+    with st.form("share_login", clear_on_submit=True):
+        given = st.text_input("Password", type="password",
+                              key="share_password_input")
+        submitted = st.form_submit_button("Log in")
+    if submitted:
+        wait = throttle.locked_for()
+        if wait > 0:
+            st.error(f"Too many wrong passwords. Logins are locked for "
+                     f"{int(wait // 60) + 1} more minute(s).")
+        elif gui_helpers.check_share_password(
+                given, gui_helpers.share_password()):
+            throttle.record_success()
+            st.session_state[SHARE_AUTH_KEY] = True
+            st.rerun()
+        else:
+            throttle.record_failure()
+            time.sleep(gui_helpers.SHARE_FAIL_DELAY)
+            if throttle.locked_for() > 0:
+                st.error("Too many wrong passwords. Logins are locked for "
+                         f"{gui_helpers.SHARE_LOCK_SECONDS // 60} minutes.")
+            else:
+                st.error("Wrong password.")
+    st.stop()
+    return False
+
+
 # ------------------------------------------------------------------ client --
 # One GUI process serves every client, so the selected slug lives in
 # session_state, never in this module. It IS mirrored into os.environ,
@@ -133,8 +205,14 @@ def current_client():
     Cached in session_state so a re-render does not re-parse client.toml, and
     os.environ is refreshed on every call: a lazily-imported `import app`
     deeper in a step must see the right client even if the selector moved in
-    an earlier rerun."""
-    slug = st.session_state.get(CLIENT_KEY) or default_slug()
+    an earlier rerun.
+
+    In share mode the slug is ALWAYS the one the process started with
+    (default_slug()); session_state cannot move it."""
+    if share_mode():
+        slug = default_slug()
+    else:
+        slug = st.session_state.get(CLIENT_KEY) or default_slug()
     st.session_state[CLIENT_KEY] = slug
     os.environ[client_config.ENV_VAR] = slug
     cached = st.session_state.get(_CFG_KEY)
@@ -154,6 +232,7 @@ def switch_client(slug: str):
     and the media base as module state); gui_helpers' SKU codes are rebound;
     and the category dropdown cache is dropped because it is keyed by slug
     but its underlying `app` module is a singleton."""
+    refuse_in_share_mode("Switching the client")
     cfg = load_client(slug)                      # raises before anything moves
     os.environ[client_config.ENV_VAR] = slug
     st.session_state[CLIENT_KEY] = slug
@@ -175,6 +254,11 @@ def client_selector():
 
     A failure here is fatal for the page (no taxonomy, no store URL), so it
     is reported as an error rather than a traceback."""
+    if share_mode():
+        # no selector at all: the client is the one the process started with
+        cfg = current_client()
+        st.sidebar.caption(f"Client: `{cfg.slug}` (fixed in share mode)")
+        return cfg
     slugs = available_clients() or [DEFAULT_CLIENT]
     current = st.session_state.get(CLIENT_KEY) or default_slug()
     if current not in slugs:
@@ -597,6 +681,11 @@ def start_enricher(P, extra_flags: list, total: int):
     # this file hands the NEXT retry) and must keep meaning that;
     # `enricher_total` is how many rows THIS launch will actually touch and is
     # the only value the progress bar and the ETA may divide by.
+    if share_mode():
+        # every launch path (Step 1, Step 2 retries, pass 2) comes through
+        # here: no headless browser, no --force, and a capped --budget
+        extra_flags = gui_helpers.share_cap_flags(
+            extra_flags, gui_helpers.share_budget())
     eligible = eligible_total(P, extra_flags, total)
     # --client on the command line AND PIPELINE_CLIENT in the env: the flag is
     # what shows up in enricher_cmd and the report header, the env var is what
@@ -851,13 +940,21 @@ def step_enrich(P):
             help="A hard stop, not a warning: the enricher saves and exits "
                  "cleanly the moment it has spent this many search credits. "
                  "Pre-filled from this client's [serper] default_run_budget.")
+        if share_mode():
+            st.caption(f"Share mode: every run is capped at "
+                       f"{gui_helpers.share_budget()} Serper credits; the "
+                       "headless browser and --force are off.")
         with st.expander("Advanced"):
-            js = st.checkbox("--js-fallback (headless browser for blocked "
-                             "pages; slow)")
+            js = force = False
+            if not share_mode():
+                js = st.checkbox("--js-fallback (headless browser for "
+                                 "blocked pages; slow)")
             min_images = st.number_input("Min images per product", 1, 10, 3)
-            force = st.checkbox("--force — re-process EVERY row (re-pays "
-                                "Serper credits when the cache is cold; only "
-                                "for applying parser fixes on a warm cache)")
+            if not share_mode():
+                force = st.checkbox("--force — re-process EVERY row (re-pays "
+                                    "Serper credits when the cache is cold; "
+                                    "only for applying parser fixes on a "
+                                    "warm cache)")
         started = st.form_submit_button(
             "▶ Find links & photos" if discover else "▶ Start enrichment",
             type="primary")
@@ -1093,12 +1190,14 @@ def _configured_app():
 
 
 _FIELD_LABEL = {"short description": "Short description",
-                "description": "Description"}
+                "description": "Description",
+                gui_helpers.KEY_FEATURES_FIELD: "Key features paragraph"}
 
 
 def description_editor(P, row, where="card"):
-    """Show and edit the two description fields of ONE row, as the build
-    will write them. Computed for this row only (app.description_fields_for_row
+    """Show and edit the three description fields of ONE row (short
+    description, description, key-features paragraph = CSV column
+    'configuration'), as the build will write them. Computed for this row only (app.description_fields_for_row
     - no image download), so it stays cheap on every rerun.
 
     The edit is saved as a per-SKU override in runs\\<name>\\
@@ -1128,7 +1227,8 @@ def description_editor(P, row, where="card"):
     st.caption("One line per table row, as **Label: value**. Delete a line "
                "to remove that point. This is the text the CSV will contain "
                "(content firewall and the key-point limit already applied). "
-               "Edits are saved for this run only; the scraped sheet is not "
+               "The key-features paragraph writes each line as one "
+               "'Label: value.' sentence. Edits are saved for this run only; the scraped sheet is not "
                "changed. Title or price edits above show here after Save.")
     texts, empties = {}, {}
     for field in gui_helpers.OVERRIDE_FIELDS:
@@ -1155,7 +1255,7 @@ def description_editor(P, row, where="card"):
                          "published"):
             rows = (app.parse_description_lines(entry["lines"], brand)[0]
                     if entry is not None else generated[field])
-            html = app.render_description_rows(rows)
+            html = app.render_override_field(field, rows)
             if html:
                 st.markdown(html, unsafe_allow_html=True)
             else:
@@ -1205,7 +1305,7 @@ def description_editor(P, row, where="card"):
         st.session_state[msg_key] = notes
         st.session_state[gen_key] = gen + 1
         st.rerun()
-    if b2.button("↺ Reset both to generated",
+    if b2.button("↺ Reset all three to generated",
                  key=f"desc_reset_{where}_{run}_{sku}",
                  disabled=not any(gui_helpers.get_override(state, sku, f)
                                   for f in gui_helpers.OVERRIDE_FIELDS)):
@@ -1367,6 +1467,99 @@ def price_attribute_editor(P, row, where="card"):
         st.rerun()
 
 
+# --------- card review: preview of the final 1500 x 1500 images --------------
+# Owner request 2026-11-20. app.preview_images_for_row runs the build's own
+# image code (fetch, 1000 px floor, white canvas, _1 = whitest photo) and
+# writes nothing. Each photo is cached per URL as a small WebP, so a rerun
+# does not download again. PIPELINE_REVIEW_IMAGE_PREVIEW=off sets the toggle's
+# default to off (tests\conftest.py does this, so no test downloads).
+REVIEW_PREVIEW_ENV = "PIPELINE_REVIEW_IMAGE_PREVIEW"
+
+
+def review_preview_default() -> bool:
+    return os.environ.get(REVIEW_PREVIEW_ENV, "on").strip().lower() not in (
+        "0", "off", "false", "no")
+
+
+@st.cache_data(max_entries=256, ttl=3600, show_spinner=False)
+def _final_image_preview(url: str) -> dict:
+    """One photo through app.square_image, stored compact: a ~600 px WebP
+    of the canvas plus the white flag and share the build orders by. A
+    failure is stored too, so a rerun does not wait on it again."""
+    import app
+    try:
+        white, share, data = app.square_image(url)
+    except app.ImageBelowFloor as exc:
+        return {"ok": False, "floor": True, "size": list(exc.size)}
+    except Exception as exc:              # network, decode, anything
+        return {"ok": False, "floor": False,
+                "reason": f"{type(exc).__name__}: {exc}"[:200]}
+    return {"ok": True, "white": bool(white), "share": float(share),
+            "thumb": app.preview_thumbnail(data)}
+
+
+def _cached_square(url):
+    """fetch_one for app.preview_images_for_row, from the cache above."""
+    import app
+    got = _final_image_preview(url)
+    if got["ok"]:
+        return got["white"], got["share"], got["thumb"]
+    if got["floor"]:
+        raise app.ImageBelowFloor(got["size"])
+    raise app.ImageFetchFailed(got["reason"])
+
+
+def final_image_gallery(urls, keeps, slots, show_final):
+    """Fill each photo's slot: the final canvas with its number when the
+    build keeps it, else the source photo with the reason. A failure here
+    never breaks the card - it falls back to the source photos."""
+    def source(j, u, caption=None):
+        with slots[j]:
+            st.image(u, width="stretch", caption=caption)
+
+    if not show_final:
+        for j, u in enumerate(urls):
+            source(j, u)
+        return
+    kept = [u for u in urls if keeps.get(u)]
+    try:
+        app = _configured_app()
+        with st.spinner("Preparing the final images…"):
+            preview = app.preview_images_for_row(kept,
+                                                 fetch_one=_cached_square)
+    except Exception as exc:
+        st.warning(f"The final-image preview failed ({type(exc).__name__}: "
+                   f"{exc}); the source photos show instead.")
+        for j, u in enumerate(urls):
+            source(j, u)
+        return
+    final = {img["url"]: img for img in preview["images"]}
+    refused = {r["url"]: r for r in preview["rejected"]}
+    st.caption(f"Preview of the {app.CANVAS_EDGE} x {app.CANVAS_EDGE} "
+               "output (shown smaller). The number is the file the build "
+               "writes; _1 is the main image. Untick 'keep' to drop a photo.")
+    if preview["main_not_white"]:
+        st.warning("No kept photo has a white background: _1 is the first "
+                   "photo, and the validator will flag it.")
+    for j, u in enumerate(urls):
+        if u in final:
+            img = final[u]
+            label = f"_{img['position']} (photo {j + 1})"
+            if img["position"] == 1:
+                label += " - main image"
+            with slots[j]:
+                st.image(img["data"], width="stretch", caption=label)
+        elif u in refused:
+            source(j, u, f"Photo {j + 1}: NOT built - "
+                         f"{refused[u]['reason']}")
+        else:
+            source(j, u, f"Photo {j + 1}: dropped - not built")
+    if st.button("↻ Download the preview images again",
+                 key="final_prev_refresh"):
+        _final_image_preview.clear()
+        st.rerun()
+
+
 def card_review(P, df, cat_opts, all_raws=None):
     """One SKU per screen: gallery with keep/drop, editable fields, an
     approve/skip queue. df is the (possibly filtered) review dataframe -
@@ -1440,12 +1633,22 @@ def card_review(P, df, cat_opts, all_raws=None):
     dropped_now = set(parse_image_urls(row.get("dropped_images", "")))
     keeps = {}
     if urls:
+        show_final = st.toggle(
+            "Show the final 1500 x 1500 images (downloads the photos)",
+            value=review_preview_default(), key=f"final_prev_{run}",
+            help="On: each kept photo shows as the build will save it, with "
+                 "its final number (_1 is the main image). Off: the source "
+                 "photos only, with no download.")
         cols = st.columns(min(4, len(urls)))
+        slots = []
         for j, u in enumerate(urls):
             with cols[j % len(cols)]:
-                st.image(u, width="stretch")
+                # the picture goes in ABOVE the checkbox, but is drawn after
+                # every checkbox is read: the final order depends on them
+                slots.append(st.container())
                 keeps[u] = st.checkbox("keep", value=u not in dropped_now,
                                        key=f"keep_{run}_{sku}_{j}")
+        final_image_gallery(urls, keeps, slots, show_final)
     else:
         st.info("No images on this row.")
 
@@ -2225,6 +2428,10 @@ def unconfirmed_publish_skus(P, publish_skus) -> list:
 
 
 def run_publish(P, extra: list) -> tuple:
+    if share_mode():
+        # exit code 4 = REFUSED, nothing written - wc_publish.py's own
+        # convention. No subprocess is started, so not even --check runs.
+        return 4, "REFUSED: publish is off in share mode.\n"
     slug = run_client_slug(P["run"])
     cmd = ([str(VENV_PY), "wc_publish.py", str(P["csv"]),
             "--client", slug] + extra)
@@ -2240,6 +2447,9 @@ def run_publish(P, extra: list) -> tuple:
 
 def step_publish(P):
     st.header("5 · Publish to WooCommerce")
+    if share_mode():
+        st.info("Publish is off in share mode.")
+        return
     if not P["csv"].exists():
         st.info("No CSV yet — run Step 3 first.")
         return
@@ -2508,8 +2718,10 @@ def archive_run(run_dir: Path, dest: Path) -> int:
     folder to batches\\<name>.zip so there is ONE file to hand over.
 
     Returns the number of files copied (the zip path lands in
-    LAST_ARCHIVE_ZIP). Copies only; the run folder is left untouched."""
+    LAST_ARCHIVE_ZIP). Copies only; the run folder is left untouched.
+    Refused in share mode (ShareModeRefused)."""
     global LAST_ARCHIVE_ZIP
+    refuse_in_share_mode("Archiving a run")
     LAST_ARCHIVE_ZIP = None
     Pr = run_paths(run_dir)
     files = {f.name: f for f in (Pr[k] for k in
@@ -2623,7 +2835,11 @@ def client_runs(cfg) -> list:
     store) is that client's, so offering it would only lead to the refusal
     guard_run_client() raises."""
     RUNS_DIR.mkdir(exist_ok=True)
-    runs = sorted((d for d in RUNS_DIR.iterdir() if d.is_dir()),
+    # a folder starting with "_" is never a run: runs\_share\ holds the
+    # share-mode password file and server log (tools\share_gui.ps1), and
+    # "Create run" strips a leading "_", so no real run can be named so
+    runs = sorted((d for d in RUNS_DIR.iterdir()
+                   if d.is_dir() and not d.name.startswith("_")),
                   key=lambda d: d.stat().st_mtime, reverse=True)
     return [d for d in runs if run_client_slug(d) == cfg.slug]
 
@@ -2669,6 +2885,13 @@ def pick_run(cfg) -> Path | None:
     return None
 
 
+def delete_run(run_dir: Path):
+    """Permanently delete a run folder. Refused in share mode
+    (ShareModeRefused); OSError propagates to the caller's message."""
+    refuse_in_share_mode("Deleting a run")
+    shutil.rmtree(run_dir)
+
+
 def save_first_sheet(path, edited):
     """Write `edited` back into the FIRST worksheet of an existing workbook,
     keeping that sheet's NAME and position and every OTHER sheet untouched.
@@ -2700,7 +2923,8 @@ def backup_and_save_category_map(path, edited, backups_dir=None):
 
     `backups_dir` is the client's own clients\\<slug>\\backups\\; the
     REPO_ROOT default is kept only so the plain-function tests can call this
-    with no client at all."""
+    with no client at all. Refused in share mode (ShareModeRefused)."""
+    refuse_in_share_mode("Saving the category map")
     backup = (Path(backups_dir or (REPO_ROOT / "backups")) /
               f"category_map_{datetime.now():%Y%m%d_%H%M%S}.xlsx")
     # parents=True: clients\\<slug>\\backups\\ may not exist yet, and the
@@ -2719,6 +2943,9 @@ def category_map_editor(cfg):
 
     Only the FIRST sheet is editable here; the other sheets of the workbook
     ('Sub-Category Attributes', 'Filters') are preserved verbatim."""
+    if share_mode():
+        st.info("Taxonomy edits are off in share mode.")
+        return
     path = Path(cfg.category_map)
     st.header(f"⚙ Category map — {cfg.name}")
     st.caption(f"`{path}`")
@@ -2771,11 +2998,16 @@ def main():
     # resolved before it - current_client() only reads session_state and the
     # environment, it renders nothing. A broken config falls back to a
     # generic tab title and is reported by the selector below.
-    try:
-        page_title = f"{current_client().name} pipeline"
-    except ClientConfigError:
-        page_title = "Catalogue pipeline"
+    # In share mode nothing is read (not even client.toml) before the
+    # password gate, so the tab title stays generic.
+    page_title = "Catalogue pipeline"
+    if not share_mode():
+        try:
+            page_title = f"{current_client().name} pipeline"
+        except ClientConfigError:
+            pass
     st.set_page_config(page_title=page_title, page_icon="🛒", layout="wide")
+    share_gate()                    # st.stop()s unless logged in / not shared
     try:
         cfg = client_selector()
     except ClientConfigError as exc:
@@ -2791,9 +3023,10 @@ def main():
                  "and reload.")
         return
     st.sidebar.title(f"🛒 {cfg.name}")
-    if st.sidebar.checkbox("⚙ Category map editor",
-                           help="Edit the taxonomy the builds snap to. "
-                                "Closes the wizard while open."):
+    if not share_mode() and st.sidebar.checkbox(
+            "⚙ Category map editor",
+            help="Edit the taxonomy the builds snap to. "
+                 "Closes the wizard while open."):
         category_map_editor(cfg)
         return
 
@@ -2825,6 +3058,8 @@ def main():
         st.dataframe(pd.DataFrame(rows), hide_index=True,
                      width="stretch")
         st.caption("Pick a run in the sidebar to open it.")
+        if share_mode():
+            return              # archive / delete are off in share mode
         with st.expander("🗂 Manage a run (archive / delete)"):
             target = st.selectbox("Run", [r["run"] for r in rows],
                                   key="mgr_target")
@@ -2880,7 +3115,7 @@ def main():
             if c2.button("🗑 Delete run", disabled=not sure or busy,
                          key="mgr_del"):
                 try:
-                    shutil.rmtree(tdir)
+                    delete_run(tdir)
                 except OSError as e:
                     # OSError, not PermissionError: the folder can also be
                     # gone already (Explorer, a second browser tab) or fail

@@ -310,3 +310,199 @@ rewrite.
 - `ensure_writable` checks the Excel lock once at t=0 only (:1116).
 - validate_csv.py:176 — substring removal of the title from joined text can corrupt
   the comparison when the title appears inside cats/desc.
+
+---
+
+## Found by the mixed-category test of 2026-11-20
+
+The test enriched 9 models (3 air conditioners, 3 washing machines, 3
+refrigerators) with `--search-order free_first --budget 60`. It used 0 serper
+credits. Run folder: `runs\mixed-2026-11-20\` (`enrich.log`, `mixed_filled.xlsx`,
+`mixed_filled_report.md`). Line anchors are from 2026-11-20. Check them before a fix.
+
+## KI-17 · HIGH · open (found 2026-11-20) — junk images pass the image filter
+**Symptom:** banners, energy labels and text cards reach the `image_url` cell as
+product photos.
+**Evidence:** SAMSUNG-AR50H19D1PHNNA: all 8 images are samsung.com energy labels
+(`.../energylabel/in-energylabel-product-ar50h19d1phnna-*`). HAIER-HRD-2561SGSA-N:
+the 3 images are bajajfinserv.in banners (`mega1`, `mega2`, `BM_Explore_tractors`).
+LG-US-Q18ENXE (a split AC): image 3 is the lg.com menu banner
+`/gnb/windowsac-644x328.jpg`. VOLTAS BEKO-WFL7012VTMP: the only image is a
+generated text card (`og?t=...&k=Review`) from bestpurifier.in.
+PANASONIC-CW-XU185CGT: image 2 is a campaign tile (`.../get-inspired-section/.../Higlish.jpg`).
+**Likely cause:** `IMAGE_JUNK_RE` (sku_enricher.py:772-784) and `JUNK_IMG_ATTR_RE`
+(:789-791) do not know these patterns: `energylabel`, `/gnb/` (global navigation
+bar), `mega\d`, `explore_`, `get-inspired`, and generated `og?` image URLs.
+**Build check (2026-11-20):** the build's 1000 px floor dropped the bajajfinserv.in
+banners and the lg.com banner (both rows then have 0 images). It WROTE 3 Samsung
+energy labels, the Panasonic campaign tile and the Voltas Beko text card as product
+images (`_1` of the last two is not white).
+**Accept:** a replay of the run (warm `.cache\`, `--force`, scratch copy) writes
+none of the URLs above. The good photos of the same rows stay. A unit test pins
+each pattern.
+
+## KI-18 · HIGH · open (found 2026-11-20) — a different model's photo is the only image
+**Symptom:** LG-GLD2256ZARS (a 210 L single-door refrigerator) has one image, and it
+shows another model.
+**Evidence:** the image path is
+`.../gl-d201ascu_asczebn_eail_in_c/gallery/GL-D201ASCU-Refrigerators-Front-View-D-01-v.jpg`
+on the lg.com page of GLD2256ZARS. The poorvika.com images were below the 1000 px floor
+and were not donated.
+**Likely cause:** the lg.com image collection (`extract()` / `parse_generic`, sku_enricher.py
+:2680 and :2975) accepts any gallery image on the page. No check compares a model code
+in the image file name with the row's model code.
+**Accept:** an image whose file name holds a model code that is not the row's model
+code (and is not a shared-prefix variant) is dropped. LG-GLD2256ZARS then has 0 images
+from lg.com and the status says so.
+
+## KI-19 · MED · open (found 2026-11-20) — a foreign model code in the title is not flagged
+**Symptom:** HAIER-HRF-3782BNSA-P is a clean FOUND, but the title names another code.
+**Evidence:** title "Haier 328 L, Frost Free Refrigerator (HHRF-3782BIS-P)"; status
+`FOUND (haier.com)`.
+**Likely cause:** `assess()` returns "strong" at sku_enricher.py:3206-3208 when the
+model code is in the URL and the title starts with the brand. The different-model
+check (:3228-3236) runs only after that return, so it never sees the title code.
+**Accept:** a page whose URL holds the model code but whose title names a different,
+non-variant code gets a VERIFY or CLOSE MATCH status, not a clean FOUND.
+
+## KI-20 · MED · open (found 2026-11-20) — exact official URL gives CLOSE MATCH and no price
+**Symptom:** SAMSUNG-AR50H19D1PHNNA is `CLOSE MATCH - CHECK (samsung.com)` and has no
+price, although tier 0 found the exact official page.
+**Evidence:** URL `https://www.samsung.com/in/air-conditioners/split-ac/bespoke-ai-inverter-split-ac-5-00-kw-3-star-2026-ar50h19d1phnna/`
+holds the full model code. Title "Online Bespoke AI Inverter Split AC 3 Star 5.0 kW 2026"
+holds no model code and does not start with "Samsung". Price cells are empty.
+**Likely cause:** the URL vouches only when `starts_with_brand` is true (sku_enricher.py
+:3206-3207). The title has no model token, so the verdict falls to the trailing-characters
+branch (:3237-3239, the core code is in the URL) and returns "close". The samsung.com
+parser reads no price from this page (cause not confirmed: page price is maybe loaded by JavaScript).
+**Accept:** an official brand-domain URL that holds the full model code gives a
+"strong" verdict even when the title omits the brand. A `--probe` of the URL shows a
+price, or the status says "no price shown".
+
+## KI-21 · MED · open (found 2026-11-20) — panasonic.com spec scrape returns site navigation
+**Symptom:** PANASONIC-CW-XU185CGT has no real spec rows, no price, no tonnage and no
+star rating.
+**Evidence:** the `specs` cell is "Find Your Nearest Dealers: ... | Product Catalogues: ...".
+`page_text` is 76 characters.
+**Likely cause:** the generic spec-table scrape (`parse_generic`, sku_enricher.py:2680)
+takes the first label/value block on the page, which is the footer navigation. It has
+no panasonic.com parser.
+**Accept:** a `--probe` of the panasonic.com page gives spec rows with the capacity
+(tonnage) and the star rating, and no navigation text.
+
+## KI-22 · MED · open (found 2026-11-20) — reliancedigital.in FOUND with 0 spec rows
+**Symptom:** SAMSUNG-WA80F10B3NTL is a clean FOUND with an empty `specs` cell.
+**Evidence:** `FOUND (reliancedigital.in)`, 0 spec rows, `page_text` 131 characters.
+**Likely cause:** `parse_reliance` (sku_enricher.py:2612) reads the title, price and
+images but not the specification block of the current page layout.
+**Accept:** a `--probe` of the reliancedigital.in URL gives spec rows (capacity, load
+type, star rating).
+
+## KI-23 · MED · open (found 2026-11-20) — review text passes the content firewall
+**Symptom:** spec rows of VOLTAS BEKO-WFL7012VTMP hold review opinions.
+**Evidence:** rows such as "Service network: good" and "✓ Front-load drum: the gentlest
+wash..." from bestpurifier.in.
+**Likely cause:** `content_ok` / `content_clean` (sku_enricher.py:686 and :706) block
+retailer, offer and contact text, but not review wording or check-mark bullets.
+**Accept:** spec rows with review wording (good, best, gentlest, a leading check mark)
+do not reach the sheet or the CSV. A unit test pins the two rows above.
+
+## KI-24 · MED · open (found 2026-11-20) — sizing specs in the title but not in the spec rows
+**Symptom:** the spec rows miss the main sizing value that the title states.
+**Evidence:** no tonnage row on both split ACs (LG-US-Q18ENXE "(1.5)",
+SAMSUNG-AR50H19D1PHNNA "5.0 kW"); no litres or door-type row on LG-GLD2256ZARS
+("210L Single Door"); no star row on GODREJ-WSEDGE-ULT-80-5.0-DB2M-CSRD ("5 Star").
+**Likely cause:** the site parsers copy only the page's spec table. The enricher
+does not add a sizing row from the title. `app.py` reads the title as a third source
+for filter groups, so the CSV can still be right; check the build before a fix.
+**Accept:** for each row above, the built CSV has the tonnage / capacity / door type /
+star rating attribute. If the CSV already has it, close this entry as "no defect".
+**Build check (2026-11-20, `runs\mixed-2026-11-20\build\mixed.csv`):** the title
+fills the gap for 3 rows: LG-US-Q18ENXE `AC Capacity=1.5 Ton`, LG-GLD2256ZARS
+`Fridge Type=Single Door` + `Capacity=210 L`, GODREJ `Energy Rating=5 Star`. Still
+open for SAMSUNG-AR50H19D1PHNNA (no `AC Capacity`, see KI-29).
+
+## KI-25 · LOW · open (found 2026-11-20) — free_first sends no serper query after poor DuckDuckGo results
+**Symptom:** with `--search-order free_first`, a poor DuckDuckGo answer stops the
+paid search.
+**Evidence:** SAMSUNG-AR50H19D1PHNNA: `"AR50H19D1PHNNA" site:flipkart.com` returned a
+jeans page; `site:samsung.com` returned a user manual, a help page and a community post.
+The run sent 0 serper queries.
+**Likely cause:** `web_search` (sku_enricher.py:1429-1433) returns any non-empty
+DuckDuckGo result list and caches it; serper is asked only when DuckDuckGo gives nothing.
+**Accept:** in free_first mode, a DuckDuckGo result list with no URL on the queried
+site (for a `site:` query) counts as empty, and serper is asked within the budget.
+
+## Found by the build of the mixed-category rows (2026-11-20)
+
+Command: `build_csv.py runs\mixed-2026-11-20\build\mixed_filled.xlsx -o
+runs\mixed-2026-11-20\build\mixed.csv --client <scratch copy of shreejee> --all-rows`,
+then `validate_csv.py` on the CSV. Output: `runs\mixed-2026-11-20\build\` (`mixed.csv`,
+`build.log`, `validate.log`, `validation_issues.csv`). The scratch client and its
+images were deleted after the run.
+
+## KI-26 · MED · open (found 2026-11-20, validate_csv.py) — every washing machine is flagged as a pre-KI-14 CSV
+**Symptom:** all 3 washing-machine rows get `placeholder_spec_text (WM Function Type) -
+rebuild this CSV, it predates the KI-14 fix`. The CSV is new.
+**Evidence:** `validation_issues.csv` rows of WM-SAMSUNG-WA80F10B3NTL,
+WM-VOLTAS-BEKO-WFL7012VTMP and WM-GODREJ-WSEDGE-ULT-80-5.0-DB2M-CSRD.
+**Likely cause:** `DEAD_PLACEHOLDERS` (validate_csv.py:196-199) lists `WM Function Type`
+and `WM Washing Capacity`. Since 2026-11-19 these are the store's real filter-group
+names (filter sheet; `app.FILTER_AXIS_GROUPS`, app.py:2033-2034). The check at
+validate_csv.py:1105-1109 searches the whole row text.
+**Accept:** a washing-machine row built today has no `placeholder_spec_text` issue.
+A row with `Standard Capacity` or `Appliance Utility Core` is still flagged.
+
+## KI-27 · MED · open (found 2026-11-20, app.py) — a semi-automatic washer is also "Fully Automatic Top Load"
+**Symptom:** GODREJ-WSEDGE-ULT-80-5.0-DB2M-CSRD gets
+`WM Function Type=Fully Automatic Top Load, Semi-Automatic`. The product is semi-automatic only.
+**Evidence:** title "... Semi-Automatic Top Load ..."; `categories` is
+`Washing Machines > semi auto` (correct).
+**Likely cause:** `FILTER_VALUE_ALIASES` (app.py:1601-1602) maps the bare phrase
+`top load` to `Fully Automatic Top Load`. `_text_hits` (app.py:1735-1753) drops a hit
+only when it sits inside a longer hit, and "semi automatic" and "top load" do not overlap.
+**Accept:** "Semi-Automatic Top Load" gives `Semi-Automatic` only. "Fully Automatic Top
+Load" and a bare "Top Load" on a fully automatic product still give `Fully Automatic Top Load`.
+
+## KI-28 · MED · open (found 2026-11-20, app.py) — "2 Way Air Swing" becomes Power Rating 2 W
+**Symptom:** LG-US-Q18ENXE has the attribute `Power Rating=2 W`.
+**Evidence:** title "... 2 Way Air Swing, ADC Sensor, 4.4 kW ...".
+**Likely cause:** `wattage()` (app.py:773) matches `\d+\s*(?:W|Watt|Watts)` with no
+word boundary after the unit, so "2 W" in "2 Way" matches. Called from app.py:2871.
+**Accept:** "2 Way Air Swing" gives no Power Rating. "1200 W" and "1200 Watts" still give one.
+
+## KI-29 · MED · open (found 2026-11-20, app.py) — a scraped value outside the filter list leaves the filter empty and no gap
+**Symptom:** two rows have no value for a required filter, and `_spec_gaps` is empty.
+**Evidence:** SAMSUNG-AR50H19D1PHNNA: `_filter_unmatched` = `AC Capacity (Ton):
+'17061 Btu/h' not in list`; no `AC Capacity` attribute; the title says "5.0 kW".
+HAIER-HRF-3782BNSA-P (a top-mount, two-door refrigerator): `_filter_unmatched` =
+`Fridge Type (Type): 'Top Mount Frost Free (FF)' not in list`; no `Fridge Type` attribute.
+**Likely cause:** the `Ton` axis has no unit (app.py:2027), so a Btu/h capacity is a
+candidate; nothing converts kW or Btu/h to tons (the owner rule says a scraped value
+is never rounded, so a conversion needs an owner decision). `FILTER_VALUE_ALIASES`
+(app.py:1597) has no `top mount` -> `Double Door` alias. `_spec_gaps` seems to count an
+unmatched value as filled (not confirmed).
+**Accept:** each row either gets the filter value (after an owner decision on the
+conversion and the alias) or lists the axis in `_spec_gaps`.
+
+## KI-30 · LOW · open (found 2026-11-20) — lg.com spec labels keep section prefixes and lose units
+**Symptom:** attribute names such as `GENERAL - Product Type`, `Energy Saving - Energy
+Grade` and `BASIC SPEC - ENERGY`; the value `GENERAL - Cooling Capacity=5000` has no unit.
+**Evidence:** LG-US-Q18ENXE and LG-GLD2256ZARS in `mixed.csv`. The sheet row says
+`GENERAL - Cooling Capacity Max(W): 5000`. `Energy Grade=3 Star` repeats `AC Star Rating`.
+**Likely cause:** the lg.com spec scrape in sku_enricher.py writes "SECTION - label"
+(parser not confirmed), and the app.py label clean-up drops the "(W)" unit with the
+label suffix.
+**Accept:** lg.com rows give plain labels (`Product Type`, `Cooling Capacity`) and the
+value keeps its unit (`5000 W`).
+
+## KI-31 · LOW · open (found 2026-11-20, app.py) — split inverter AC filed as "Inverter AC"; brand "Voltas" for Voltas Beko
+**Symptom:** SAMSUNG-AR50H19D1PHNNA ("Inverter Split AC") gets `Air Conditioner >
+Inverter AC`; LG-US-Q18ENXE (a split AC) gets `Air Conditioner > Split AC`.
+VOLTAS BEKO-WFL7012VTMP gets the brand `Voltas`.
+**Likely cause:** the taxonomy has `Split AC` and `Inverter AC` as sibling
+sub-categories, and `detect_category` tests inverter first (app.py:575-579). The
+brand split keeps the first word of a two-word brand (not confirmed where).
+**Accept:** the owner decides which sub-category an inverter split AC belongs to (or
+adds the technology as a filter only), and the detector follows it. "Voltas Beko"
+stays one brand.

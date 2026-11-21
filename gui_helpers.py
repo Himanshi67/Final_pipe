@@ -4,6 +4,7 @@ Unit-tested in tests/test_gui_helpers.py. Keep streamlit (and app.py)
 imports OUT of this module so the tests never boot the app."""
 
 import hashlib
+import hmac
 import os
 import re
 import shutil
@@ -1548,7 +1549,9 @@ def render_batch_readme(name, meta, coverage, review_metrics=None,
 #    "skus": {"<raw sheet sku>": {
 #        "short description": {"lines": [...], "generated": [...],
 #                              "saved": "<iso time>"},
-#        "description": {...}}}}
+#        "description": {...},
+#        "key features": {...}}}}      (added 2026-11-20: the key-features
+#                                       paragraph, CSV column 'configuration')
 # `lines` are the accepted "Label: Value" lines (the firewall has already
 # refused the others at save time); an EMPTY list means the reviewer cleared
 # the field on purpose. `generated` is what the build made at save time, so
@@ -1556,7 +1559,8 @@ def render_batch_readme(name, meta, coverage, review_metrics=None,
 # columns of _filled.xlsx are never touched.
 
 DESCRIPTION_OVERRIDES_FILE = "description_overrides.json"
-OVERRIDE_FIELDS = ("short description", "description")
+KEY_FEATURES_FIELD = "key features"     # == app.KEY_FEATURES_FIELD
+OVERRIDE_FIELDS = ("short description", "description", KEY_FEATURES_FIELD)
 
 
 def overrides_path(run_dir) -> Path:
@@ -1614,8 +1618,8 @@ def set_override(state, sku, field, lines, generated, at=None) -> str:
 
 
 def reset_override(state, sku, field=None) -> bool:
-    """'Reset to generated': drop the override of one field (or both when
-    `field` is None). Returns True when something was removed."""
+    """'Reset to generated': drop the override of one field (or every
+    description field in OVERRIDE_FIELDS when `field` is None). Returns True when something was removed."""
     skus = (state or {}).get("skus", {})
     entry = skus.get(str(sku))
     if not entry:
@@ -1800,3 +1804,172 @@ def merge_attribute_edits(entry, sets, removes):
     merged_removes += [r for r in _names(removes)
                        if r.lower() not in {m.lower() for m in merged_removes}]
     return merged_sets, merged_removes
+
+
+# ------------------------------------------------------------ share mode --
+# A password-protected, restricted GUI for a second person (docs\
+# PIPELINE_GUIDE.md "Share mode"). The three environment switches are read
+# HERE and nowhere else; gui.py asks these functions on every render, so a
+# test can flip the environment between runs.
+
+SHARE_MODE_ENV = "GUI_SHARE_MODE"
+SHARE_PASSWORD_ENV = "GUI_SHARE_PASSWORD"
+SHARE_BUDGET_ENV = "GUI_SHARE_BUDGET"
+SHARE_DEFAULT_BUDGET = 50
+SHARE_MIN_PASSWORD = 12
+SHARE_MAX_FAILS = 8
+SHARE_LOCK_SECONDS = 15 * 60
+SHARE_FAIL_DELAY = 1.5          # seconds slept on every wrong password
+SHARE_BANNER = ("Share mode: publish, delete, archive and taxonomy edits "
+                "are off.")
+
+# enricher flags share mode removes: --js-fallback / --js-profile start a
+# headless browser, --force re-pays every serper credit on a cold cache.
+# --budget is removed too and re-added with the capped value.
+_SHARE_DROP_FLAGS = ("--js-fallback", "--js-profile", "--force")
+_SHARE_VALUE_FLAGS = ("--js-profile", "--budget")
+
+
+class ShareModeRefused(RuntimeError):
+    """An action that share mode forbids was asked for. Raised by the
+    function that does the work, so a hidden control is not the only guard."""
+
+
+def _env(env):
+    return os.environ if env is None else env
+
+
+def share_mode_on(env=None) -> bool:
+    """True when GUI_SHARE_MODE is 1 / true / on / yes (any case)."""
+    return str(_env(env).get(SHARE_MODE_ENV, "")).strip().lower() in (
+        "1", "true", "on", "yes")
+
+
+def share_password(env=None) -> str:
+    """The share password exactly as set (no stripping); "" when unset."""
+    return str(_env(env).get(SHARE_PASSWORD_ENV) or "")
+
+
+def share_password_problem(env=None) -> str | None:
+    """Why share mode must refuse to render, or None when the password is
+    usable. Never includes the password itself."""
+    pw = share_password(env)
+    if not pw:
+        return (f"Share mode is on but {SHARE_PASSWORD_ENV} is not set. "
+                "Nothing is shown until a password is configured.")
+    if len(pw) < SHARE_MIN_PASSWORD:
+        return (f"Share mode is on but {SHARE_PASSWORD_ENV} is shorter than "
+                f"{SHARE_MIN_PASSWORD} characters. Nothing is shown until a "
+                "longer password is configured.")
+    return None
+
+
+def share_budget(env=None) -> int:
+    """GUI_SHARE_BUDGET as a positive int; the default (50) when unset, not
+    a number, or not above 0 (0 would mean 'unlimited' to the enricher)."""
+    raw = str(_env(env).get(SHARE_BUDGET_ENV, "")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return SHARE_DEFAULT_BUDGET
+    return value if value > 0 else SHARE_DEFAULT_BUDGET
+
+
+def check_share_password(given, expected) -> bool:
+    """Constant-time compare; an empty expected password never matches."""
+    if not expected:
+        return False
+    return hmac.compare_digest(str(given or "").encode("utf-8"),
+                               str(expected).encode("utf-8"))
+
+
+def _flag_hits(token: str, full: str) -> bool:
+    """`token` names the flag `full`, including argparse's abbreviations
+    (`--forc`, `--js-f`) and the `--flag=value` form."""
+    name = token.split("=", 1)[0]
+    return (name.startswith("--") and len(name) >= 3
+            and full.startswith(name))
+
+
+def share_cap_flags(flags, budget: int) -> list:
+    """The enricher flags with share mode applied: no --js-fallback,
+    --js-profile or --force (any abbreviation), and exactly one
+    `--budget N` where N = min(the operator's value if > 0, budget)."""
+    cap = budget if budget and budget > 0 else SHARE_DEFAULT_BUDGET
+    out, asked = [], 0
+    tokens = [str(t) for t in (flags or [])]
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        hit = next((f for f in _SHARE_DROP_FLAGS + ("--budget",)
+                    if _flag_hits(tok, f)), None)
+        if hit is None:
+            out.append(tok)
+            i += 1
+            continue
+        value = None
+        if "=" in tok:
+            value = tok.split("=", 1)[1]
+        elif hit in _SHARE_VALUE_FLAGS and i + 1 < len(tokens) \
+                and not tokens[i + 1].startswith("--"):
+            value = tokens[i + 1]
+            i += 1
+        if hit == "--budget" and value is not None:
+            try:
+                asked = int(value)
+            except ValueError:
+                asked = 0
+        i += 1
+    n = min(asked, cap) if asked > 0 else cap
+    return out + ["--budget", str(n)]
+
+
+class LoginThrottle:
+    """Process-wide guard against password guessing: after `max_fails`
+    wrong attempts in total (all sessions together) every login is locked
+    for `lock_seconds`. A success, or the end of a lock, resets the count.
+
+    It lives in this imported module, not in gui.py: Streamlit re-executes
+    the main script on every rerun, so a global there would reset."""
+
+    def __init__(self, max_fails=SHARE_MAX_FAILS,
+                 lock_seconds=SHARE_LOCK_SECONDS, clock=None):
+        import threading
+        import time as _time
+        self.max_fails = max_fails
+        self.lock_seconds = lock_seconds
+        self._clock = clock or _time.monotonic
+        self._lock = threading.Lock()
+        self._fails = 0
+        self._locked_until = 0.0
+
+    def locked_for(self) -> float:
+        """Seconds left on the lock; 0 when logins are open."""
+        with self._lock:
+            left = self._locked_until - self._clock()
+            if left <= 0 and self._locked_until:
+                self._locked_until = 0.0
+                self._fails = 0
+            return max(0.0, left)
+
+    def record_failure(self):
+        with self._lock:
+            self._fails += 1
+            if self._fails >= self.max_fails:
+                self._locked_until = self._clock() + self.lock_seconds
+
+    def record_success(self):
+        with self._lock:
+            self._fails = 0
+
+    def reset(self):
+        with self._lock:
+            self._fails = 0
+            self._locked_until = 0.0
+
+    @property
+    def failures(self) -> int:
+        return self._fails
+
+
+SHARE_THROTTLE = LoginThrottle()

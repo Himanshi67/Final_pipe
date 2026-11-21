@@ -44,7 +44,7 @@ SEED = [
     ("Home Appliances", "Fans", "ceiling fan, table fan, pedestal fan, wall fan, bldc fan", "ceiling fan", "ceiling fan price, bldc fan india, pedestal fan"),
     ("Home Appliances", "Refrigerators", "refrigerator, fridge, double door refrigerator, single door fridge, frost free refrigerator, inverter refrigerator", "refrigerator", "fridge price india, double door refrigerator, best refrigerator"),
     ("Home Appliances", "Room Heaters", "room heater, oil filled radiator, fan heater, halogen heater", "room heater", "room heater price, oil filled heater india"),
-    ("Home Appliances", "Trolly Bag", "trolley bag, luggage trolley, cabin bag, travel suitcase", "trolley bag", "trolley bag price, cabin luggage india"),
+    ("Home Appliances", "Trolley Bag","trolley bag, luggage trolley, cabin bag, travel suitcase", "trolley bag", "trolley bag price, cabin luggage india"),
     ("Home Appliances", "Water Dispensers", "water dispenser, hot and cold water dispenser, bottled water dispenser, floor standing dispenser", "water dispenser", "water dispenser price, hot and cold dispenser"),
     ("Home Appliances", "Water Purifiers", "water purifier, ro water purifier, uv water purifier, ro uv uf purifier, alkaline water purifier", "water purifier", "ro water purifier price, best water purifier india"),
     ("Home Appliances", "mattress", "mattress, orthopedic mattress, memory foam mattress, spring mattress, queen size mattress", "mattress", "mattress price india, memory foam mattress"),

@@ -440,8 +440,31 @@ edit equal to the generated text is no override. *Reset ... to generated* remove
 If the row is re-enriched or edited later, the panel says the generated text has
 changed; the edit is still used until it is reset. The build (step 3, and
 `build_csv.py --description-overrides runs\<name>\description_overrides.json`) writes
-the override in place of the generated rows and applies the firewall again. The
-key-features paragraph (`configuration`) is not edited here.
+the override in place of the generated rows and applies the firewall again.
+
+**Key-features paragraph (review step, 2026-11-20).** The same panel has a third
+field, *Key features paragraph*. The build writes it to the CSV column
+`configuration` as `<p class="product-key-features">` with one `Label: value.`
+sentence per line. The panel shows it as one **Label: value** line per sentence: the
+brand row plus at most `KEY_POINTS_MAX` key points. The rules are the same as for the
+two other fields: the firewall check at save time and at build time, *Publish ...
+EMPTY*, *Reset ... to generated*, and the "generated text has changed" warning. The
+edit is stored in `description_overrides.json` under the key `key features`. The
+reviewer's lines have no line limit, the same as the two other fields. An older
+overrides file without this key builds the paragraph as before.
+
+**Final images (card review, 2026-11-20).** Card review shows each kept photo as the
+build will save it: the 1500 x 1500 white canvas, with its final number (`_1` is the
+main image, the whitest white-background photo). `app.preview_images_for_row` runs
+the build's own image code (`open_source_image`, `square_image`,
+`order_square_results`). It writes no file and never moves old images. A photo that
+the build refuses shows the source photo and the reason (below the 1000 px floor, or
+download failed). A dropped photo shows the source photo with "dropped - not built".
+The *keep* checkboxes work as before and write `dropped_images` as before. The
+preview downloads each photo once and caches a small copy for one hour. Use the
+toggle *Show the final 1500 x 1500 images* to switch the preview off (the source
+photos then show with no download). Set `PIPELINE_REVIEW_IMAGE_PREVIEW=off` to make
+off the default. The table view does not show the preview.
 
 **Price and attributes (review step, 2026-11-19 late).** A second panel, *Price &
 attributes*, sits above the description panel (card view, and in the table view's
@@ -505,6 +528,54 @@ produces the same client pack from the headless route.
 `app.py` still exists and still works on its own (just the CSV-build step) —
 useful if you already have a `_filled.xlsx` from a script-driven run and only
 need the formatter, without the rest of the wizard's state-tracking.
+
+#### Share mode (password-protected GUI)
+
+Share mode lets a second person use the wizard. It asks for a password
+before it shows anything. It also turns off the dangerous actions.
+
+**Start:**
+```
+powershell -ExecutionPolicy Bypass -File tools\share_gui.ps1
+```
+- The script makes a random 24-character password. To set your own
+  password, add `-Password "<at least 12 characters>"`.
+- The script binds the GUI to `127.0.0.1` (this PC only), port 8501.
+  Other options: `-Port`, `-Budget` (credits per run, default 50) and
+  `-MaxUploadMB` (default 20).
+- The script writes the URL, the password, the PID and the start time to
+  `runs\_share\share_info.txt`. `runs\` is gitignored. The script does not
+  print the password. Read it from that file.
+
+**Stop:**
+```
+powershell -ExecutionPolicy Bypass -File tools\stop_share_gui.ps1
+```
+The stop script kills the process tree, checks that the port is closed and
+deletes `share_info.txt`.
+
+**What is off in share mode:**
+- Step 5 Publish: no preflight, no dry run, no commit. `run_publish` refuses.
+- Run delete and run archive.
+- Category map edits.
+- The client selector. The client stays the one the process started with.
+- `--js-fallback`, `--js-profile` and `--force`. Every enrichment run gets
+  `--budget N`. N is the operator's value or `GUI_SHARE_BUDGET`, whichever
+  is smaller.
+
+Upload, enrich, review, build and validate stay available.
+
+**Login lock:** after 8 wrong passwords in total (all sessions together),
+all logins lock for 15 minutes.
+
+**Environment variables** (the launcher sets them for the GUI process only):
+`GUI_SHARE_MODE=1`, `GUI_SHARE_PASSWORD` (12 characters minimum, else the GUI
+shows only an error), `GUI_SHARE_BUDGET` (default 50). With none of them set,
+the GUI works as before.
+
+**Public access:** the launcher binds to this PC only. It starts no tunnel.
+A public address needs a separate tunnel step. The owner starts and stops
+that tunnel. Stop the tunnel before you stop the GUI.
 
 ### app.py — WooCommerce formatter (browser app)
 
@@ -901,7 +972,7 @@ a batch can run unattended and so the formatter can be asserted on by tests.
 | `--seo` | Add the SEO meta columns (OFF by default) |
 | `--seo-plugin` | `yoast` (default) · `rankmath` · `both` |
 | `--no-validate` | Skip the QA pass that otherwise runs on the file just written |
-| `--description-overrides JSON` | The reviewer's edits per SKU: description / short description, page MRP / selling price / publish price, attributes (`runs\<name>\description_overrides.json`, written by the GUI review step). Default: none - every field is generated |
+| `--description-overrides JSON` | The reviewer's edits per SKU: description / short description / key-features paragraph (`configuration`), page MRP / selling price / publish price, attributes (`runs\<name>\description_overrides.json`, written by the GUI review step). Default: none - every field is generated |
 | `--pack` | Also write `<out stem>_pack\` — CSV, the images the CSV references and a README (never the `_filled.xlsx`, the report or a log) — and zip it. The same client pack the GUI's Archive button zips |
 | `--client SLUG` | Which client's config to use (default: `PIPELINE_CLIENT`, then `shreejee`) |
 

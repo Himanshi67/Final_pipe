@@ -89,7 +89,8 @@ def main():
                     help="Which plugin's meta keys to write (default: yoast)")
     ap.add_argument("--description-overrides", metavar="JSON",
                     help="The reviewer's edits per SKU: description, short "
-                         "description, page MRP / selling price / publish "
+                         "description, key-features paragraph "
+                         "(configuration), page MRP / selling price / publish "
                          "price, attributes (description_overrides.json "
                          "in the GUI run folder, written by the review "
                          "step). Default: none - every field is generated.")
@@ -145,7 +146,7 @@ def main():
             sys.exit(f"Overrides file not found: {ov_path}")
         overrides = gui_helpers.overrides_for_build(
             gui_helpers.load_overrides_state(ov_path))
-        # (covers description, price and attribute edits)
+        # (covers description, key-features, price and attribute edits)
         print(f"Description overrides: {len(overrides)} SKU(s) from "
               f"{ov_path.name}")
 

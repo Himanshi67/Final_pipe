@@ -19,7 +19,8 @@ filter attributes from them (app.filter_attributes). This tool prints:
      2026-11-19) against (a) the rows of 'Sub-Category Attributes' and (b) the
      first sheet of category_map.xlsx (same shape): a sub-category in one and
      not the other, and the same name spelled differently ('Trolly Bag' /
-     'Trolley Bag', 'Top load' / 'Top Load'). Nothing is edited.
+     'Trolley Bag' - fixed in the shreejee sheets on 2026-11-20 -, 'Top load' /
+     'Top Load'). Nothing is edited.
 
 Read-only. Usage:
     .venv\\Scripts\\python.exe tools\\check_filter_sheet.py [--client SLUG]

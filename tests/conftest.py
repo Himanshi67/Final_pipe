@@ -35,6 +35,11 @@ os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
 # start of every enricher run. Suites that drive sku_enricher.main() stub the
 # page fetcher and serper only, so keep tier 0 off for them; tests# test_url_index.py turns it back on per test with fixtures and a temp DB.
 os.environ.setdefault("PIPELINE_URL_INDEX", "off")
+# Card review (gui.py) downloads every kept photo to preview the final 1500 x
+# 1500 canvas. The seeded test rows carry example.com image URLs, so the
+# toggle defaults to OFF under pytest; tests\test_review_image_preview.py
+# turns it on per test with app.fetch_image_bytes stubbed.
+os.environ.setdefault("PIPELINE_REVIEW_IMAGE_PREVIEW", "off")
 
 collect_ignore = ["qa_pipeline.py", "qa_deep.py", "qa_cli.py"]
 

@@ -57,13 +57,105 @@ def test_generated_fields_match_what_the_build_writes(monkeypatch):
     assert app.html_block(fields["short description"]) == \
         out["short description"]
     assert app.html_block(fields["description"]) == out["description"]
+    assert app.key_features_paragraph(fields["key features"]) == \
+        out["configuration"]
+    assert out["configuration"].startswith('<p class="product-key-features">')
     # and the editor's lines round-trip to the SAME html, byte for byte
     for field in app.DESCRIPTION_FIELDS:
         lines = app.description_lines(fields[field])
         rows, refused = app.parse_description_lines("\n".join(lines),
                                                     "Foxsky")
         assert refused == []
-        assert app.render_description_rows(rows) == out[field]
+        column = app.DESCRIPTION_FIELD_COLUMNS[field]
+        assert app.render_override_field(field, rows) == out[column]
+
+
+# ------------------------------------- the key-features paragraph (2026-11-20)
+def test_key_features_is_the_third_field_and_writes_configuration():
+    assert app.KEY_FEATURES_FIELD == "key features" == GH.KEY_FEATURES_FIELD
+    assert app.DESCRIPTION_FIELDS[-1] == app.KEY_FEATURES_FIELD
+    assert app.DESCRIPTION_FIELD_COLUMNS[app.KEY_FEATURES_FIELD] == \
+        "configuration"
+    assert GH.OVERRIDE_FIELDS == app.DESCRIPTION_FIELDS
+
+
+def test_key_features_rows_keep_the_key_point_cap():
+    """The generated paragraph = the brand row(s) + at most KEY_POINTS_MAX
+    key points, the same cap the build applies today."""
+    many = " | ".join(f"Spec {i}: value {i}" for i in range(20))
+    fields = app.description_fields_for_row(pd.Series(row(specs=many)))
+    points = [r for r in fields["key features"] if r[0] != "Brand"]
+    assert len(points) <= app.KEY_POINTS_MAX
+
+
+def test_key_features_override_is_built_and_refiltered(monkeypatch):
+    no_downloads(monkeypatch)
+    df = pd.DataFrame([row(), row(sku="OTHER1", title="Foxsky 32 inch HD "
+                                  "Ready LED TV OTHER1")])
+    overrides = {"43FSFHS": {"key features": [
+        "Brand: Foxsky", "Screen Size: 43 Inch", "Note: <b>bold</b>",
+        "Seller: Appario Retail", "just words"]}}
+    out = app.process_inventory(df, media_base="https://x.test/m",
+                                description_overrides=overrides)
+    plain = app.process_inventory(df, media_base="https://x.test/m")
+    edited = out.iloc[0]
+    assert edited["configuration"] == (
+        '<p class="product-key-features">Brand: Foxsky. Screen Size: 43 '
+        'Inch. Note: &lt;b&gt;bold&lt;/b&gt;.</p>')
+    assert "Appario" not in edited["configuration"]
+    # the other columns and the other SKU keep their generated text
+    for col in ("short description", "description"):
+        assert edited[col] == plain.iloc[0][col]
+    assert out.iloc[1]["configuration"] == plain.iloc[1]["configuration"]
+
+
+def test_key_features_cleared_on_purpose_writes_it_empty(monkeypatch):
+    no_downloads(monkeypatch)
+    out = app.process_inventory(pd.DataFrame([row()]),
+                                media_base="https://x.test/m",
+                                description_overrides={"43FSFHS": {
+                                    "key features": []}}).iloc[0]
+    assert pd.isna(out["configuration"]) or out["configuration"] == ""
+
+
+def test_old_overrides_file_without_the_new_key_is_unchanged(monkeypatch):
+    """A description_overrides.json written before 2026-11-20 has no
+    'key features' entry: the paragraph stays the generated one."""
+    no_downloads(monkeypatch)
+    df = pd.DataFrame([row()])
+    old = {"43FSFHS": {"short description": ["Brand: Foxsky"]}}
+    out = app.process_inventory(df, media_base="https://x.test/m",
+                                description_overrides=old).iloc[0]
+    plain = app.process_inventory(df, media_base="https://x.test/m").iloc[0]
+    assert out["configuration"] == plain["configuration"]
+    assert out["description"] == plain["description"]
+
+
+def test_key_features_state_set_reset_and_stale(tmp_path):
+    path = GH.overrides_path(tmp_path)
+    state = GH.load_overrides_state(path)
+    gen = ["Brand: Foxsky", "Screen Size: 43 Inch"]
+    assert GH.set_override(state, "SKU-A", "key features",
+                           ["Brand: Foxsky"], gen, at="t") == "saved"
+    GH.set_override(state, "SKU-A", "short description", ["Brand: X"], [],
+                    at="t")
+    GH.save_overrides_state(path, state)
+    back = GH.load_overrides_state(path)
+    assert GH.overrides_for_build(back) == {"SKU-A": {
+        "key features": ["Brand: Foxsky"], "short description": ["Brand: X"]}}
+    entry = GH.get_override(back, "SKU-A", "key features")
+    assert GH.override_is_stale(entry, gen) is False
+    assert GH.override_is_stale(entry, gen + ["Colour: Black"]) is True
+    # equal to generated = no override; reset of one field leaves the other
+    assert GH.set_override(back, "SKU-A", "key features", gen, gen) == \
+        "removed"
+    GH.set_override(back, "SKU-A", "key features", ["A: 1"], gen)
+    assert GH.reset_override(back, "SKU-A", "key features") is True
+    assert "key features" not in GH.overrides_for_build(back)["SKU-A"]
+    # reset with no field drops every description field, key features too
+    GH.set_override(back, "SKU-A", "key features", ["A: 1"], gen)
+    assert GH.reset_override(back, "SKU-A") is True
+    assert GH.overrides_for_build(back) == {}
 
 
 def test_parse_lines_form_bullets_and_blank_lines():
@@ -194,6 +286,8 @@ def test_build_csv_flag_applies_the_overrides(tmp_path):
     state = {"version": 1, "skus": {}}
     GH.set_override(state, "43FSFHS", "short description",
                     ["Brand: Foxsky", "Reviewer Note: kept point"], [])
+    GH.set_override(state, "43FSFHS", "key features",
+                    ["Brand: Foxsky", "Reviewer Point: in the paragraph"], [])
     ov = tmp_path / "description_overrides.json"
     GH.save_overrides_state(ov, state)
     out = tmp_path / "out.csv"
@@ -205,6 +299,9 @@ def test_build_csv_flag_applies_the_overrides(tmp_path):
     assert proc.returncode == 0, proc.stdout[-2000:] + proc.stderr[-2000:]
     csv = pd.read_csv(out, dtype=str, keep_default_na=False)
     assert "Reviewer Note" in csv.loc[0, "short description"]
+    assert csv.loc[0, "configuration"] == (
+        '<p class="product-key-features">Brand: Foxsky. Reviewer Point: in '
+        'the paragraph.</p>')
     assert "Description overrides: 1 SKU(s)" in proc.stdout
     # without the flag: generated text
     proc = subprocess.run(
@@ -214,6 +311,7 @@ def test_build_csv_flag_applies_the_overrides(tmp_path):
     assert proc.returncode == 0
     csv = pd.read_csv(out, dtype=str, keep_default_na=False)
     assert "Reviewer Note" not in csv.loc[0, "short description"]
+    assert "Reviewer Point" not in csv.loc[0, "configuration"]
 
 
 # ----------------------------------------------------------- gui (AppTest)
@@ -257,3 +355,36 @@ def test_card_review_shows_and_saves_a_description_edit(tmp):
         (run / "review_state.json").read_text(encoding="utf-8")
     assert json.loads(GH.overrides_path(run).read_text(
         encoding="utf-8"))["skus"] == {}
+
+
+def test_card_review_edits_the_key_features_paragraph(tmp):
+    import gui
+    from test_gui_ui import boot, seeded_run, step2, assert_no_exception
+    runs = tmp / "runs"
+    run = seeded_run(runs, "kfedit")
+    gui.run_paths(run)
+    at = boot(runs)
+    step2(at)
+    next(r for r in at.radio if "View" in str(r.label)).set_value(
+        "Card review").run(timeout=60)
+    assert_no_exception(at)
+    kf = next(t for t in at.text_area
+              if str(t.label).startswith("Key features paragraph"))
+    assert "Brand: LG" in kf.value                 # as the build writes it
+    kf.set_value("Brand: LG\nCapacity: 190 L\nOffer: No Cost EMI").run(
+        timeout=60)
+    next(b for b in at.button if "Save description edits" in str(b.label)) \
+        .click().run(timeout=60)
+    assert_no_exception(at)
+    state = GH.load_overrides_state(GH.overrides_path(run))
+    assert GH.overrides_for_build(state) == {
+        "SKU-B": {"key features": ["Brand: LG", "Capacity: 190 L"]}}
+    assert "Offer: No Cost EMI" in " ".join(str(e.value) for e in at.error)
+    assert any(str(t.label).startswith("Key features paragraph — EDITED")
+               for t in at.text_area)
+    next(b for b in at.button
+         if "Reset key features paragraph" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    state = GH.load_overrides_state(GH.overrides_path(run))
+    assert GH.overrides_for_build(state) == {}

@@ -118,7 +118,7 @@ CASES = [
     ("Home Appliances > sewing machine",
      "Usha Janome Dream Stitch 14 Stitch Sewing Machine"),
     ("Home Appliances > mattress", "Sleepwell Impressions 6 inch Queen Mattress"),
-    ("Home Appliances > Trolly Bag",
+    ("Home Appliances > Trolley Bag",
      "Safari Pentagon 65 cm Polycarbonate Trolley Bag"),
     # ---- Electronics & Computing -----------------------------------------
     ("Electronics & Computing > Laptops",
