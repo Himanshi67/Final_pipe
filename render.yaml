@@ -1,0 +1,30 @@
+# Render Blueprint (https://render.com/docs/blueprint-spec).
+# Guide: docs/RENDER_DEPLOY.html. This repo is PUBLIC: no secret values here.
+# Secrets use `sync: false` - Render asks for them once, when the Blueprint
+# is first applied. WC_* / WP_* are deliberately absent: share mode keeps
+# publishing off on the hosted copy.
+services:
+  - type: web
+    name: final-pipe
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter            # a persistent disk needs a paid instance
+    region: singapore
+    healthCheckPath: /_stcore/health
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: GUI_SHARE_MODE
+        value: "1"
+      - key: GUI_SHARE_BUDGET
+        value: "50"
+      - key: PIPELINE_CLIENT
+        value: shreejee
+      - key: DATA_DIR
+        value: /data
+      - key: GUI_SHARE_PASSWORD   # 12+ characters
+        sync: false
+      - key: SERPER_API_KEY       # = [serper] api_key_env in clients/shreejee/client.toml
+        sync: false

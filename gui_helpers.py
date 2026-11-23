@@ -8,6 +8,7 @@ import hmac
 import os
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -1973,3 +1974,56 @@ class LoginThrottle:
 
 
 SHARE_THROTTLE = LoginThrottle()
+
+
+# ------------------------------------------------------- cross-platform --
+# gui.py runs on the Windows dev machine AND in a Linux container (Render).
+# These pure functions hold the parts that differ, so tests on Windows can
+# pin the POSIX behaviour without a Linux box.
+
+def venv_python(repo_root, fallback=None) -> Path:
+    """The interpreter gui.py launches the enricher and wc_publish.py with:
+    <repo>/.venv/Scripts/python.exe when that file exists (Windows dev
+    machine), otherwise `fallback` (default: sys.executable - the container
+    has no .venv)."""
+    venv = Path(repo_root) / ".venv" / "Scripts" / "python.exe"
+    if venv.is_file():
+        return venv
+    return Path(fallback if fallback is not None else sys.executable)
+
+
+def posix_stat_state(stat_text) -> str | None:
+    """The one-letter process state from a /proc/<pid>/stat line, or None
+    when the text cannot be parsed.
+
+    Format: `pid (comm) state ppid ...`. comm may hold spaces AND
+    parentheses, so the state is the first field after the LAST ')'."""
+    if not stat_text:
+        return None
+    text = str(stat_text)
+    close = text.rfind(")")
+    if close < 0:
+        return None
+    fields = text[close + 1:].split()
+    if not fields:
+        return None
+    state = fields[0]
+    return state if len(state) == 1 and state.isalpha() else None
+
+
+ENRICHER_SCRIPT = "sku_enricher.py"
+
+
+def posix_cmdline_is_enricher(cmdline) -> bool:
+    """True when a /proc/<pid>/cmdline (NUL-separated argv, bytes) runs
+    sku_enricher.py - one argv element whose file name is exactly that
+    script. A recycled pid that runs anything else returns False."""
+    if not cmdline:
+        return False
+    if isinstance(cmdline, str):
+        cmdline = cmdline.encode("utf-8", errors="replace")
+    for arg in bytes(cmdline).split(b"\0"):
+        name = arg.decode("utf-8", errors="replace").replace("\\", "/")
+        if name.rsplit("/", 1)[-1] == ENRICHER_SCRIPT:
+            return True
+    return False

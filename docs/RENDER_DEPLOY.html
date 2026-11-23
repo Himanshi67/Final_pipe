@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Render deploy guide</title>
+<meta name="robots" content="noindex">
+<style>
+  :root { --fg:#1b1f24; --muted:#57606a; --bg:#ffffff; --line:#d0d7de; --code:#f3f4f6; --warn:#fff8e1; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e6edf3; --muted:#9da7b3; --bg:#0d1117; --line:#30363d; --code:#161b22; --warn:#2b2410; }
+  }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:16px/1.55 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width:820px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { font-size:1.7rem; margin:0 0 4px; }
+  h2 { font-size:1.2rem; margin:32px 0 8px; padding-top:8px; border-top:1px solid var(--line); }
+  p.lead { color:var(--muted); margin-top:0; }
+  code, pre { font-family:ui-monospace, Consolas, monospace; font-size:.9em; background:var(--code); }
+  code { padding:1px 4px; border-radius:4px; }
+  pre { padding:12px; border-radius:6px; overflow-x:auto; }
+  table { border-collapse:collapse; width:100%; }
+  th, td { text-align:left; border:1px solid var(--line); padding:6px 8px; vertical-align:top; }
+  .note { background:var(--warn); border:1px solid var(--line); border-radius:6px; padding:10px 12px; }
+  li { margin:4px 0; }
+</style>
+</head>
+<body>
+<main>
+<h1>Hosted pipeline on Render</h1>
+<p class="lead">Operator guide for the Linux container copy of the wizard (<code>gui.py</code>).</p>
+
+<h2>What the hosted copy is</h2>
+<p>The hosted copy runs the same 5-step wizard as the local machine. It runs in share mode.</p>
+<ul>
+  <li>A password gate shows first. Nothing else shows until the user gives the correct password.</li>
+  <li>Publish, delete, archive and taxonomy edits are off.</li>
+  <li>Each enrichment run has a search budget cap. <code>GUI_SHARE_BUDGET</code> sets the cap (default 50 serper credits).</li>
+  <li>The headless browser flags and <code>--force</code> are removed from every run.</li>
+  <li>The hosted copy has no WooCommerce credentials. It cannot write to the live store.</li>
+</ul>
+
+<h2>Cost</h2>
+<p>The service uses the Render <strong>Starter</strong> instance type and one <strong>5 GB persistent disk</strong>.
+A persistent disk needs a paid instance type, so the free type does not work.
+Render bills the instance and the disk separately.
+Confirm the current prices on <a href="https://render.com/pricing">render.com/pricing</a> before you apply the Blueprint.</p>
+<p>Serper credits are a separate cost. The serper.dev account pays for them, not Render.</p>
+
+<h2>One-time setup</h2>
+<ol>
+  <li>Open the Render dashboard.</li>
+  <li>Select <strong>New</strong>, then <strong>Blueprint</strong>.</li>
+  <li>Connect the GitHub repository <code>atavisticrystal6888/Final_pipe</code>. Render reads <code>render.yaml</code> from the repository root.</li>
+  <li>Enter a value for <code>GUI_SHARE_PASSWORD</code>. Use 12 characters or more. The gate refuses a shorter password and shows only an error.</li>
+  <li>Enter the serper.dev API key in <code>SERPER_API_KEY</code>.</li>
+  <li>Select <strong>Apply</strong>. Render builds the image, creates the disk and starts the service.</li>
+  <li>Open the service URL. Give the password. Confirm that the share-mode banner shows.</li>
+</ol>
+<p class="note">The repository is public. Do not put a password or a key in <code>render.yaml</code> or in any file. Render asks for the two secrets only when you first apply the Blueprint. To change them later, use the service's <strong>Environment</strong> page.</p>
+
+<h2>How updates deploy</h2>
+<p>Push a commit to <code>main</code>. Render builds a new image from that commit and restarts the service.</p>
+<p>A deploy stops a running enrichment. See "Known limits".</p>
+
+<h2>What is on the disk and what comes from git</h2>
+<table>
+  <tr><th>Item</th><th>Source</th><th>On redeploy</th></tr>
+  <tr><td>Code (<code>*.py</code>, <code>url_sources.toml</code>, <code>tools/</code>)</td><td>git</td><td>Replaced by the new commit</td></tr>
+  <tr><td>Client config: <code>client.toml</code>, <code>category_map.xlsx</code>, <code>category_seo.xlsx</code>, <code>SubCategory_Attributes_Master.xlsx</code></td><td>git</td><td>Copied over the disk copy on every boot. Git is the source of truth.</td></tr>
+  <tr><td><code>clients/&lt;slug&gt;/credits.json</code>, <code>clients/&lt;slug&gt;/backups/</code></td><td>disk</td><td>Kept</td></tr>
+  <tr><td><code>runs/</code>, <code>.cache/</code>, <code>product_images_for_upload/</code>, <code>checkpoints/</code>, <code>url_index/</code>, <code>batches/</code>, <code>backups/</code>, <code>inputs/</code></td><td>disk</td><td>Kept</td></tr>
+</table>
+<p>The disk mounts at <code>/data</code>. On each boot, <code>docker-entrypoint.sh</code> links each state folder in <code>/app</code> to the same folder on the disk.</p>
+<p>To change the taxonomy for the hosted copy, edit the files on the local machine, commit them and push to <code>main</code>.</p>
+
+<h2>Known limits</h2>
+<ul>
+  <li>Retailer sites can block data-centre IP addresses more often than a home connection. Expect more <code>NOT FOUND - … blocked</code> rows than on the local machine.</li>
+  <li>The image has no headless browser. The Playwright package is installed, but its browsers are not.</li>
+  <li>A redeploy or a restart stops a running enrichment. Start the run again from the wizard. It resumes from its last checkpoint.</li>
+  <li>Use one instance only. A Render disk attaches to one instance, so the service cannot scale out.</li>
+  <li>A <code>clients/&lt;slug&gt;/.env</code> file on the disk overrides the Render environment variables. Do not create one unless you need that override.</li>
+</ul>
+
+<h2>Run the image locally with Docker</h2>
+<p>Build the image from the repository root:</p>
+<pre>docker build -t final-pipe .</pre>
+<p>Run it with a local folder as the disk:</p>
+<pre>docker run --rm -p 10000:10000 ^
+  -e GUI_SHARE_MODE=1 ^
+  -e GUI_SHARE_PASSWORD=change-me-12chars ^
+  -e SERPER_API_KEY=your-key ^
+  -v "%CD%\docker-data:/data" ^
+  final-pipe</pre>
+<p>The example uses Windows <code>cmd</code> line breaks (<code>^</code>). In PowerShell, use a backtick. In a POSIX shell, use a backslash and <code>"$PWD/docker-data:/data"</code>.</p>
+<p>Check the health endpoint:</p>
+<pre>curl http://localhost:10000/_stcore/health</pre>
+<p>The response is <code>ok</code>. Then open <code>http://localhost:10000</code> in a browser.</p>
+</main>
+</body>
+</html>

@@ -67,7 +67,9 @@ from gui_helpers import (BADGE, append_events, assemble_pack, batch_summary,
                          sheet_combos, stale_confirmations)
 
 REPO_ROOT = Path(__file__).parent
-VENV_PY = REPO_ROOT / ".venv" / "Scripts" / "python.exe"
+# The Windows venv interpreter when it exists; in the Linux container (no
+# .venv) the interpreter that runs this GUI.
+VENV_PY = gui_helpers.venv_python(REPO_ROOT)
 RUNS_DIR = REPO_ROOT / "runs"
 
 # What the Step-1 uploader accepts. Legacy .xls is deliberately NOT here:
@@ -598,7 +600,72 @@ def _pid_created(pid: int):
 
 
 def pid_alive(pid: int, started: float = None) -> bool:
-    """Is this PID still the process we launched?
+    """Is this PID still the process we launched? Windows: _pid_alive_nt.
+    POSIX (the Linux container): _pid_alive_posix."""
+    if os.name == "nt":
+        return _pid_alive_nt(pid, started)
+    return _pid_alive_posix(pid)
+
+
+def _pid_alive_posix(pid: int) -> bool:
+    """POSIX liveness: the pid exists, is not a zombie, and runs
+    sku_enricher.py.
+
+    The enricher is a child of THIS Streamlit process. When the session that
+    held the Popen handle is gone, an exited child stays a zombie and
+    os.kill(pid, 0) still succeeds - the wizard would show "running" forever.
+    So reap first (WNOHANG; ChildProcessError = not our child), then read
+    /proc. The cmdline check replaces the Windows creation-time check: a
+    recycled pid that is not the enricher returns False, so Stop never
+    signals an unrelated process."""
+    if not pid:
+        return False
+    pid = int(pid)
+    try:
+        os.waitpid(pid, os.WNOHANG)
+    except (ChildProcessError, OSError):
+        pass
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8",
+                                                   errors="replace")
+    except OSError:
+        return False
+    state = gui_helpers.posix_stat_state(stat)
+    if state is None or state in ("Z", "X"):
+        return False
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+    return gui_helpers.posix_cmdline_is_enricher(cmdline)
+
+
+def _posix_hard_kill(pid: int, proc=None):
+    """SIGKILL the enricher's whole process group (it is a session leader:
+    start_new_session=True), then reap it so no zombie is left."""
+    try:
+        os.killpg(int(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+        return
+    # not blocking: if the kill failed, a waitpid(pid, 0) would hang the GUI
+    for _ in range(50):
+        try:
+            done, _status = os.waitpid(int(pid), os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return              # not our child, or already reaped
+        if done:
+            return
+        time.sleep(0.1)
+
+
+def _pid_alive_nt(pid: int, started: float = None) -> bool:
+    """Is this PID still the process we launched? (Windows)
 
     Windows recycles PIDs aggressively, and a stale `enricher_pid` left in
     run_meta.json by a GUI closed mid-batch would sooner or later match some
@@ -696,11 +763,17 @@ def start_enricher(P, extra_flags: list, total: int):
             "--client", slug] + extra_flags)
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     env[client_config.ENV_VAR] = slug
+    # Windows: its own process group, so CTRL_BREAK reaches only the child.
+    # POSIX: its own session (and process group), so SIGINT / killpg reach
+    # only the child and its descendants.
+    if os.name == "nt":
+        group_kw = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+    else:
+        group_kw = {"start_new_session": True}
     with open(P["log"], "w", encoding="utf-8") as log_f:
         proc = subprocess.Popen(
             cmd, stdout=log_f, stderr=subprocess.STDOUT,
-            cwd=str(REPO_ROOT), env=env,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+            cwd=str(REPO_ROOT), env=env, **group_kw)
     st.session_state[f"proc_{P['run'].name}"] = proc
     st.session_state[f"running_{P['run'].name}"] = True
     update_meta(P, enricher_pid=proc.pid, enricher_started=time.time(),
@@ -714,7 +787,8 @@ def cancel_enricher(P):
     sku_enricher.install_break_handler() maps it to KeyboardInterrupt so the
     run checkpoints ('Stopped by user - progress saved'). Delivery waits for
     the row's current sleep/request to return, hence the 15 s grace before the
-    hard kill (safe either way: saves are atomic)."""
+    hard kill (safe either way: saves are atomic). POSIX (Linux container):
+    SIGINT, the same 15 s grace, then SIGKILL to the child's process group."""
     proc = st.session_state.get(f"proc_{P['run'].name}")
     meta = load_meta(P)
     # P3-51: every liveness check here carries the launch timestamp, so
@@ -733,10 +807,18 @@ def cancel_enricher(P):
         update_meta(P, enricher_pid=None)
         st.session_state[f"running_{P['run'].name}"] = False
         return
-    try:
-        os.kill(pid, signal.CTRL_BREAK_EVENT)
-    except OSError:
-        pass
+    if os.name == "nt":
+        try:
+            os.kill(pid, signal.CTRL_BREAK_EVENT)
+        except OSError:
+            pass
+    else:
+        # POSIX: SIGINT -> KeyboardInterrupt in the child, the same
+        # 'Stopped by user - progress saved' checkpoint path as CTRL_BREAK
+        try:
+            os.kill(pid, signal.SIGINT)
+        except OSError:
+            pass
     deadline = 15
     if proc is not None:
         try:
@@ -748,8 +830,11 @@ def cancel_enricher(P):
             time.sleep(1)
             deadline -= 1
     if pid_alive(pid, started):
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True)
+        else:
+            _posix_hard_kill(pid, proc)
     update_meta(P, enricher_pid=None)
     st.session_state[f"running_{P['run'].name}"] = False
 

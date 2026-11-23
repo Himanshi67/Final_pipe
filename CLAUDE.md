@@ -163,6 +163,13 @@ all resolve THROUGH it, so nothing is cwd-relative and a run from any directory 
 the same taxonomy and images.
 Moving a `.py` file out of root silently relocates the directory it owns — don't.
 
+Linux container (Render): `Dockerfile`, `docker-entrypoint.sh` (LF only, pinned in
+`.gitattributes`), `.dockerignore`, `render.yaml`. The entrypoint symlinks every state dir
+(runs, .cache, images, checkpoints, url_index, batches, backups, inputs, clients) onto the
+`/data` disk; client config is re-copied from git on each boot. gui.py branches on
+`os.name` (POSIX: start_new_session, /proc liveness, SIGINT then killpg). Operator guide:
+docs/RENDER_DEPLOY.html.
+
 ## Commands (full flag semantics: docs/PIPELINE_GUIDE.md §3 — don't guess flags)
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --limit 3          # smoke
     .venv\Scripts\python.exe sku_enricher.py "LIST.xlsx" --client shreejee --budget 200
