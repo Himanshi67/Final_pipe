@@ -320,7 +320,16 @@ refrigerators) with `--search-order free_first --budget 60`. It used 0 serper
 credits. Run folder: `runs\mixed-2026-11-20\` (`enrich.log`, `mixed_filled.xlsx`,
 `mixed_filled_report.md`). Line anchors are from 2026-11-20. Check them before a fix.
 
-## KI-17 · HIGH · open (found 2026-11-20) — junk images pass the image filter
+## KI-17 · HIGH · fixed (2026-11-23) — junk images pass the image filter
+**Fix (2026-11-23):** one commented KI-17 group in `IMAGE_JUNK_RE`: `energy[-_]?label`,
+`/gnb/`, `[-_/]mega\d+(?:[-_.?#]|$)`, `[-_/]explore[-_]`, `get-inspired`, `/og\?`,
+`/etc\.clientlibs/`, `/pictograms?/`, `[-_/]og[-_]tag`, `trustmark`,
+`lg\.com/.*/features?/`, `watermark`, `opengraph-image`, `twitter-image`. The last
+eight came from the replays: each removed junk image let the next one into the freed
+slot (see KI-32). Tests: `tests\test_junk_images_ki17.py`. A sweep of 611 URLs in 24
+`*_filled.xlsx` files drops only the 14 evidence URLs. The replay of
+`runs\mixed-2026-11-20\` (`runs\ki17-replay6\`, Serper blocked, 0 credits) writes
+none of them. Not caught: the bajajfinserv.in partner logo `91mobiles.png` (KI-33).
 **Symptom:** banners, energy labels and text cards reach the `image_url` cell as
 product photos.
 **Evidence:** SAMSUNG-AR50H19D1PHNNA: all 8 images are samsung.com energy labels
@@ -341,7 +350,26 @@ images (`_1` of the last two is not white).
 none of the URLs above. The good photos of the same rows stay. A unit test pins
 each pattern.
 
-## KI-18 · HIGH · open (found 2026-11-20) — a different model's photo is the only image
+## KI-18 · HIGH · fixed (2026-11-23) — a different model's photo is the only image
+**Fix (2026-11-23):** `model_core` / `foreign_model_image` / `drop_foreign_model_images`
+(before `status_for`), called from `finalize_gallery(rec, model)` and on each strong
+donor in `hunt_donors`. Rules:
+- The row's model core is the leading letters plus the first digit run. A core under 4
+  characters is not judged.
+- An image is kept when its file name holds the core, so shared-prefix variants stay.
+- Hash-named CDNs are not judged: amazon, flixcart, shopify `/cdn/shop/` and jiostore.
+- Before the scan, the check removes size tokens (`1200Wx1200H`, `1600x1062`, `1000px`),
+  years, uuids and stop words.
+- Codes are found in single segments, and in a pair only after a 2-3 letter non-word
+  prefix (`GL-D201ASCU`).
+- A row left with 0 images gets `- only 0 image(s)`.
+
+Tests: `tests\test_wrong_model_images_ki18.py`. Two review rounds found these false
+positives, and each is now pinned as a keep case: Reliance `…-1200Wx1200H` names that
+could empty a correct gallery, `SKU12345`, `lg-1500` and `hero-e1234`. The sweep of 728
+URL/row pairs drops only the GL-D201ASCU image. LG-GLD2256ZARS now keeps its own 2
+photos, and its status flags the floor. Known false negative: a short Samsung core
+(`RT28`) keeps sibling models.
 **Symptom:** LG-GLD2256ZARS (a 210 L single-door refrigerator) has one image, and it
 shows another model.
 **Evidence:** the image path is
@@ -506,3 +534,25 @@ brand split keeps the first word of a two-word brand (not confirmed where).
 **Accept:** the owner decides which sub-category an inverter split AC belongs to (or
 adds the technology as a filter only), and the detector follows it. "Voltas Beko"
 stays one brand.
+
+## KI-32 · MED · open (found 2026-11-23) — removed junk is replaced by the next junk image
+**Symptom:** in the KI-17 replays, each junk image that the filter removed freed a slot,
+and lower-ranked junk filled it. Examples: samsung.com site icons after the energy
+labels went, lg.com feature tiles after the pictograms went, and a page change on the
+Haier row. HAIER-HRD-2561SGSA-N moved from bajajfinserv.in (2 images left) to
+arihantelectronics.org (6 other-model photos), and after KI-18 to industrybuying.com
+(watermark and share cards).
+**Likely cause:** the winner choice and `hunt_donors` reward a page for its image COUNT.
+The 1000 px floor drops real sub-floor gallery photos (LG-US-Q18ENXE: 7 gallery photos
+under 1000 px, so only a dimension drawing stays).
+**Accept:** removing a junk image never changes the winning page to one with fewer
+real photos of the row's model. A page's image score counts only images that pass the
+junk and KI-18 checks. Needs an owner decision if it touches the floor.
+
+## KI-33 · LOW · open (found 2026-11-23) — partner logo passes as a product image
+**Symptom:** HAIER-HRD-2561SGSA-N keeps `mc.bajajfinserv.in/.../dynamic-pdp/91mobiles.png`
+(a partner logo) as image 2.
+**Likely cause:** the URL has no generic junk word, and the logo is a brand name.
+**Accept:** the logo is dropped (by size, aspect ratio or a bajajfinserv.in
+`/dynamic-pdp/` rule) without dropping real product photos. Until then, the reviewer
+removes it in card review.

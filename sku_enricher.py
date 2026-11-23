@@ -778,6 +778,13 @@ IMAGE_JUNK_RE = re.compile(
     r"/nav(?:bar|igation)?/|/menu/|/banners?/|/promo|[-_/]icon\.|/search/|"
     r"/static-pages?/|homepage|feedback|[-_/]close[-_.]|_jcr_content|"
     r"vs-plus|/desktop/|/subcategory/|/category/image|"
+    # KI-17: energy labels, mega-menu / nav tiles, campaign tiles, generated
+    # og:image text cards (samsung.com, lg.com, bajajfinserv.in, bestpurifier.in),
+    # AEM site assets, icon folders, og share cards, review badges, lg.com
+    # feature tiles, watermarks and social share images
+    r"energy[-_]?label|/gnb/|[-_/]mega\d+(?:[-_.?#]|$)|[-_/]explore[-_]|"
+    r"get-inspired|/og\?|/etc\.clientlibs/|/pictograms?/|[-_/]og[-_]tag|"
+    r"trustmark|lg\.com/.*/features?/|watermark|opengraph-image|twitter-image|"
     # storefront UI chrome, often mis-resolved against the product path
     r"[-_/](?:cart|basket|wishlist|compare|account|profile|login|user|"
     r"hamburger|burger|share|heart|star|zoom|magnif)[-_.]",
@@ -3337,6 +3344,96 @@ def cap_images(rec, limit=MAX_IMAGES):
     return rec
 
 
+# KI-18: an image whose FILE NAME names a different model is another product's
+# photo (lg.com put GL-D201ASCU's front view on the GLD2256ZARS page). Hosts
+# that name files by hash or uuid say nothing about the model, so they are
+# never judged.
+HASH_NAMED_IMG_HOSTS = ("media-amazon.com", "images-amazon.com",
+                        "ssl-images-amazon.com", "flixcart.com",
+                        "cdn.shopify.com", "jiostore.online")
+MODEL_CORE_RE = re.compile(r"^([A-Z]{1,6})(\d{2,})")
+# not followed by another digit or by 'x<digit>' (a size: THUM1600X1062)
+FILE_MODEL_RE = re.compile(r"(?<![A-Z])([A-Z]{2,5})(\d{3,5})(?!\d|X\d)")
+UUID_RE = re.compile(r"[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}")
+YEAR_RE = re.compile(r"(?:19|20)\d\d")
+# retailer size tokens (1200Wx1200H, 437Wx649H, 1600x1062, 1000px): removed
+# before the scan, or 'WX1200' reads as a model code
+FILE_SIZE_RE = re.compile(r"\d+[WH]?X\d+[WH]?|\d+PX")
+# letter prefixes that look model-shaped but are camera / CMS / size words
+FILE_MODEL_STOP = {"IMG", "IMAGE", "DSC", "DSCN", "PIC", "PHOTO", "SIZE",
+                   "MAIN", "VIEW", "FRONT", "BACK", "SIDE", "THUMB", "ZOOM",
+                   "LARGE", "SMALL", "BIG", "WEB", "COPY", "SCALE", "CROP",
+                   "RES", "HD", "FHD", "UHD", "PX", "SL", "SX", "SY", "AC",
+                   "THUM", "SKU", "PNG", "JPG", "JPEG", "WEBP", "MAX", "SLR",
+                   "BLDC"}
+# short common words that must not be glued onto the next segment as a prefix
+PAIR_WORD_STOP = {"NEW", "TOP", "SET", "BOX", "ALL", "THE", "AND", "FOR", "PIC",
+                  "CAM", "AIR", "ONE", "TWO", "BIG", "OF", "IN", "ON", "TO",
+                  "BY", "AT", "AN", "OR", "WITH", "LOW", "OFF", "RED", "HOT",
+                  "DRY", "PRO", "KIT", "BAG", "CUP", "MIN", "ECO", "DIY"}
+
+
+def model_core(text):
+    """'HRD-2561SGSA-N' -> 'HRD2561': leading letters plus the first digit
+    run. '' when the code has no such shape, or it is too short to tell one
+    model from another (under 4 characters) - those rows are not judged."""
+    m = MODEL_CORE_RE.match(re.sub(r"[^A-Z0-9]", "", str(text or "").upper()))
+    return m.group(1) + m.group(2) if m and len(m.group(0)) >= 4 else ""
+
+
+def foreign_model_image(u, core):
+    """True when the image file name holds a model code whose core is not
+    `core`. Conservative: no code found, or any doubt, means keep."""
+    if not core:
+        return False
+    try:
+        pr = urlsplit(u)
+    except Exception:
+        return False
+    if (any(h in pr.netloc.lower() for h in HASH_NAMED_IMG_HOSTS)
+            or "/cdn/shop/" in pr.path.lower()):      # Shopify on its own domain
+        return False
+    name = UUID_RE.sub("-", pr.path.rsplit("/", 1)[-1].rsplit(".", 1)[0].upper())
+
+    def _segs(text):
+        # hex / uuid / long-digit segments are ids, not model codes
+        return [s for s in re.split(r"[^A-Z0-9]+", text)
+                if s and not (len(s) >= 8 and re.fullmatch(r"[0-9A-F]+", s))]
+    if core in "".join(_segs(name)):
+        return False                  # own model, or a shared-prefix variant
+    segs = _segs(FILE_SIZE_RE.sub("-", name))
+    # Scan single segments, plus a pair only where a 2-3 letter prefix is
+    # split off a code that also starts with a letter ('GL-D201ASCU').
+    # 'LG-1500' (bare digits) and words ('front-view-d001', 'new-a1234') are
+    # never joined into a code.
+    pairs = [a + b for a, b in zip(segs, segs[1:])
+             if a.isalpha() and 2 <= len(a) <= 3 and b[:1].isalpha()
+             and a not in FILE_MODEL_STOP and a not in PAIR_WORD_STOP]
+    for text in segs + pairs:
+        for letters, digits in FILE_MODEL_RE.findall(text):
+            if letters in FILE_MODEL_STOP or YEAR_RE.fullmatch(digits):
+                continue
+            code = letters + digits
+            if code in core or core in code:
+                continue
+            return True
+    return False
+
+
+def drop_foreign_model_images(rec, model):
+    """KI-18: remove images that name another model. Logs what it drops."""
+    core = model_core(model)
+    if not core:
+        return rec
+    imgs = split_image_list(rec.get("image_url", ""))
+    keep = [u for u in imgs if not foreign_model_image(u, core)]
+    if len(keep) < len(imgs):
+        log(f"      dropped {len(imgs) - len(keep)} image(s) naming another "
+            f"model (row model {core})")
+        rec["image_url"] = ",".join(keep)
+    return rec
+
+
 def status_for(rec, url, min_images=MIN_IMAGES, donors=()):
     """The FOUND status line and its honest caveats.
 
@@ -3557,6 +3654,7 @@ def hunt_donors(candidates, tried, sku, model, brand, min_price, max_price,
         verdict, _ = assess(rec, sku, model, brand, min_price, max_price)
         if verdict == "strong":
             rec["url_link"] = rec.get("url_link") or u
+            drop_foreign_model_images(rec, model)          # KI-18
             found.append(rec)
     return found
 
@@ -3605,10 +3703,12 @@ def extract_page(u, html):
     return rec
 
 
-def finalize_gallery(rec):
+def finalize_gallery(rec, model=""):
     """Measure the gallery before the row can claim it. Done here rather than
     in extract() so only a listing we are about to accept pays for the probes -
-    most fetched pages never get this far."""
+    most fetched pages never get this far. `model` drops images that name
+    another model first (KI-18)."""
+    drop_foreign_model_images(rec, model)
     keep, small, note = upgrade_gallery(
         split_image_list(rec.get("image_url", "")), IMAGE_MIN_PX)
     if note:
@@ -3814,7 +3914,7 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
                 continue
             verdict, reason = assess(rec, sku, model, brand, min_price, max_price)
             if verdict == "strong":
-                finalize_gallery(rec)
+                finalize_gallery(rec, model)
                 n_img = image_count(rec)
                 known = domain_quality(u)
                 rec["url_link"] = rec.get("url_link") or u
@@ -4044,7 +4144,7 @@ def crawl_url(url, sku="", min_images=MIN_IMAGES):
         return {"status": "ERROR: no product data in the page "
                           "(built by JavaScript? try --js-fallback)"}
 
-    finalize_gallery(rec)
+    finalize_gallery(rec, build_queries(sku)[1] if sku else "")
     rec["url_link"] = rec.get("url_link") or url
     rec["status"] = status_for(rec, url, min_images)
 
