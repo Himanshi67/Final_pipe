@@ -196,12 +196,15 @@ CATEGORY_PRICE_CEILING = {
 DEAD_PLACEHOLDERS = (
     'Standard Capacity', 'Standard Power Rating', 'Standard Washing Capacity',
     'Standard Tank Volume', 'Standard Cavity Volume', 'Standard Liquid Volume',
-    'Appliance Utility Core', 'WM Function Type', 'WM Washing Capacity',
+    'Appliance Utility Core',
     # the four the KI-14 sweep missed: asserted for every iron / sewing machine
     # regardless of the listing. The readers that produced them now return ''
     # unless the title states the fact, so nothing can emit these again.
     'Premium Non-Stick Glide', 'Built-in Straight Stitching',
 )
+# KI-26: since 2026-11-19 these are also the store's real filter-group NAMES
+# (attribute names, "Label: value" labels), so they are dead only as a VALUE.
+DEAD_PLACEHOLDER_VALUES = ('WM Function Type', 'WM Washing Capacity')
 
 
 def mostly_non_latin(text):
@@ -1104,6 +1107,10 @@ def validate_export(df, csv_path, check_images=True, write_issues=True):
 
         blob = ' '.join([str(row.get(c, '')) for c in df.columns])
         found_dead = [p for p in DEAD_PLACEHOLDERS if p in blob]
+        values = [item.strip() for col in attr_name_cols
+                  for item in str(row.get(col.replace(' name', ' value(s)'), '')
+                                  or '').split(',')]
+        found_dead += [p for p in DEAD_PLACEHOLDER_VALUES if p in values]
         if found_dead:
             reasons.append(f'placeholder_spec_text ({found_dead[0]}) - rebuild '
                            f'this CSV, it predates the KI-14 fix')

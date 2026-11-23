@@ -770,7 +770,8 @@ def prefixed_sku(raw_sku, category):
 def wattage(text):
     # KI-14: '' when the title does not state a wattage. A spec we could not
     # read must be omitted, never replaced with a 'Standard ...' placeholder.
-    match = re.search(r'(\d+\s*(?:W|Watt|Watts))', compact(text), re.IGNORECASE)
+    # KI-28: the boundary keeps "2 Way Air Swing" from reading as 2 W
+    match = re.search(r'(\d+\s*(?:Watts|Watt|W))\b', compact(text), re.IGNORECASE)
     return match.group(1) if match else ''
 
 
@@ -1735,7 +1736,9 @@ def _norm_filter_text(text):
 def _text_hits(raw, entries):
     """Allowed text values stated in `raw` as whole words / phrases. A match
     that sits inside a longer match of ANOTHER value is dropped ('Inverter'
-    inside 'Non-Inverter', 'BLDC' inside 'non BLDC')."""
+    inside 'Non-Inverter', 'BLDC' inside 'non BLDC'). An ALIAS hit directly
+    after a hit of another value is dropped too (KI-27: 'top load' in
+    'Semi-Automatic Top Load' qualifies 'semi automatic', it is no value)."""
     norm = _norm_filter_text(raw)
     found = []
     for entry in entries:
@@ -1745,10 +1748,14 @@ def _text_hits(raw, entries):
         for phrase in (value_norm,) + FILTER_VALUE_ALIASES.get(value_norm, ()):
             for m in re.finditer(r'(?<![a-z0-9])' + re.escape(phrase)
                                  + r'(?![a-z0-9])', norm):
-                found.append((m.start(), m.end(), text))
+                found.append((m.start(), m.end(), text, phrase != value_norm))
     kept = [hit for hit in found
             if not any(o[2] != hit[2] and o[0] <= hit[0] and hit[1] <= o[1]
                        and (o[1] - o[0]) > (hit[1] - hit[0]) for o in found)]
+    kept = [hit for hit in kept
+            if not (hit[3] and any(o[2] != hit[2] and o[1] <= hit[0]
+                                   and not norm[o[1]:hit[0]].strip()
+                                   for o in kept))]
     texts = {hit[2] for hit in kept}
     return [entry[2] for entry in entries if entry[2] in texts]
 

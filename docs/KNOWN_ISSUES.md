@@ -469,7 +469,12 @@ then `validate_csv.py` on the CSV. Output: `runs\mixed-2026-11-20\build\` (`mixe
 `build.log`, `validate.log`, `validation_issues.csv`). The scratch client and its
 images were deleted after the run.
 
-## KI-26 · MED · open (found 2026-11-20, validate_csv.py) — every washing machine is flagged as a pre-KI-14 CSV
+## KI-26 · MED · fixed (2026-11-24, validate_csv.py) — every washing machine is flagged as a pre-KI-14 CSV
+**Fix (2026-11-24):** `WM Function Type` and `WM Washing Capacity` moved from
+`DEAD_PLACEHOLDERS` to `DEAD_PLACEHOLDER_VALUES`. These strings are flagged only when they
+are an attribute VALUE (an exact cell or a comma item), never when they are an attribute
+name or a description label. The mixed build CSV went from 3 flags to 0. Tests:
+`tests\test_build_fixes_ki26_28.py`.
 **Symptom:** all 3 washing-machine rows get `placeholder_spec_text (WM Function Type) -
 rebuild this CSV, it predates the KI-14 fix`. The CSV is new.
 **Evidence:** `validation_issues.csv` rows of WM-SAMSUNG-WA80F10B3NTL,
@@ -481,7 +486,11 @@ validate_csv.py:1105-1109 searches the whole row text.
 **Accept:** a washing-machine row built today has no `placeholder_spec_text` issue.
 A row with `Standard Capacity` or `Appliance Utility Core` is still flagged.
 
-## KI-27 · MED · open (found 2026-11-20, app.py) — a semi-automatic washer is also "Fully Automatic Top Load"
+## KI-27 · MED · fixed (2026-11-24, app.py) — a semi-automatic washer is also "Fully Automatic Top Load"
+**Fix (2026-11-24):** `_text_hits` drops an ALIAS hit that directly follows (with only
+whitespace between them) a hit of another value in the same group. The Godrej
+semi-auto row now gives `Semi-Automatic` only. "Fully Automatic Top Load" and a bare
+"Top Load" are unchanged. Tests: `tests\test_build_fixes_ki26_28.py`.
 **Symptom:** GODREJ-WSEDGE-ULT-80-5.0-DB2M-CSRD gets
 `WM Function Type=Fully Automatic Top Load, Semi-Automatic`. The product is semi-automatic only.
 **Evidence:** title "... Semi-Automatic Top Load ..."; `categories` is
@@ -492,7 +501,10 @@ only when it sits inside a longer hit, and "semi automatic" and "top load" do no
 **Accept:** "Semi-Automatic Top Load" gives `Semi-Automatic` only. "Fully Automatic Top
 Load" and a bare "Top Load" on a fully automatic product still give `Fully Automatic Top Load`.
 
-## KI-28 · MED · open (found 2026-11-20, app.py) — "2 Way Air Swing" becomes Power Rating 2 W
+## KI-28 · MED · fixed (2026-11-24, app.py) — "2 Way Air Swing" becomes Power Rating 2 W
+**Fix (2026-11-24):** `wattage()` uses `(\d+\s*(?:Watts|Watt|W))\b`. LG-US-Q18ENXE has no
+Power Rating now. "1200 W", "1200W" and "1200 Watts" still match. `wattage()` is the only
+wattage regex, and `_QUANTITY_RE` already has a boundary.
 **Symptom:** LG-US-Q18ENXE has the attribute `Power Rating=2 W`.
 **Evidence:** title "... 2 Way Air Swing, ADC Sensor, 4.4 kW ...".
 **Likely cause:** `wattage()` (app.py:773) matches `\d+\s*(?:W|Watt|Watts)` with no
