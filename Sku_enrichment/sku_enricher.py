@@ -152,7 +152,7 @@ BLOCKED_DOMAINS = [                    # never use these results
 # client.toml), because sku_parts()/build_queries() must keep working for
 # --probe and for anything that imports this module without a client dir.
 CATEGORY_CODES = ("WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW",
-                  "WH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW",
+                  "WH", "GWH", "SM", "HWD", "IC", "ICT", "DI", "DF", "LED", "MW",
                   # store-side prefixes from app.SKU_PREFIX_BY_PARENT, so a
                   # published SKU pasted back in as input still parses
                   "CF", "KA", "HA", "SA", "EC", "AP")
@@ -175,6 +175,9 @@ COMPAT_PHRASES = ("made for", "compatible with", "for use with",
 # capacity (kg) pattern and category words used to reject wrong-variant
 # candidates when the exact model code could not be verified
 KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*kg\b", re.I)
+# the lookahead keeps a geyser's flow rate ('12 L/min') out of the size
+LITRE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|ltrs?|litres?|liters?)\b"
+                      r"(?!\s*/\s*min)", re.I)
 
 CATEGORY_WORDS = {
     "WM": ("washing machine", "washer"),
@@ -1314,6 +1317,51 @@ def sku_parts(sku):
             models.append(t)
     models.sort(key=len, reverse=True)     # longest token = model code, usually
     return brand, (models[0] if models else "")
+
+
+# words a SKU carries that never identify a series: filler and colours
+LOOSE_STOP_WORDS = {"with", "new", "and", "for", "the", "plus",
+                    "white", "black", "blue", "grey", "gray", "silver", "red",
+                    "ivory", "gold"}
+LITRE_UNIT_WORDS = {"l", "lt", "ltr", "ltrs", "litre", "litres", "liter", "liters"}
+
+
+def loose_model_terms(sku, brand):
+    """(['aqualia'], {25.0}) from 'KENSTAR-WH AQUALIA 25L'
+
+    KI-35: a SKU with no model code still names a series word and a size.
+    assess() uses them to reject a same-brand page for a different product,
+    which the bare brand check let through."""
+    raw = str(sku)
+    # the size may be spaced or bracketed ('25 L', '(25L)'), so read it from
+    # the whole string, not from tokens
+    litres = {float(x) for x in LITRE_RE.findall(raw)}
+    sku = re.sub(r"\([^)]*\)", " ", raw).strip(" -,")
+    codes = {c.upper() for c in CATEGORY_CODES}
+    words = []
+    for token in re.split(r"[\s\-,/]+", sku):
+        if not token or token.upper() in codes:
+            continue
+        if brand and norm(token) == norm(brand):
+            continue
+        low = token.lower()
+        if (re.fullmatch(r"[a-z]{3,}", low) and low not in LITRE_UNIT_WORDS
+                and low not in LOOSE_STOP_WORDS):
+            words.append(low)
+    return words, litres
+
+
+def loose_overlap(title, sku, brand, model):
+    """How many of the SKU's series words and litre sizes the title names.
+    Ranks weak hits (no model code only); 0 when a model code exists."""
+    if model:
+        return 0
+    words, litres = loose_model_terms(sku, brand)
+    t_low = " " + re.sub(r"\s+", " ", str(title or "")).lower() + " "
+    hits = sum(1 for w in words if re.search(r"\b" + re.escape(w) + r"\b", t_low))
+    t_litres = [float(x) for x in LITRE_RE.findall(str(title or ""))]
+    hits += sum(1 for v in litres if any(abs(v - t) <= 0.05 for t in t_litres))
+    return hits
 
 
 def build_queries(sku):
@@ -3250,7 +3298,22 @@ def assess(rec, sku, model, brand, min_price, max_price):
             return "weak", "model code not verified"
         return "", "model code not found in listing title/URL"
 
-    # SKU has no clean model code -> brand match is the best we can do
+    # SKU has no clean model code -> brand match is the best we can do,
+    # after the SKU's own size and series words rule out a sibling (KI-35)
+    words, litres = loose_model_terms(sku, brand)
+    t_litres = [float(x) for x in LITRE_RE.findall(title)]
+    if litres and t_litres and not any(abs(v - s) <= 0.05
+                                       for v in t_litres for s in litres):
+        return "", (f"size mismatch: listing says "
+                    f"{', '.join(f'{v:g}' for v in t_litres)} L, SKU says "
+                    f"{', '.join(f'{v:g}' for v in sorted(litres))} L")
+    # whole words: 'star' must not match inside 'KENSTAR'. One word is enough,
+    # so a colour word in the SKU cannot reject the right page.
+    # Only for size-coded lines (geysers): there the series word is the only
+    # identity; elsewhere a missing word is weak evidence, ranking handles it.
+    if litres and words and not any(re.search(r"\b" + re.escape(w) + r"\b", t_low)
+                         for w in words):
+        return "", f"series word not in title ({', '.join(words)})"
     if brand_n and brand_n in title_n:
         return "weak", ""
     return "", "no reliable match"
@@ -4043,7 +4106,11 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
         rec["status"] = f"CLOSE MATCH - CHECK ({domain_of(rec['url_link'])})"
         return cap_images(rec)
     if weak_hits:
-        rec = max(weak_hits, key=lambda r: rec_score(r, min_images))
+        # title fit first (KI-35): rec_score alone ranks by source, so a
+        # complete amazon sibling beat the flipkart page naming the series
+        rec = max(weak_hits, key=lambda r: (
+            loose_overlap(r["title"], sku, brand, model),
+            rec_score(r, min_images)))
         rec["status"] = f"CHECK MANUALLY ({domain_of(rec['url_link'])})"
         return cap_images(rec)
     return {"status": not_found_status(candidates, fetched, fail_reasons)}
