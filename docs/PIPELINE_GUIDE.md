@@ -425,6 +425,11 @@ built in either scope, so they never reach the CSV, the images or the store.
 When a re-enrichment changes a row, its ✔ is dropped (P3-53) but its skip is
 KEPT: an explicit "no" must not turn back into "not reviewed".
 
+**Step 3 downloads.** After a build (and on every later visit to step 3),
+step 3 shows "⬇ Download CSV" and "⬇ Download images (.zip)". The zip mirrors
+the image URLs: unpack it into `wp-content/uploads/` and every CSV image URL
+resolves. See "Image zip (step 3)" under Share mode for the layout.
+
 **Description and short description (review step).** Card review shows a
 "Description & short description" panel for the row on screen (the table view has
 the same panel for one SKU chosen from a list). It shows the text the CSV WILL
@@ -564,6 +569,23 @@ deletes `share_info.txt`.
   is smaller.
 
 Upload, enrich, review, build and validate stay available.
+
+**Image zip (step 3):** step 3 shows "⬇ Download images (.zip)" next to
+"⬇ Download CSV", in share mode and in normal mode. The zip
+(`<csv stem>_images.zip`) holds every image that the CSV `Images` column
+names. Each file is at the URL path after `/wp-content/uploads/` (for
+example `2026/11/WM-SKU_1.webp`). A URL without that marker keeps its full
+path. The zip also holds `image_map.csv` (sku, position, image_url,
+zip_path, status = ok / missing / refused) and `README.txt`. A missing file
+does not stop the zip; the caption lists it. A URL path with `..` or a
+drive letter is refused, and nothing outside the image folder is read. The
+button reads only: it moves and deletes nothing. The GUI keeps the zip in
+memory and builds it again only when the CSV changes.
+
+**Publish from share mode is off by design.** To put the products on the
+store, upload the folders in the zip into `wp-content/uploads/` (keep the
+folders). Then do one of these: import the CSV manually in WooCommerce, or
+publish from a PC that has the store credentials (`wc_publish.py`).
 
 **Login lock:** after 8 wrong passwords in total (all sessions together),
 all logins lock for 15 minutes.

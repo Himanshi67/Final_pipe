@@ -3,14 +3,18 @@
 Unit-tested in tests/test_gui_helpers.py. Keep streamlit (and app.py)
 imports OUT of this module so the tests never boot the app."""
 
+import csv
 import hashlib
 import hmac
+import io
 import os
 import re
 import shutil
 import sys
+import zipfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 
@@ -525,15 +529,137 @@ def image_basenames_from_csv(csv_df):
     """Basenames of every image URL the CSV references. The Images column
     lists exactly the files the build downloaded, so these names are safe
     to copy out of product_images_for_upload when archiving a run."""
-    names = []
-    if "Images" not in csv_df.columns:
-        return names
-    for cell in csv_df["Images"].astype(str):
+    return [image_source_name(url) for _, _, url in csv_image_urls(csv_df)]
+
+
+def csv_image_urls(csv_df) -> list:
+    """[(sku, position, url)] for every image URL in the CSV's Images column
+    (comma-separated, position 1-based within its row). The one reader of
+    that column behind assemble_pack AND build_image_zip."""
+    out = []
+    if csv_df is None or "Images" not in csv_df.columns:
+        return out
+    skus = (csv_df["sku"].astype(str) if "sku" in csv_df.columns
+            else pd.Series([""] * len(csv_df), index=csv_df.index))
+    for sku, cell in zip(skus, csv_df["Images"].astype(str)):
+        pos = 0
         for u in cell.split(","):
             u = u.strip()
-            if u:
-                names.append(u.rsplit("/", 1)[-1])
-    return names
+            if u and u.lower() != "nan":
+                pos += 1
+                out.append((sku, pos, u))
+    return out
+
+
+def image_source_name(url) -> str:
+    """The local file name a CSV image URL stands for: its last '/' part."""
+    return str(url).rsplit("/", 1)[-1]
+
+
+def safe_image_source(image_dir, name):
+    """`image_dir / name` when `name` is a plain file name that stays INSIDE
+    image_dir, else None. A crafted URL ('.../..', 'C:x', 'a\\..\\b') can
+    never point a pack or a zip at a file outside the image folder."""
+    name = str(name or "")
+    if (not name or name in (".", "..") or "\\" in name or "/" in name
+            or ":" in name or "\x00" in name):
+        return None
+    root = Path(image_dir).resolve()
+    src = (root / name).resolve()
+    if src.parent != root:
+        return None
+    return src
+
+
+WP_UPLOADS_MARKER = "/wp-content/uploads/"
+
+
+def image_zip_path(url):
+    """Where the file behind `url` goes in the images zip: the URL path after
+    /wp-content/uploads/ (so the zip unpacks INTO wp-content/uploads/ and the
+    CSV URL resolves), else the whole URL path without its leading '/'.
+    None when the path is unsafe (a '..' or '.' part, a backslash, a drive
+    letter, an empty part)."""
+    path = unquote(urlsplit(str(url)).path or "")
+    i = path.find(WP_UPLOADS_MARKER)
+    rel = path[i + len(WP_UPLOADS_MARKER):] if i >= 0 else path.lstrip("/")
+    parts = rel.split("/")
+    if not rel or any(p in ("", ".", "..") or "\\" in p or ":" in p
+                      or "\x00" in p for p in parts):
+        return None
+    return "/".join(parts)
+
+
+IMAGE_ZIP_README = ("Upload the folders in this zip into wp-content/uploads/ "
+                    "on the store, keeping the folders; then import the CSV.\n"
+                    "image_map.csv lists every image URL in the CSV, the file "
+                    "in this zip that serves it, and whether that file was "
+                    "found (ok / missing / refused).\n")
+
+
+def build_image_zip(csv_path, image_dir) -> tuple:
+    """(zip_bytes, summary) holding every image the CSV references, laid out
+    like the URLs, for a person who has no access to this PC.
+
+    Entry path = image_zip_path(url); source = image_dir / the URL basename
+    (the same mapping assemble_pack copies by), read only through
+    safe_image_source. Also writes image_map.csv (sku, position, image_url,
+    zip_path, status) and README.txt. A missing file is listed, never fatal;
+    an unsafe URL path is 'refused' and nothing is read for it. Nothing on
+    disk is written, moved or deleted.
+
+    summary = {urls, products, images, missing: [..], refused: [..],
+               csv_error}. A CSV with no image URLs returns (b"", summary)."""
+    summary = {"urls": 0, "products": 0, "images": 0, "missing": [],
+               "refused": [], "csv_error": None}
+    try:
+        csv_df = pd.read_csv(csv_path, dtype=str).fillna("")
+    except (OSError, ValueError) as exc:
+        summary["csv_error"] = exc.__class__.__name__
+        return b"", summary
+    rows = csv_image_urls(csv_df)
+    summary["urls"] = len(rows)
+    summary["products"] = len({sku for sku, _, _ in rows})
+    if not rows:
+        return b"", summary
+
+    buf = io.BytesIO()
+    mapping = io.StringIO()
+    writer = csv.writer(mapping, lineterminator="\n")
+    writer.writerow(["sku", "position", "image_url", "zip_path", "status"])
+    written = {}                      # zip path -> status, one entry per file
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        for sku, pos, url in rows:
+            zpath = image_zip_path(url)
+            src = safe_image_source(image_dir, image_source_name(url))
+            if zpath in ("image_map.csv", "README.txt"):
+                zpath = None
+            if zpath is None or src is None:
+                status = "refused"
+                if url not in summary["refused"]:
+                    summary["refused"].append(url)
+            elif zpath in written:
+                status = written[zpath]
+            elif src.is_file():
+                zf.write(src, zpath)
+                status = written[zpath] = "ok"
+                summary["images"] += 1
+            else:
+                status = written[zpath] = "missing"
+                summary["missing"].append(zpath)
+            writer.writerow([sku, pos, url, zpath or "", status])
+        zf.writestr("image_map.csv", mapping.getvalue())
+        zf.writestr("README.txt", IMAGE_ZIP_README)
+    return buf.getvalue(), summary
+
+
+def image_zip_caption(summary) -> str:
+    """One line for Step 3 under the images download button."""
+    text = (f"{summary['images']} image(s) for {summary['products']} "
+            f"product(s); {len(summary['missing'])} missing")
+    if summary["refused"]:
+        text += f"; {len(summary['refused'])} refused (unsafe URL path)"
+    return text
 
 
 # mirror of app.CATEGORY_COMMA_MERGES / app._split_subcategories, copied for
@@ -1385,8 +1511,10 @@ def assemble_pack(dest, files, image_dir, csv_path, *, internal=False,
                 img_dest = dest / "images"
                 img_dest.mkdir(exist_ok=True)
                 for name in names:
-                    src = Path(image_dir) / name
-                    if src.exists():
+                    # same guard as build_image_zip: a crafted name never
+                    # reads outside image_dir (it counts as missing)
+                    src = safe_image_source(image_dir, name)
+                    if src is not None and src.is_file():
                         shutil.copy2(src, img_dest / name)
                         res["images"] += 1
                     else:

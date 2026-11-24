@@ -393,5 +393,31 @@ def test_share_folder_is_never_offered_as_a_run(tmp_path, shared):
     assert not (share / "run_meta.json").exists()
 
 
+def test_step3_offers_the_image_zip_in_share_mode(tmp_path, shared):
+    """The person on the other PC has no access to product_images_for_upload:
+    step 3 of a built run gives them the CSV AND the images zip. The image
+    file does not exist here, so the zip lists it as missing - the button is
+    there all the same, and nothing in the run folder is moved or deleted."""
+    runs = tmp_path / "runs"
+    run = seeded_run(runs, "built")
+    (run / "wordpress_ready.csv").write_text(
+        'sku,title,Images\n"WM-SKU-A","Samsung 7 kg Washer",'
+        '"https://shreejeeelectronics.in/wp-content/uploads/2026/11/'
+        'WM-SKU-A_zz-not-on-disk_1.webp"\n', encoding="utf-8")
+    before = sorted(p.name for p in run.iterdir())
+    at = boot(runs)
+    login(at, GOOD_PW)
+    labels = [str(o) for o in at.sidebar.radio[0].options]
+    at.sidebar.radio[0].set_value(labels[2]).run(timeout=60)
+    assert not at.exception, [e.value for e in at.exception]
+    downloads = [str(getattr(d, "proto", d).label)
+                 for d in at.get("download_button")]
+    assert any("Download images (.zip)" in d for d in downloads), downloads
+    assert any("Download CSV" in d for d in downloads), downloads
+    assert any("1 missing" in str(c.value) for c in at.caption), \
+        [str(c.value) for c in at.caption]
+    assert sorted(p.name for p in run.iterdir()) == before
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

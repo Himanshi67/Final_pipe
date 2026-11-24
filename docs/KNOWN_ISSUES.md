@@ -568,3 +568,13 @@ junk and KI-18 checks. Needs an owner decision if it touches the floor.
 **Accept:** the logo is dropped (by size, aspect ratio or a bajajfinserv.in
 `/dynamic-pdp/` rule) without dropping real product photos. Until then, the reviewer
 removes it in card review.
+
+## KI-34 · MED · open (found 2026-11-24, gui.py) — archived packs probably get no images
+**Symptom (not reproduced):** `archive_run` gives `assemble_pack` the folder
+`REPO_ROOT / "product_images_for_upload"`, not the per-client
+`product_images_for_upload\<slug>\` folder where the build saves the images. So the
+internal and client packs probably have 0 images.
+**Workaround:** the step 3 button "Download images (.zip)" (`gui_helpers.build_image_zip`)
+reads the correct per-client folder.
+**Accept:** an archived run of a built CSV holds every image that the CSV references.
+A test pins the folder.

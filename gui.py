@@ -2140,6 +2140,51 @@ def preview_build_rows(pf, app_mod, estimate_mrp=False, limit=5):
     return out
 
 
+@st.cache_data(max_entries=2, show_spinner=False)
+def _image_zip(csv_path: str, mtime_ns: int, size: int, image_dir: str):
+    """gui_helpers.build_image_zip, cached on the CSV's path + mtime + size
+    (and the image folder), so a rerun never rebuilds it. max_entries keeps
+    at most two zips in memory."""
+    return gui_helpers.build_image_zip(csv_path, image_dir)
+
+
+def build_downloads(P):
+    """Step 3's hand-over buttons: the CSV and the images it references, as
+    a zip laid out like the image URLs (unpack into wp-content/uploads/).
+    Reads only; available in share mode too - it deletes or moves nothing."""
+    csv_path = P["csv"]
+    try:
+        stat = csv_path.stat()
+    except OSError:
+        return
+    cfg = st.session_state.get(_CFG_KEY) or current_client()
+    image_dir = getattr(cfg, "image_dir", None) or (
+        REPO_ROOT / client_config.IMAGE_ROOT_NAME / cfg.slug)
+    data, summary = _image_zip(str(csv_path), stat.st_mtime_ns,
+                               stat.st_size, str(image_dir))
+    c1, c2 = st.columns(2)
+    c1.download_button("⬇ Download CSV", csv_path.read_bytes(),
+                       file_name=csv_path.name, mime="text/csv")
+    if summary["csv_error"]:
+        c2.warning(f"The CSV cannot be read ({summary['csv_error']}), so no "
+                   "image zip. Rebuild the CSV.")
+        return
+    if not summary["urls"]:
+        c2.info("The CSV has no image URLs, so there is no image zip.")
+        return
+    c2.download_button("⬇ Download images (.zip)", data,
+                       file_name=f"{csv_path.stem}_images.zip",
+                       mime="application/zip")
+    c2.caption(gui_helpers.image_zip_caption(summary)
+               + ". Unpack into wp-content/uploads/ on the store.")
+    if summary["missing"] or summary["refused"]:
+        with st.expander("Images not in the zip"):
+            for z in summary["missing"]:
+                st.text(f"missing: {z}")
+            for u in summary["refused"]:
+                st.text(f"refused: {u}")
+
+
 def step_build(P):
     st.header("3 · Build WooCommerce CSV")
     if not P["filled"].exists():
@@ -2262,6 +2307,7 @@ def step_build(P):
         if P["csv"].exists():
             st.success(f"CSV already built: {P['csv'].name} — rebuild any "
                        "time, or continue to Step 4.")
+            build_downloads(P)
         return
 
     os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
@@ -2351,8 +2397,7 @@ def step_build(P):
     with st.expander("Build log"):
         st.code(buf.getvalue() or "(no output)", language=None)
     st.dataframe(result.head(50))
-    st.download_button("⬇ Download CSV", P["csv"].read_bytes(),
-                       file_name=P["csv"].name, mime="text/csv")
+    build_downloads(P)
     # Record WHAT went into the CSV. Step 5 used to intersect the confirmed
     # SKUs (raw, as the enricher wrote them) with the CSV's SKUs (prefixed by
     # app.prefixed_sku), and those two sets barely overlap - measured on a
