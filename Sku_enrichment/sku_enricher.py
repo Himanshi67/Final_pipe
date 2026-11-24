@@ -272,6 +272,8 @@ CACHE_STATS = {"page_hit": 0, "page_miss": 0, "page_write": 0,
 # what the run actually spent, for the batch report. serper.dev bills per
 # search call, so a cached search is a credit not spent.
 RUN_STATS = {"serper_calls": 0, "ddg_calls": 0, "pages_fetched": 0,
+             # KI-36 fallback engines: calls that got an HTTP response
+             "tavily_calls": 0, "serpapi_calls": 0,
              "blocked_domains": {},
              # which client this batch was enriched for (PRODUCT_PLAN Phase 1
              # item 1). Recorded in the report header so a sheet can never be
@@ -317,6 +319,15 @@ SEARCH_ORDER = "paid_first"
 # from [serper] api_key_env of the resolved client; the default keeps
 # --probe, --cache-info and every test behaving exactly as before.
 SERPER_KEY_ENV = "SERPER_API_KEY"
+# KI-36: the fallback engines and the chain order ([serper] engines,
+# tavily_api_key_env, serpapi_api_key_env). main() rebinds all three.
+TAVILY_KEY_ENV = "TAVILY_API_KEY"
+SERPAPI_KEY_ENV = "SERPAPI_API_KEY"
+SEARCH_ENGINES = ("serper", "tavily", "serpapi", "ddg")
+# True after a web_search() where every engine of the chain FAILED (error,
+# HTTP non-200, timeout, budget refused or no key) - not after a cache hit or
+# an empty answer. lookup_sku resets it before each query and reads it after.
+LAST_SEARCH_FAILED = False
 
 # Live round-trips made so far - cache hits excluded. fetch() and web_search()
 # bump it just before they go to the network; polite_sleep() reads it to tell a
@@ -1456,12 +1467,98 @@ def serper_search(query):
             # look like a trusted empty result and mask a dead/over-quota key
             if not _serper_failed_warned:
                 log(f"      serper.dev HTTP {r.status_code} (bad key or out of "
-                    f"credits?) - falling back to DuckDuckGo")
+                    f"credits?) - trying the next search engine")
                 _serper_failed_warned = True
             return None
         return [{"href": it.get("link", ""), "title": it.get("title", "")}
                 for it in r.json().get("organic", [])]
     except Exception:
+        return None
+
+
+_tavily_failed_warned = False
+_serpapi_failed_warned = False
+
+
+def tavily_search(query):
+    """KI-36 fallback engine: Tavily (free tier, no credit card). Same
+    contract as serper_search: a list (maybe empty) when Tavily answered,
+    None on an error / HTTP non-200 / timeout or when no key is set."""
+    global _tavily_failed_warned
+    key = os.environ.get(TAVILY_KEY_ENV)
+    if not key:
+        return None
+    try:
+        r = creq.post("https://api.tavily.com/search",
+                      headers={"Authorization": f"Bearer {key}",
+                               "Content-Type": "application/json"},
+                      json={"query": query, "max_results": SEARCH_RESULTS,
+                            "search_depth": "basic"},
+                      timeout=20)
+        RUN_STATS["tavily_calls"] += 1        # counted once a response came back
+        if r.status_code != 200:
+            if not _tavily_failed_warned:
+                log(f"      Tavily HTTP {r.status_code} (bad key or out of "
+                    f"credits?) - trying the next search engine")
+                _tavily_failed_warned = True
+            return None
+        data = r.json()
+        if not isinstance(data, dict):
+            return None
+        return [{"href": it.get("url", "") or "", "title": it.get("title", "") or ""}
+                for it in (data.get("results") or []) if isinstance(it, dict)]
+    except Exception as e:
+        # the exception TYPE only - never str(e), which can carry the request
+        if not _tavily_failed_warned:
+            log(f"      Tavily request failed ({type(e).__name__}) - trying "
+                f"the next search engine")
+            _tavily_failed_warned = True
+        return None
+
+
+# SerpApi says "no results" through its "error" field; that is an ANSWER
+# (Google found nothing), not an engine failure.
+_SERPAPI_EMPTY_RE = re.compile(r"hasn'?t returned any results|no results",
+                               re.IGNORECASE)
+
+
+def serpapi_search(query):
+    """KI-36 fallback engine: SerpApi (Google results, free tier, no credit
+    card). A list when SerpApi answered, None on an error or with no key."""
+    global _serpapi_failed_warned
+    key = os.environ.get(SERPAPI_KEY_ENV)
+    if not key:
+        return None
+    try:
+        r = creq.get("https://serpapi.com/search.json",
+                     params={"engine": "google", "q": query, "api_key": key,
+                             "gl": "in", "hl": "en", "num": SEARCH_RESULTS},
+                     timeout=20)
+        RUN_STATS["serpapi_calls"] += 1
+        try:
+            data = r.json()
+        except Exception:
+            data = None
+        err = data.get("error") if isinstance(data, dict) else None
+        if err and _SERPAPI_EMPTY_RE.search(str(err)):
+            return []
+        if r.status_code != 200 or err or not isinstance(data, dict):
+            if not _serpapi_failed_warned:
+                log(f"      SerpApi HTTP {r.status_code}"
+                    f"{' (' + str(err)[:80] + ')' if err else ''}"
+                    f" - trying the next search engine")
+                _serpapi_failed_warned = True
+            return None
+        return [{"href": it.get("link", "") or "", "title": it.get("title", "") or ""}
+                for it in (data.get("organic_results") or [])
+                if isinstance(it, dict)]
+    except Exception as e:
+        # the exception TYPE only: str(e) of a requests error quotes the URL,
+        # and the SerpApi URL carries api_key in its query string
+        if not _serpapi_failed_warned:
+            log(f"      SerpApi request failed ({type(e).__name__}) - trying "
+                f"the next search engine")
+            _serpapi_failed_warned = True
         return None
 
 
@@ -1474,6 +1571,12 @@ def ddg_search(query):
             return [{"href": it.get("href") or it.get("url") or "",
                      "title": it.get("title", "")} for it in res]
         except Exception as e:
+            # ddgs >= 9 raises DDGSException("No results found.") for a query
+            # with no hits. That is an ANSWER (empty), not an engine failure:
+            # return [] at once, no retry and no sleep. web_search still treats
+            # an empty DuckDuckGo list as untrusted and uncached.
+            if "no results found" in str(e).lower():
+                return []
             if attempt == 1:
                 # a rate-limit needs the full cool-down; any other hiccup
                 # (DNS blip, parse error) never benefits from 30 idle seconds.
@@ -1484,15 +1587,66 @@ def ddg_search(query):
                 wait = 30 if "ratelimit" in blob or "rate limit" in blob else 10
                 log(f"      search hiccup ({type(e).__name__}) - waiting {wait}s...")
                 time.sleep(wait)
-    return []
+    # KI-36: both attempts raised - that is an engine FAILURE, not "no
+    # results". None lets web_search try the next engine and mark the query.
+    return None
+
+
+def engine_order():
+    """The engine chain for this run: [serper] engines in paid_first order;
+    free_first moves "ddg" to the front."""
+    engines = [e for e in SEARCH_ENGINES if e in _ENGINE_FUNCS] or ["ddg"]
+    if SEARCH_ORDER == "free_first" and "ddg" in engines:
+        engines = ["ddg"] + [e for e in engines if e != "ddg"]
+    return engines
+
+
+def _serper_with_budget(query):
+    """serper_search behind the --budget gate. A refused credit is None, so
+    the chain moves on to the next engine (it does not spend more credits)."""
+    global _budget_warned
+    if SERPER_BUDGET and RUN_STATS["serper_calls"] >= SERPER_BUDGET:
+        # The budget is spent. Refuse the credit HERE rather than after the
+        # row, so the queries still in flight for this SKU cannot overshoot.
+        if not _budget_warned:
+            _budget_warned = True
+            others = [n for n, k in (("Tavily", TAVILY_KEY_ENV),
+                                     ("SerpApi", SERPAPI_KEY_ENV))
+                      if os.environ.get(k)]
+            log(f"      Serper budget of {SERPER_BUDGET} reached - remaining "
+                f"searches fall back to {' / '.join(others + ['DuckDuckGo'])}")
+        return None
+    return serper_search(query)
+
+
+# looked up by NAME at call time, so a test's monkeypatch of serper_search /
+# ddg_search / tavily_search / serpapi_search still takes effect
+_ENGINE_FUNCS = {
+    "serper": lambda q: _serper_with_budget(q),
+    "tavily": lambda q: tavily_search(q),
+    "serpapi": lambda q: serpapi_search(q),
+    "ddg": lambda q: ddg_search(q),
+}
 
 
 def web_search(query):
-    """Cached in front of the providers, so a repeated run of the same batch
-    spends no Serper credits at all. An EMPTY serper answer is cached (Google
-    genuinely found nothing); an empty DuckDuckGo answer is not, because that
-    is nearly always the library failing rather than a real absence."""
-    global NET_CALLS, _budget_warned
+    """Cached in front of the engine chain (KI-36), so a repeated run of the
+    same batch spends no credits at all.
+
+    Each engine returns a list (it answered) or None (error, HTTP non-200,
+    timeout, budget refused, or no key - the next engine is asked).
+    * a NON-EMPTY list stops the chain; it is cached and returned.
+    * an EMPTY list from serper / Tavily / SerpApi is a trusted "Google found
+      nothing": returned, no more credits spent. Only serper's empty answer
+      is cached; an empty Tavily / SerpApi answer is not.
+    * an EMPTY DuckDuckGo list is not trusted (nearly always the library
+      failing quietly), so the chain still asks the next engine; if no later
+      engine answers, [] is returned uncached.
+    * every engine None: [] is returned and LAST_SEARCH_FAILED is set.
+    The cache key is the bare query whatever the engine, so entries written
+    in either order stay valid in the other."""
+    global NET_CALLS, LAST_SEARCH_FAILED
+    LAST_SEARCH_FAILED = False
     hit = cache_get("search", query)
     if hit is not None:
         CACHE_STATS["search_hit"] += 1
@@ -1501,35 +1655,24 @@ def web_search(query):
     CACHE_STATS["search_miss"] += 1
     NET_CALLS += 1
 
-    # free_first: DuckDuckGo answers first; serper is paid for only when it
-    # gives nothing. The cache key is the bare query whatever the provider,
-    # so entries written in either order stay valid in the other.
-    if SEARCH_ORDER == "free_first":
-        res = ddg_search(query)
-        if res:
+    answered = False
+    for name in engine_order():
+        res = _ENGINE_FUNCS[name](query)
+        if res is None:
+            continue                       # failed / no key: next engine
+        answered = True
+        if res or name == "serper":
             cache_put("search", query, res)
             return res
-
-    if SERPER_BUDGET and RUN_STATS["serper_calls"] >= SERPER_BUDGET:
-        # The budget is spent. Refuse the credit HERE rather than after the
-        # row, so the queries still in flight for this SKU cannot overshoot -
-        # returning None drops straight into the DuckDuckGo fallback below.
-        if not _budget_warned:
-            _budget_warned = True
-            log(f"      Serper budget of {SERPER_BUDGET} reached - remaining "
-                f"searches fall back to DuckDuckGo")
-        res = None
-    else:
-        res = serper_search(query)
-    if res is not None:      # serper answered (even if empty) - trust Google
-        cache_put("search", query, res)
-        return res
-    if SEARCH_ORDER == "free_first":
-        return []            # DuckDuckGo was already asked, and gave nothing
-    res = ddg_search(query)
-    if res:
-        cache_put("search", query, res)
-    return res
+        if name != "ddg":
+            # empty Tavily / SerpApi answer: trusted enough to stop the chain
+            # (no more credits), but NOT cached - only serper's empty answer
+            # is cached, so a later run asks again.
+            return res
+        # empty DuckDuckGo answer: not trusted, ask the next engine
+    if not answered:
+        LAST_SEARCH_FAILED = True
+    return []
 
 
 def search_is_cached(query):
@@ -3835,6 +3978,7 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
     fetched, per_dom, fail_reasons, tried = 0, {}, [], set()
     candidates = []           # every URL any tier surfaced, for hunt_donors
     budget_end = FETCH_BUDGET  # crawl() stops once `fetched` reaches this
+    search_outcome = {"ok": 0, "failed": 0}   # KI-36: per sent query
 
     def admit(u, title, dom=None):
         """The URL screens EVERY candidate passes - a search result, an index
@@ -3885,9 +4029,15 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
         return True
 
     def search_into(q, dom, found):
+        global LAST_SEARCH_FAILED
         log(f"    searching: {q}")
         _net_before = NET_CALLS
-        for r in web_search(q):
+        LAST_SEARCH_FAILED = False       # a stubbed web_search leaves it so
+        results = web_search(q)
+        # KI-36: did every engine fail on this query? A cached or an empty
+        # answer is a success.
+        search_outcome["failed" if LAST_SEARCH_FAILED else "ok"] += 1
+        for r in results:
             u = admit(r.get("href", ""), r.get("title", ""), dom)
             if u:
                 found.append(u)
@@ -4136,14 +4286,23 @@ def lookup_sku(sku, min_price=0.0, max_price=0.0, min_images=MIN_IMAGES):
             rec_score(r, min_images)))
         rec["status"] = f"CHECK MANUALLY ({domain_of(rec['url_link'])})"
         return cap_images(rec)
-    return {"status": not_found_status(candidates, fetched, fail_reasons)}
+    return {"status": not_found_status(
+        candidates, fetched, fail_reasons,
+        search_failed=(search_outcome["failed"] > 0
+                       and search_outcome["ok"] == 0))}
 
 
-def not_found_status(candidates, fetched, fail_reasons):
+SEARCH_FAILED_STATUS = "NOT FOUND - search engine failed"
+
+
+def not_found_status(candidates, fetched, fail_reasons, search_failed=False):
     """Say WHY nothing was found. 'blocked' and 'genuinely not listed' used to
     look identical in the sheet, which sent people hunting for products that
-    were there all along."""
+    were there all along. KI-36: `search_failed` = every query sent for the
+    row ended with ALL engines failing, so "no results" would be a lie."""
     if not candidates:
+        if search_failed:
+            return SEARCH_FAILED_STATUS
         return "NOT FOUND - no usable search results"
     blocked = [(d, w) for d, w in fail_reasons if is_block_reason(w)]
     if blocked and len(blocked) >= max(1, fetched):
@@ -4564,6 +4723,18 @@ class Ledger:
     def month_total(self):
         return int(self.data.get("serper_calls") or 0)
 
+    def month_engine_calls(self, key):
+        """KI-36: month-to-date 'tavily_calls' / 'serpapi_calls', summed over
+        this month's runs. A run written before KI-36 has no such field and
+        counts 0, so an old credits.json loads unchanged."""
+        total = 0
+        for row in self.data.get("runs") or []:
+            try:
+                total += int(row.get(key) or 0)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        return total
+
     # ------------------------------------------------ write
     def update(self, run_entry):
         """Upsert this run by 'id', recompute the month total from the runs
@@ -4668,6 +4839,9 @@ def status_bucket(status):
     if s.startswith("FOUND"):
         head, _, tail = s.partition(" - ")
         return "FOUND" if not tail else "FOUND (incomplete)"
+    if s.startswith(SEARCH_FAILED_STATUS):
+        # KI-36: an engine outage, not a product that is absent - its own row
+        return SEARCH_FAILED_STATUS
     for prefix, _ in REVIEW_BUCKETS:
         if s.startswith(prefix):
             return prefix
@@ -4711,8 +4885,10 @@ def write_report(path, rows, out_file, started, args, min_images):
     """Write the run summary next to the output. Never raises: a report that
     cannot be written must not fail a batch whose data is already saved."""
     buckets, review = {}, []
-    no_price = thin_images = 0
+    no_price = thin_images = engine_failed = 0
     for r, sku, status, images, sale in rows:
+        if SEARCH_FAILED_STATUS in status:     # also "NEEDS LINK - NOT FOUND - ..."
+            engine_failed += 1
         bucket = status_bucket(status)
         buckets[bucket] = buckets.get(bucket, 0) + 1
         if status.startswith("FOUND"):
@@ -4742,7 +4918,12 @@ def write_report(path, rows, out_file, started, args, min_images):
         f" · budget {RUN_STATS.get('credits_budget', 0)}"
         f" · queries not sent: {RUN_STATS.get('queries_skipped_dup', 0)}"
         f" (free source said not there)"
-        f" + {RUN_STATS.get('queries_skipped_early', 0)} (stopped early)",
+        f" + {RUN_STATS.get('queries_skipped_early', 0)} (stopped early)"
+        # KI-36 fallback engines (their own free tiers, not the serper budget)
+        f" · Tavily calls: {RUN_STATS.get('tavily_calls', 0)}"
+        f" · SerpApi calls: {RUN_STATS.get('serpapi_calls', 0)}",
+        # KI-36: rows where every search engine failed (not "no results")
+        f"- search engine failed: {engine_failed}",
         f"- Stopped by: {RUN_STATS.get('stopped_by') or 'done'}",
         # tier 0 (url_index.py): what the free URL sources saved
         f"- URL index: {RUN_STATS.get('index_lookups', 0)} lookup(s)"
@@ -4772,6 +4953,8 @@ def write_report(path, rows, out_file, started, args, min_images):
         "",
         f"- serper.dev calls this run: **{RUN_STATS['serper_calls']}** "
         f"(~1 credit each; the free tier is 2,500/month)",
+        f"- Tavily calls: {RUN_STATS.get('tavily_calls', 0)} · "
+        f"SerpApi calls: {RUN_STATS.get('serpapi_calls', 0)}",
         f"- DuckDuckGo fallback calls: {RUN_STATS['ddg_calls']}",
         f"- searches served from cache: {CACHE_STATS['search_hit']}/{searched}"
         + (f" - about {CACHE_STATS['search_hit']} credit(s) not spent"
@@ -4884,6 +5067,7 @@ def main():
     global CACHE_TTL_DAYS, CACHE_DIR, MERGE_BUDGET, SPECS_ENABLED, DISCOVER_MODE
     global IMAGE_CHECK, IMAGE_MIN_PX, SERPER_KEY_ENV, CATEGORY_CODES
     global SERPER_BUDGET, _budget_warned, QUERY_MODE, SEARCH_ORDER
+    global TAVILY_KEY_ENV, SERPAPI_KEY_ENV, SEARCH_ENGINES
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -5047,6 +5231,9 @@ def main():
         log(f"No .env for this client ({cfg.env_file}) - using the shell "
             f"environment as-is")
     SERPER_KEY_ENV = cfg.serper.api_key_env
+    TAVILY_KEY_ENV = getattr(cfg.serper, "tavily_api_key_env", TAVILY_KEY_ENV)
+    SERPAPI_KEY_ENV = getattr(cfg.serper, "serpapi_api_key_env", SERPAPI_KEY_ENV)
+    SEARCH_ENGINES = tuple(getattr(cfg.serper, "engines", SEARCH_ENGINES))
     CATEGORY_CODES = cfg.sku.enricher_codes
 
     # --budget: explicit flag > the client's default_run_budget. 0 = unlimited.
@@ -5192,11 +5379,22 @@ def main():
     if args.crawl_urls:
         log("PASS 2 (--crawl-urls): crawling the links in the sheet. "
             "No searches will run, so this costs no serper credits.")
-    elif os.environ.get(SERPER_KEY_ENV):
-        log(f"Search: Google via serper.dev (${SERPER_KEY_ENV} detected)")
     else:
-        log(f"Search: DuckDuckGo (free). Tip: set ${SERPER_KEY_ENV} for "
-            f"better results.")
+        # KI-36: name the engine chain; warn once when no paid key exists
+        key_of = {"serper": SERPER_KEY_ENV, "tavily": TAVILY_KEY_ENV,
+                  "serpapi": SERPAPI_KEY_ENV}
+        chain = engine_order()
+        usable = [e for e in chain
+                  if e == "ddg" or os.environ.get(key_of.get(e, ""))]
+        log(f"Search engines: {' -> '.join(usable) or '(none)'}"
+            + (f" (no key, skipped: "
+               f"{', '.join(e for e in chain if e not in usable)})"
+               if len(usable) < len(chain) else ""))
+        if not any(e in key_of for e in usable):
+            paid = [key_of[e] for e in chain if e in key_of] or [SERPER_KEY_ENV]
+            log(f"  !! WARNING: no paid search key found - only DuckDuckGo "
+                f"is available; it often fails on a cloud server. Add "
+                f"{' or '.join(paid)} (shell or {cfg.env_file}).")
     if args.discover:
         log("PASS 1 (--discover): finding a link and photos only - no spec "
             "table, no donor pages. Review the sheet, then run --crawl-urls.")
@@ -5223,6 +5421,9 @@ def main():
             "ended": datetime.now().isoformat(timespec="seconds"),
             "serper_calls": RUN_STATS["serper_calls"],
             "ddg_calls": RUN_STATS["ddg_calls"],
+            # KI-36 fallback engines; an older credits.json simply lacks them
+            "tavily_calls": RUN_STATS.get("tavily_calls", 0),
+            "serpapi_calls": RUN_STATS.get("serpapi_calls", 0),
             "pages_fetched": RUN_STATS["pages_fetched"],
             "stopped_by": RUN_STATS.get("stopped_by") or "done",
         })
@@ -5264,8 +5465,12 @@ def main():
         elif args.discover:
             if not args.force and has_url:
                 continue                  # already has a link waiting for review
-            if not args.force and has_status and not args.retry_missing:
+            if (not args.force and has_status and not args.retry_missing
+                    and SEARCH_FAILED_STATUS not in has_status):
                 continue                  # looked before and found nothing
+                                          # (KI-36: a failed search engine is
+                                          # transient, so that row stays
+                                          # eligible - also as "NEEDS LINK - ...")
         elif not args.force:
             if has_url:
                 incomplete = ((has_status.startswith("FOUND") and " - " in has_status)
@@ -5275,11 +5480,13 @@ def main():
                     continue              # found earlier and complete (or
                                           # retrying incomplete not requested)
             elif has_status and not args.retry_missing:
-                if "blocked" not in has_status.lower():
+                if ("blocked" not in has_status.lower()
+                        and SEARCH_FAILED_STATUS not in has_status):
                     continue              # NOT FOUND / ERROR earlier - skip so
                                           # the run continues with fresh rows
-                                          # (a blocked row is transient, so it
-                                          # stays eligible for the next run)
+                                          # (a blocked row or a failed search
+                                          # engine - KI-36 - is transient, so
+                                          # it stays eligible for the next run)
         if args.limit and done >= args.limit:
             break
 
