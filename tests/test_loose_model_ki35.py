@@ -77,9 +77,95 @@ def test_flow_rate_is_not_a_litre_size(s):
 
 
 def test_flow_rate_title_is_not_a_size_reject():
-    v, reason = verdict(rec("Kenstar Jett Gas Geyser 12 L/min flow"), JETT)
+    # electric (WH) SKU: L/min is not a tank size (KI-39 changes GWH only)
+    v, reason = verdict(rec("Kenstar Aqualia 10 L/min Storage Water Geyser"),
+                        AQUALIA)
     assert "size mismatch" not in reason
     assert v == "weak"
+
+
+# ------------------------------------------------------- KI-39 gas flow
+@pytest.mark.parametrize("sku,gas", [
+    (JETT, True), ("BAJAJ GWH SHAKTI 15L", True), (AQUALIA, False),
+    ("KENSTAR-GWHX 6L", False),
+    ("KENSTAR GWH(6L) JETT", True), ("KENSTAR_GWH JETT 6L", True),
+])
+def test_sku_is_gas(sku, gas):
+    assert E.sku_is_gas(sku) is gas
+
+
+@pytest.mark.parametrize("s", ["6 L/min", "6 L / min", "6 LPM", "6 lpm",
+                               "6lpm", "6L/min", "6 Ltr/minute", "6-LPM",
+                               "6 Litre/Mins", "6 L/mins"])
+def test_pure_flow_spellings_count_on_gas_only(s):
+    assert E.size_values(s, True) == [6.0], s
+    assert E.size_values(s, False) == [], s
+
+
+def test_litres_per_minute_reads_on_both():
+    # 'per minute' has no '/', so LITRE_RE reads it on an electric SKU too
+    assert E.size_values("6 litres per minute", True) == [6.0]
+    assert E.size_values("6 litres per minute", False) == [6.0]
+
+
+def test_electric_flow_rate_is_not_a_size():
+    assert E.size_values("6 L/min", False) == []
+
+
+def test_bracketed_gas_sku_rejects_other_flow():
+    v, reason = verdict(rec("Kenstar Jett 10 L/min Gas Geyser"),
+                        "KENSTAR GWH(6L) JETT")
+    assert v == ""
+    assert reason == "size mismatch: listing says 10 L, SKU says 6 L"
+
+
+def test_gas_sku_rejects_hyphenated_lpm():
+    v, reason = verdict(rec("Kenstar Jett Gas Geyser 10-LPM"), JETT)
+    assert v == ""
+    assert reason == "size mismatch: listing says 10 L, SKU says 6 L"
+
+
+def test_electric_l_mins_is_not_a_size_reject():
+    v, reason = verdict(rec("Kenstar Aqualia 10 L/mins Storage Water Geyser"),
+                        AQUALIA)
+    assert "size mismatch" not in reason
+    assert v == "weak"
+
+
+def test_flow_sku_parses_size():
+    sku = "KENSTAR GWH JETT 6 LPM"
+    brand, model = E.sku_parts(sku)
+    assert (brand, model) == ("KENSTAR", "")
+    assert E.loose_model_terms(sku, brand) == (["jett"], {6.0})
+
+
+@pytest.mark.parametrize("title", [
+    "Kenstar Jett 6 L/min Gas Geyser",
+    "Kenstar Jett 6 LPM Gas Water Heater",
+    "Kenstar JETT MAX 6L Gas Water Geyser",
+    "Kenstar Jett 6 Ltr Gas Geyser",
+    "Kenstar Jett 6 Liter Gas Geyser",
+    "Kenstar Jett Gas Water Heater",
+])
+def test_gas_flow_rate_is_the_size(title):
+    assert verdict(rec(title), JETT) == ("weak", "")
+
+
+@pytest.mark.parametrize("title,says", [
+    ("Kenstar Jett 10 L/min Gas Geyser", "10"),
+    ("Kenstar Jett 10L Gas Geyser", "10"),
+])
+def test_gas_flow_mismatch_is_rejected(title, says):
+    v, reason = verdict(rec(title), JETT)
+    assert v == ""
+    assert reason == f"size mismatch: listing says {says} L, SKU says 6 L"
+
+
+def test_gas_sized_title_ranks_above_unsized():
+    brand, model = E.sku_parts(JETT)
+    sized = E.loose_overlap("Kenstar Jett 6 L/min Gas Geyser", JETT, brand, model)
+    bare = E.loose_overlap("Kenstar Jett Gas Water Heater", JETT, brand, model)
+    assert (sized, bare) == (2, 1)
 
 
 @pytest.mark.parametrize("sku", ["KENSTAR-WH AQUALIA 25 L",

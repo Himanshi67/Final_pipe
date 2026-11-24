@@ -633,7 +633,7 @@ model `25LTR` / `1.5L` / `15-L` from `sku_parts`. The SKU then takes the model-c
 **Accept:** a token that is only a size (litres, kg, W) is never the model; such a SKU takes
 the KI-35 loose path. The false-positive sweep shows no change on rows with a real model code.
 
-## KI-39 · MED · open (found 2026-11-24) — gas geyser (GWH) flow rate is not compared
+## KI-39 · MED · fixed (2026-11-24) — gas geyser (GWH) flow rate is not compared
 **Symptom:** for `KENSTAR-GWH JETT 6L` the "6L" is 6 L/min (owner). `LITRE_RE` skips
 "L/min" (KI-35 review), so "Kenstar Jett 10 L/min Gas Geyser" is not rejected; it only
 ranks lower.
@@ -652,3 +652,9 @@ litres are the size on an electric geyser.
 **Accept:** for a GWH 6L SKU: "6 L/min", "6 LPM", "6L", "6 Ltr" titles count as size 6;
 "10 L/min" and "10L" titles are rejected; a title with no size stays weak. An electric
 SKU (WH) still ignores "L/min". Sweep: no change on rows with a model code.
+**Fix (2026-11-24):** `FLOW_RE` (L/min, L / min, L/mins, per minute, LPM, 10-LPM),
+`sku_is_gas` (a `GWH` token, also `GWH(6L)` / `_GWH`) and `size_values(text, gas)`.
+`loose_model_terms`, `loose_overlap` and the no-model branch of `assess()` use
+`size_values`; flow rates count only on a gas SKU. Tests: `tests\test_loose_model_ki35.py`.
+Sweep: 33 old sheets, 894 rows, 0 rows changed. Not in scope: "6 Lt" is still not a size
+(pre-existing, also for electric SKUs; see KI-38).
