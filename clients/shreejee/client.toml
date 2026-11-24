@@ -46,6 +46,7 @@ strip_codes = ["DW", "LED", "MW"]  # extra tokens the enricher strips, no taxono
 [sku.input_codes]
 WM = ["Washing Machines", ""]
 WH = ["Water Heaters", "Geysers"]
+GWH = ["Water Heaters", "Geysers"]
 SM = ["Home Appliances", "sewing machine"]
 HWD = ["Home Appliances", "Water Dispensers"]
 REF = ["Home Appliances", "Refrigerators"]

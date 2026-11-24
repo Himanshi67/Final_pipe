@@ -323,7 +323,7 @@ def test_sku_scheme_matches_todays_tables():
     assert sku.prefixes == ("WM", "WH", "TV", "AC", "CF", "KA", "HA", "SA",
                             "EC", "AP")
     assert set(sku.enricher_codes) == {
-        "WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW", "WH", "SM", "HWD",
+        "WM", "TV", "AC", "REF", "FRIDGE", "MWO", "DW", "WH", "GWH", "SM", "HWD",
         "IC", "ICT", "DI", "DF", "LED", "MW", "CF", "KA", "HA", "SA", "EC",
         "AP"}, "sku_enricher.CATEGORY_CODES drifted from the [sku] table"
     assert len(sku.enricher_codes) == len(set(sku.enricher_codes)), \

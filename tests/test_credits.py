@@ -193,7 +193,8 @@ ZZ = ["Home Appliances", "Widgets"]
 def test_category_codes_follow_the_client():
     print("CATEGORY_CODES is the client's scheme, not a literal")
     codes = set(client_config.load_client("shreejee").sku.enricher_codes)
-    check("shreejee still has today's 22 codes", len(codes), 22)
+    check("shreejee still has today's 23 codes (GWH added, KI-35)",
+          len(codes), 23)
     check("the module var matches it", set(E.CATEGORY_CODES), codes)
     check("no precompiled copy: build_queries uses it live",
           "WM" in E.build_queries("WM-HTW120-178BK")[2][0][0][0].upper()

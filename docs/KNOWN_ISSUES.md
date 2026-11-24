@@ -579,7 +579,7 @@ reads the correct per-client folder.
 **Accept:** an archived run of a built CSV holds every image that the CSV references.
 A test pins the folder.
 
-## KI-35 · HIGH · open (found 2026-11-24) — SKU with no model code gets the WRONG product
+## KI-35 · HIGH · fixed (2026-11-24) — SKU with no model code gets the WRONG product
 **Symptom:** `KENSTAR-WH AQUALIA 25L` -> "Kenstar Aqualia **Vogue 10L**" (amazon) and
 `KENSTAR-GWH JETT 6L` -> "KENSTAR **Star 6L**" (amazon), both `NEEDS CRAWL - CHECK LINK`.
 The exact Flipkart listings ("Kenstar Aqualia 25L …", "Kenstar JETT MAX 6L …") were in
@@ -593,6 +593,12 @@ model ("AQUALIA 25L") and require them in the title. Add a litre check next to `
 Rank weak hits by the number of SKU words in the title first. Add GWH to `CATEGORY_CODES`.
 **Accept:** both SKUs pick the Flipkart listing (or another page whose title has the
 series and the size). "Vogue 10L" and "Star 6L" are rejected.
+**Fix (2026-11-24):** `LITRE_RE` (not L/min), `loose_model_terms` / `loose_overlap`. In the
+no-model branch of `assess()`: a litre mismatch rejects; a missing series word rejects only
+when the SKU states a litre size (elsewhere it stays `weak`). Weak hits rank by
+`(loose_overlap, rec_score)`. GWH is a category code. Tests: `tests\test_loose_model_ki35.py`.
+Sweep: 265 old rows, only the 2 Kenstar rows change. Replay: `runs\ki35-replay\`, 0 credits.
+Follow-up: KI-38 (a glued size such as `25LTR` becomes the model code).
 
 ## KI-36 · MED · open (found 2026-11-24) — a failed DuckDuckGo search reads as "no results"
 **Symptom:** on Streamlit Cloud (no Serper key, cloud IP) both Kenstar SKUs gave
@@ -608,3 +614,16 @@ recovered on its second try. Two later searches failed with "No results found".
 **Symptom:** shreejeeelectronics.in product pages were fetched as candidates for both
 Kenstar SKUs.
 **Accept:** the candidate filter skips the client's own `[store] url` host.
+**Note (2026-11-24, KI-35 replay):** the own-store page "Kenstar WH Aqualia 25L" tied the
+Flipkart page on title fit. Only the source rank (`rec_score`) kept it from winning.
+
+## KI-38 · MED · open (found 2026-11-24) — a glued size becomes the model code
+**Symptom:** `KENSTAR WH AQUALIA 25LTR`, `... 1.5L` and `CROMPTON ARNO NEO 15-L` give the
+model `25LTR` / `1.5L` / `15-L` from `sku_parts`. The SKU then takes the model-code path in
+`assess()`, so the KI-35 checks do not run. Any "Kenstar <other series> 25 Ltr" title gives
+`strong`, because `norm('25LTR')` is in the title.
+**Cause:** `sku_parts` accepts any 4+ character token with a digit and a letter. A size token
+(`UNIT_TOKEN_RE` shape) is not excluded.
+**Also seen:** "AO SMITH SDS 15L" gives the brand "AO", so "smith" is a series word.
+**Accept:** a token that is only a size (litres, kg, W) is never the model; such a SKU takes
+the KI-35 loose path. The false-positive sweep shows no change on rows with a real model code.

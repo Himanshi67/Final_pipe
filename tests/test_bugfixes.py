@@ -698,6 +698,7 @@ def test_19_category_prefixes():
           app.SKU_PREFIX_CATEGORY,
           {"WM": ("Washing Machines", ""),
            "WH": ("Water Heaters", "Geysers"),
+           "GWH": ("Water Heaters", "Geysers"),     # KI-35
            "SM": ("Home Appliances", "sewing machine"),
            "HWD": ("Home Appliances", "Water Dispensers"),
            "REF": ("Home Appliances", "Refrigerators"),
