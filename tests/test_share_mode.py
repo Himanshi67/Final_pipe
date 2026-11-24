@@ -26,7 +26,8 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 import gui_helpers as gh  # noqa: E402
 
 GOOD_PW = "correct-horse-battery-staple"
-SHARE_VARS = (gh.SHARE_MODE_ENV, gh.SHARE_PASSWORD_ENV, gh.SHARE_BUDGET_ENV)
+SHARE_VARS = (gh.SHARE_MODE_ENV, gh.SHARE_PASSWORD_ENV, gh.SHARE_BUDGET_ENV,
+              gh.PASSWORD_ENV)
 
 
 # --------------------------------------------------------------- fixtures --

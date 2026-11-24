@@ -1993,6 +1993,48 @@ def share_password_problem(env=None) -> str | None:
     return None
 
 
+# ------------------------------------------------------- password-only mode --
+# GUI_PASSWORD puts the SAME gate (compare, throttle, session flag) in front of
+# the FULL GUI: after login nothing is hidden. Share mode wins when both are
+# set (it is the more restrictive one), and then GUI_SHARE_PASSWORD is the
+# password. Neither set = no gate (local laptop use).
+
+PASSWORD_ENV = "GUI_PASSWORD"
+
+
+def password_mode_on(env=None) -> bool:
+    """True when GUI_PASSWORD is set (non-empty) and share mode is OFF."""
+    return bool(_env(env).get(PASSWORD_ENV)) and not share_mode_on(env)
+
+
+def gate_on(env=None) -> bool:
+    """True when the password gate must run (share or password-only mode)."""
+    return share_mode_on(env) or password_mode_on(env)
+
+
+def gate_password(env=None) -> str:
+    """The password the gate compares against: GUI_SHARE_PASSWORD in share
+    mode, else GUI_PASSWORD; "" when the gate is off."""
+    if share_mode_on(env):
+        return share_password(env)
+    if password_mode_on(env):
+        return str(_env(env).get(PASSWORD_ENV) or "")
+    return ""
+
+
+def gate_password_problem(env=None) -> str | None:
+    """Why the gate must refuse to render (fail closed), or None. Share mode
+    keeps its own messages; password-only mode refuses a GUI_PASSWORD shorter
+    than SHARE_MIN_PASSWORD. Never includes the password itself."""
+    if share_mode_on(env):
+        return share_password_problem(env)
+    if password_mode_on(env) and len(gate_password(env)) < SHARE_MIN_PASSWORD:
+        return (f"{PASSWORD_ENV} is shorter than {SHARE_MIN_PASSWORD} "
+                "characters. Nothing is shown until a longer password is "
+                "configured.")
+    return None
+
+
 def share_budget(env=None) -> int:
     """GUI_SHARE_BUDGET as a positive int; the default (50) when unset, not
     a number, or not above 0 (0 would mean 'unlimited' to the enricher)."""

@@ -127,24 +127,36 @@ def refuse_in_share_mode(action: str):
             f"{action} is off in share mode.")
 
 
-def share_gate() -> bool:
-    """The password gate. Runs right after st.set_page_config and before any
-    other widget, sidebar or file access. Returns True when the page may
-    render; otherwise it renders only the gate and calls st.stop().
+def gate_on() -> bool:
+    """The password gate runs: share mode, or password-only mode
+    (GUI_PASSWORD). share_mode() stays False in password-only mode."""
+    return gui_helpers.gate_on()
 
-    With share mode off it renders nothing and returns True. With share mode
-    on but no usable password (unset or < 12 characters) it renders only an
-    error. The guess throttle is process-wide (gui_helpers.SHARE_THROTTLE):
-    8 wrong attempts in total, across all sessions, lock every login for 15
-    minutes. The password is never echoed, logged or kept in session_state."""
-    if not share_mode():
+
+def password_gate() -> bool:
+    """The ONE password gate, for share mode AND password-only mode. Runs
+    right after st.set_page_config and before any other widget, sidebar or
+    file access. Returns True when the page may render; otherwise it renders
+    only the gate and calls st.stop().
+
+    With neither mode on it renders nothing and returns True. With no usable
+    password (unset in share mode, or < 12 characters in either mode) it
+    renders only an error (fail closed). gui_helpers.gate_password() picks
+    the password: GUI_SHARE_PASSWORD when share mode is on (share mode wins
+    when both are set), else GUI_PASSWORD. The guess throttle is process-wide
+    (gui_helpers.SHARE_THROTTLE): 8 wrong attempts in total, across all
+    sessions, lock every login for 15 minutes. The password is never echoed,
+    logged or kept in session_state. Only share mode shows the banner and
+    hides controls; password-only mode hides nothing after login."""
+    if not gate_on():
         return True
-    problem = gui_helpers.share_password_problem()
+    problem = gui_helpers.gate_password_problem()
     if problem:
         st.error(problem)
         st.stop()
     if st.session_state.get(SHARE_AUTH_KEY) is True:
-        st.info(gui_helpers.SHARE_BANNER, icon="🔒")
+        if share_mode():
+            st.info(gui_helpers.SHARE_BANNER, icon="🔒")
         return True
 
     throttle = gui_helpers.SHARE_THROTTLE
@@ -160,7 +172,7 @@ def share_gate() -> bool:
             st.error(f"Too many wrong passwords. Logins are locked for "
                      f"{int(wait // 60) + 1} more minute(s).")
         elif gui_helpers.check_share_password(
-                given, gui_helpers.share_password()):
+                given, gui_helpers.gate_password()):
             throttle.record_success()
             st.session_state[SHARE_AUTH_KEY] = True
             st.rerun()
@@ -174,6 +186,9 @@ def share_gate() -> bool:
                 st.error("Wrong password.")
     st.stop()
     return False
+
+
+share_gate = password_gate          # the old name, kept for callers/tests
 
 
 # ------------------------------------------------------------------ client --
@@ -2575,8 +2590,29 @@ def run_publish(P, extra: list) -> tuple:
     return res.returncode, out
 
 
+HANDOVER_STEPS = (
+    "1. Download the CSV and the image zip.\n"
+    "2. Unzip; upload the folders into `wp-content/uploads/` on the store "
+    "(hosting file manager or FTP), keeping the folders.\n"
+    "3. WooCommerce > Products > Import > choose the CSV.")
+
+
+def handover_section(P):
+    """Step 5's manual hand-over: the same downloads as step 3 plus the
+    import steps. Shown in every mode (it only reads files)."""
+    st.subheader("Hand-over (manual import)")
+    if not P["csv"].exists():
+        st.info("No CSV yet — build it in Step 3 to download it here.")
+        return
+    build_downloads(P)
+    st.markdown(HANDOVER_STEPS)
+    st.divider()
+
+
 def step_publish(P):
     st.header("5 · Publish to WooCommerce")
+    handover_section(P)
+    st.subheader("Publish over the REST API")
     if share_mode():
         st.info("Publish is off in share mode.")
         return
@@ -3083,6 +3119,17 @@ def category_map_editor(cfg):
         st.error(f"{path} not found — client `{cfg.slug}` has no taxonomy "
                  "to edit.")
         return
+    st.download_button(
+        "⬇ Download category_map.xlsx", path.read_bytes(),
+        file_name=path.name, key="catmap_download",
+        mime="application/vnd.openxmlformats-officedocument."
+             "spreadsheetml.sheet")
+    if os.name != "nt":
+        # a hosted server (Streamlit Cloud, a container) has a throw-away
+        # disk: a save survives only until the next restart or redeploy
+        st.caption("This app runs on a server: a saved edit lives only on "
+                   "this server until the next restart or redeploy - "
+                   "download the file and commit it to GitHub to keep it.")
     df = pd.read_excel(path, sheet_name=0, dtype=str).fillna("")
     other = openpyxl.load_workbook(path, read_only=True).sheetnames[1:]
     st.caption("Column 1: parent category. Column 2: subcategories "
@@ -3128,16 +3175,16 @@ def main():
     # resolved before it - current_client() only reads session_state and the
     # environment, it renders nothing. A broken config falls back to a
     # generic tab title and is reported by the selector below.
-    # In share mode nothing is read (not even client.toml) before the
-    # password gate, so the tab title stays generic.
+    # Behind the password gate (share or password-only mode) nothing is read
+    # (not even client.toml) before login, so the tab title stays generic.
     page_title = "Catalogue pipeline"
-    if not share_mode():
+    if not gate_on():
         try:
             page_title = f"{current_client().name} pipeline"
         except ClientConfigError:
             pass
     st.set_page_config(page_title=page_title, page_icon="🛒", layout="wide")
-    share_gate()                    # st.stop()s unless logged in / not shared
+    password_gate()                 # st.stop()s unless logged in / no gate
     try:
         cfg = client_selector()
     except ClientConfigError as exc:

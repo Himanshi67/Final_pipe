@@ -599,6 +599,53 @@ the GUI works as before.
 A public address needs a separate tunnel step. The owner starts and stops
 that tunnel. Stop the tunnel before you stop the GUI.
 
+#### Password-only mode (`GUI_PASSWORD`, owner decision 2026-11-24)
+
+Password-only mode puts the same password gate in front of the FULL GUI.
+After login, nothing is hidden: all 5 steps, the category map editor,
+archive/delete, the client selector and the real publish.
+
+- Set `GUI_PASSWORD` (12 characters minimum). A shorter value shows only an
+  error, and nothing else renders (fail closed).
+- The gate is the same code as share mode (`gui.password_gate()`): the same
+  constant-time compare, the same login lock (8 wrong passwords, 15 minutes)
+  and the same session flag. `share_mode()` stays False in this mode.
+- **Precedence:** when `GUI_SHARE_MODE` and `GUI_PASSWORD` are both set,
+  share mode wins (it is more restrictive). The password is then
+  `GUI_SHARE_PASSWORD`, and `GUI_PASSWORD` is ignored.
+- With neither variable set (local laptop use), there is no gate.
+
+**Step 5 hand-over section (every mode):** the top of step 5 shows
+"⬇ Download CSV" and "⬇ Download images (.zip)" (the same buttons as step 3)
+and these manual steps:
+1. Download the CSV and the image zip.
+2. Unzip; upload the folders into `wp-content/uploads/` on the store
+   (hosting file manager or FTP), keeping the folders.
+3. WooCommerce > Products > Import > choose the CSV.
+
+The existing publish UI follows, unchanged. It stays off in share mode. When
+`WC_URL`, `WC_KEY` or `WC_SECRET` is missing, it shows its normal "Missing
+credentials" message.
+
+**Category map editor download:** the editor has a "⬇ Download
+category_map.xlsx" button (the current file on disk). On a non-Windows host
+(Streamlit Cloud, a container) a caption says that a saved edit lives only
+on that server until the next restart or redeploy. Download the file and
+commit it to GitHub to keep it. Save and backup behaviour is unchanged.
+
+**Streamlit Community Cloud Secrets** (app settings > Secrets, TOML):
+- Password-only mode: `GUI_PASSWORD`; optional `SERPER_API_KEY`; for the real
+  publish also `WC_URL`, `WC_KEY`, `WC_SECRET`, `WP_APP_USER`,
+  `WP_APP_PASSWORD`.
+- Share mode: as above for share mode (`GUI_SHARE_MODE`,
+  `GUI_SHARE_PASSWORD`, optional `GUI_SHARE_BUDGET` and `SERPER_API_KEY`).
+
+**Risk:** in password-only mode, anyone with the password can delete runs,
+edit the taxonomy, spend serper credits and publish to the LIVE store (when
+the WC credentials are set). Use a long random password, share it only with
+trusted people, and rotate it when a person leaves. Runs and taxonomy edits
+on Streamlit Cloud are lost on a restart or redeploy.
+
 ### app.py — WooCommerce formatter (browser app)
 
 **What it does:** takes the filled file and produces the import CSV: brand +
