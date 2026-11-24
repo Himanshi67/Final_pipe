@@ -239,9 +239,11 @@ Main loop does: designing fixes, editing code, judgment calls. Prefer one well-b
 subagent over 20 tool calls in the main context.
 
 ## Docs (load on demand only)
-- `docs/handover-2026-11-19.md` — the current handover: what changed on 2026-11-19
-  (image canvas, content firewall, search spend, filter groups, GUI review states), the
-  test baseline, the git state and the open owner actions. Read it first in a new session.
+- `docs/handover-2026-11-24.md` — the current handover: KI-17/18/26/27/28 fixes, the
+  hosted Streamlit Cloud app (password-only mode), the two git remotes, the test
+  baseline and the next task (KI-35). Read it first in a new session.
+  `docs/handover-2026-11-19.md` is the older one (image canvas, content firewall, filter
+  groups).
 - `docs/KNOWN_ISSUES.md` — pre-diagnosed bugs with line anchors + acceptance tests. Read it
   BEFORE diagnosing any enricher misbehavior; most failure modes are already there.
 - `docs/PIPELINE_GUIDE.md` — authoritative operations guide (flags, app.py controls, taxonomy).
