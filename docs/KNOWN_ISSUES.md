@@ -603,7 +603,7 @@ Follow-up: KI-38 (a glued size such as `25LTR` becomes the model code).
 FLOW RATE (6 L/min), not a tank size. "Jett" is sold as "Jett Max", so the Flipkart
 "Jett Max 6L" page is the right product. Open gap: `LITRE_RE` skips "L/min", so a GWH
 sibling titled "Jett 10 L/min" is not rejected (it only ranks lower). A fix would read
-L/min values as the size when the SKU has a GWH code.
+L/min values as the size when the SKU has a GWH code. Recorded as KI-39.
 
 ## KI-36 · MED · open (found 2026-11-24) — a failed DuckDuckGo search reads as "no results"
 **Symptom:** on Streamlit Cloud (no Serper key, cloud IP) both Kenstar SKUs gave
@@ -632,3 +632,23 @@ model `25LTR` / `1.5L` / `15-L` from `sku_parts`. The SKU then takes the model-c
 **Also seen:** "AO SMITH SDS 15L" gives the brand "AO", so "smith" is a series word.
 **Accept:** a token that is only a size (litres, kg, W) is never the model; such a SKU takes
 the KI-35 loose path. The false-positive sweep shows no change on rows with a real model code.
+
+## KI-39 · MED · open (found 2026-11-24) — gas geyser (GWH) flow rate is not compared
+**Symptom:** for `KENSTAR-GWH JETT 6L` the "6L" is 6 L/min (owner). `LITRE_RE` skips
+"L/min" (KI-35 review), so "Kenstar Jett 10 L/min Gas Geyser" is not rejected; it only
+ranks lower.
+**Design (owner, 2026-11-24):** on a GWH SKU the flow rate is THE size, the same way tank
+litres are the size on an electric geyser.
+- Normalise `L`, `Ltr`, `Litre`, `Liter`, `LPM`, `L/min`, `L / min` into one number (6.0).
+  Marketplace titles often drop "/min" and write `6L`, `6 L`, `6 Ltr`, `6 Liter`.
+- Apply this only when the SKU has a GWH code (or the category says gas water heater).
+  Electric SKUs keep the KI-35 rule: L/min is not a tank size.
+- Explicit mismatch (6 vs 10): reject.
+- Missing size ("Kenstar Jett Gas Water Heater"): NOT rejected; stays `weak` and ranks
+  below a title with the size (agent decision, matches the electric path; every weak pick
+  is a manual check anyway). Owner may override.
+**Code:** `LITRE_RE` / `loose_model_terms` / the no-model branch of `assess()` /
+`loose_overlap` in `sku_enricher.py`; tests in `tests\test_loose_model_ki35.py`.
+**Accept:** for a GWH 6L SKU: "6 L/min", "6 LPM", "6L", "6 Ltr" titles count as size 6;
+"10 L/min" and "10L" titles are rejected; a title with no size stays weak. An electric
+SKU (WH) still ignores "L/min". Sweep: no change on rows with a model code.
