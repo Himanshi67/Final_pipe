@@ -178,6 +178,28 @@ KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*kg\b", re.I)
 # the lookahead keeps a geyser's flow rate ('12 L/min') out of the size
 LITRE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|ltrs?|litres?|liters?)\b"
                       r"(?!\s*/\s*min)", re.I)
+# KI-39: on a gas geyser (GWH) the flow rate IS the size
+FLOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|ltrs?|litres?|liters?)"
+                     r"(?:\s*/\s*min(?:ute)?s?\b|\s+per\s+min(?:ute)?s?\b)"
+                     r"|(\d+(?:\.\d+)?)\s*-?\s*lpm\b", re.I)
+
+
+def sku_is_gas(sku):
+    return any(t.upper() == "GWH"
+               for t in re.split(r"[\s\-,/()_]+", str(sku)))
+
+
+def size_values(text, gas):
+    """Litre sizes in text; a gas SKU also counts flow rates (6 L/min = 6)."""
+    text = str(text or "")
+    vals = [float(x) for x in LITRE_RE.findall(text)]
+    if gas:
+        # '6 litres per minute' matches both patterns: count it once
+        for m in FLOW_RE.finditer(text):
+            v = float(m.group(1) or m.group(2))
+            if v not in vals:
+                vals.append(v)
+    return vals
 
 CATEGORY_WORDS = {
     "WM": ("washing machine", "washer"),
@@ -1322,8 +1344,9 @@ def sku_parts(sku):
 # words a SKU carries that never identify a series: filler and colours
 LOOSE_STOP_WORDS = {"with", "new", "and", "for", "the", "plus",
                     "white", "black", "blue", "grey", "gray", "silver", "red",
-                    "ivory", "gold"}
-LITRE_UNIT_WORDS = {"l", "lt", "ltr", "ltrs", "litre", "litres", "liter", "liters"}
+                    "ivory", "gold", "per"}
+LITRE_UNIT_WORDS = {"l", "lt", "ltr", "ltrs", "litre", "litres", "liter", "liters",
+                    "lpm", "min", "minute"}
 
 
 def loose_model_terms(sku, brand):
@@ -1335,7 +1358,7 @@ def loose_model_terms(sku, brand):
     raw = str(sku)
     # the size may be spaced or bracketed ('25 L', '(25L)'), so read it from
     # the whole string, not from tokens
-    litres = {float(x) for x in LITRE_RE.findall(raw)}
+    litres = set(size_values(raw, sku_is_gas(raw)))
     sku = re.sub(r"\([^)]*\)", " ", raw).strip(" -,")
     codes = {c.upper() for c in CATEGORY_CODES}
     words = []
@@ -1359,7 +1382,7 @@ def loose_overlap(title, sku, brand, model):
     words, litres = loose_model_terms(sku, brand)
     t_low = " " + re.sub(r"\s+", " ", str(title or "")).lower() + " "
     hits = sum(1 for w in words if re.search(r"\b" + re.escape(w) + r"\b", t_low))
-    t_litres = [float(x) for x in LITRE_RE.findall(str(title or ""))]
+    t_litres = size_values(title, sku_is_gas(sku))
     hits += sum(1 for v in litres if any(abs(v - t) <= 0.05 for t in t_litres))
     return hits
 
@@ -3301,7 +3324,7 @@ def assess(rec, sku, model, brand, min_price, max_price):
     # SKU has no clean model code -> brand match is the best we can do,
     # after the SKU's own size and series words rule out a sibling (KI-35)
     words, litres = loose_model_terms(sku, brand)
-    t_litres = [float(x) for x in LITRE_RE.findall(title)]
+    t_litres = size_values(title, sku_is_gas(sku))
     if litres and t_litres and not any(abs(v - s) <= 0.05
                                        for v in t_litres for s in litres):
         return "", (f"size mismatch: listing says "
