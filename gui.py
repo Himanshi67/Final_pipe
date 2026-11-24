@@ -1158,8 +1158,10 @@ def review_editor(df: pd.DataFrame, key: str,
         lambda s: f"{BADGE[classify(s)]} {s}"))
     view.insert(3, "thumb", view["image_url"].map(
         lambda v: str(v).split(",")[0].strip() if str(v).strip() else None))
-    show = ["confirmed", "skipped", "state", "sku", "title", "regular price",
-            "sale price", "thumb", "image_url", "url_link", "categories",
+    # url_link sits next to sku: pasting a link on a NEEDS LINK row is the
+    # main edit on the failed tab, and far right it was off-screen
+    show = ["confirmed", "skipped", "state", "sku", "url_link", "title",
+            "regular price", "sale price", "thumb", "image_url", "categories",
             "Brands", "specs"]
     show = [c for c in show if c in view.columns]
     return st.data_editor(
@@ -1884,6 +1886,43 @@ def card_review(P, df, cat_opts, all_raws=None):
         goto(i - 1)
 
 
+CRAWL_BUCKETS = ("pending", "review", "failed")
+
+
+def crawl_section(P, df):
+    """Pass 2's '🔎 Crawl all info' block, shared by the table AND the card
+    view. It shows when any not-yet-FOUND row (pending, review or failed)
+    holds a url_link: a NEEDS LINK row stays 'failed' after a human pastes
+    its link (saving changes no status), so gating on the pending/review
+    counts alone hid the button from a run whose rows were all NEEDS LINK.
+    --crawl-urls crawls every row with a link that is not FOUND."""
+    todo = df[df["_bucket"].isin(CRAWL_BUCKETS)]
+    has_link = todo["url_link"].astype(str).str.strip() != ""
+    if not bool(has_link.any()):
+        return
+    no_link = int((~has_link).sum())
+    meta = load_meta(P)
+    # --discover MUST be stripped: passing it alongside --crawl-urls is the one
+    # combination the enricher refuses outright
+    base_flags = [f for f in meta.get("enricher_flags", [])
+                  if f not in ("--force", "--retry-incomplete",
+                               "--retry-missing", "--discover", "--crawl-urls")]
+    st.divider()
+    st.subheader("Pass 2 · crawl the reviewed links")
+    st.caption(f"Crawls the url_link on every row and pulls in the full "
+               f"specifications. Runs **no searches**, so it spends no "
+               f"Serper credits — links already crawled replay from cache "
+               f"for free."
+               + (f" {no_link} row(s) still have no link and will be "
+                  f"skipped." if no_link else ""))
+    if st.button("🔎 Crawl all info from these links", type="primary",
+                 key="crawl_urls_btn"):
+        start_enricher(P, base_flags + ["--crawl-urls"],
+                       meta.get("total_rows", 0))
+        st.rerun()
+    st.divider()
+
+
 def step_review(P):
     st.header("2 · Review & Confirm")
     if not P["filled"].exists():
@@ -1976,11 +2015,14 @@ def step_review(P):
                     key=f"mode_{P['run'].name}",
                     help="Card review walks the rows one SKU at a time with "
                          "the full image gallery. Bulk actions (confirm all, "
-                         "crawl, retries) live in the Table view.")
+                         "retries) live in the Table view.")
     if mode == "Card review":
         # the UNFILTERED sku column: validator_flags has to resolve a CSV sku
         # against every raw on the sheet, not just the visible ones
         card_review(P, fdf, cat_opts, df["sku"].astype(str).tolist())
+        # the card's 'Product URL' + Save is how a NEEDS LINK row gets its
+        # link here, so the crawl button has to be reachable from this view
+        crawl_section(P, df)
         return
 
     st.caption("Edit title, prices, URLs and image URLs directly in the "
@@ -2100,22 +2142,7 @@ def step_review(P):
                                "--retry-missing", "--discover", "--crawl-urls")]
     total = meta.get("total_rows", 0)
 
-    if pending or int(n.get("review", 0)):
-        no_link = int((df["url_link"].astype(str).str.strip() == "").sum()) \
-            if "url_link" in df.columns else 0
-        st.divider()
-        st.subheader("Pass 2 · crawl the reviewed links")
-        st.caption(f"Crawls the url_link on every row and pulls in the full "
-                   f"specifications. Runs **no searches**, so it spends no "
-                   f"Serper credits — links already crawled replay from cache "
-                   f"for free."
-                   + (f" {no_link} row(s) still have no link and will be "
-                      f"skipped." if no_link else ""))
-        if st.button("🔎 Crawl all info from these links", type="primary",
-                     key="crawl_urls_btn"):
-            start_enricher(P, base_flags + ["--crawl-urls"], total)
-            st.rerun()
-        st.divider()
+    crawl_section(P, df)
     if b3.button("🔁 Re-enrich incomplete rows",
                  help="--retry-incomplete: rows FOUND but missing a price or "
                       "enough images; good cells are kept"):

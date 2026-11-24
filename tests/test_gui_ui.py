@@ -2052,6 +2052,103 @@ def test_a_run_with_no_review_events_gets_no_metrics_file(tmp):
     assert not any("Review so far:" in c for c in texts(at, "caption"))
 
 
+# ------------- pass 2 reachable from a run whose rows are all NEEDS LINK --
+
+NEEDS_LINK_ROWS = [
+    ["SKU-X", "", "", "", "", "", "",
+     "NEEDS LINK - NOT FOUND - 6 page(s) checked, none matched", "", ""],
+    ["SKU-Y", "", "", "", "", "", "",
+     "NEEDS LINK - NOT FOUND - no usable search results", "", ""],
+]
+
+
+def needs_link_run(base: Path, name: str) -> Path:
+    """A --discover run in which every row came back NEEDS LINK."""
+    run = base / name
+    run.mkdir(parents=True)
+    (run / "input.xlsx").write_bytes(b"")
+    wb = openpyxl.Workbook()
+    wb.active.append(FILLED_HEADERS)
+    for row in NEEDS_LINK_ROWS:
+        wb.active.append(row)
+    wb.save(run / "input_filled.xlsx")
+    return run
+
+
+def crawl_btn(at):
+    return [b for b in at.button if "Crawl all info" in str(b.label)]
+
+
+def card_mode(at):
+    next(r for r in at.radio if "View" in str(r.label)).set_value(
+        "Card review").run(timeout=60)
+    assert_no_exception(at)
+    return at
+
+
+def test_crawl_is_hidden_while_no_needs_link_row_has_a_link(tmp):
+    """Nothing to crawl yet: the button would start a run that crawls 0
+    rows, so it stays hidden in both views."""
+    runs = tmp / "runs"
+    needs_link_run(runs, "nolinks")
+    at = boot(runs)
+    step2(at)
+    assert_no_exception(at)
+    assert not crawl_btn(at)
+    card_mode(at)
+    assert not crawl_btn(at)
+
+
+def test_a_url_saved_in_the_table_unlocks_the_crawl(tmp):
+    """The failed tab says 'paste a URL, save, then press Crawl all info':
+    after that save the button must exist, in the table AND card view."""
+    import gui
+    runs = tmp / "runs"
+    run = needs_link_run(runs, "tablepaste")
+    P = gui.run_paths(run)
+    at = AppTest.from_function(
+        wizard_edited,
+        args=(runs, "SKU-X", {"url_link": "https://example.com/x"}, None))
+    at.run(timeout=60)
+    step2(at)
+    assert not crawl_btn(at)
+    next(b for b in at.button
+         if "Save edits & confirmations" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    df = gui.load_filled_df(P)
+    assert df.set_index("sku").loc["SKU-X", "url_link"] == \
+        "https://example.com/x"
+    assert crawl_btn(at), "crawl button missing after a url_link was saved"
+    assert any("1 row(s) still have no link" in c
+               for c in texts(at, "caption")), texts(at, "caption")
+    card_mode(at)
+    assert crawl_btn(at), "crawl button missing in card review"
+
+
+def test_a_url_saved_on_a_card_unlocks_the_crawl(tmp):
+    import gui
+    runs = tmp / "runs"
+    run = needs_link_run(runs, "cardpaste")
+    P = gui.run_paths(run)
+    at = boot(runs)
+    step2(at)
+    card_mode(at)
+    assert not crawl_btn(at)
+    sku = next(s for s in ("SKU-X", "SKU-Y")
+               if any(sku_h.value == f"🔴 {s}" for sku_h in at.subheader))
+    next(t for t in at.text_input if "Product URL" in str(t.label)) \
+        .set_value("https://example.com/card").run(timeout=60)
+    next(b for b in at.button if "Save & next" in str(b.label)).click().run(
+        timeout=60)
+    assert_no_exception(at)
+    df = gui.load_filled_df(P).set_index("sku")
+    assert df.loc[sku, "url_link"] == "https://example.com/card"
+    # still NEEDS LINK, so still not approvable - the import gate holds
+    assert str(df.loc[sku, "status"]).startswith("NEEDS LINK")
+    assert crawl_btn(at), "crawl button missing after a card save"
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
              if name.startswith("test_") and callable(fn)]

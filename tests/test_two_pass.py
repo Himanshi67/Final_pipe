@@ -196,11 +196,87 @@ def test_discover_hint_names_the_original_list():
           'sku_enricher.py "{out.name}" --crawl-urls' in src, False)
 
 
+def test_crawl_urls_selects_a_pasted_needs_link_row(tmp_path=None):
+    """Pass 2 must crawl a NEEDS LINK row once a human has pasted its link -
+    that is the whole remediation the GUI's failed tab asks for. It crawls
+    every row with a url_link that is not FOUND, and nothing else. No
+    network: crawl_url is stubbed, the ledger goes to a scratch client."""
+    print("--crawl-urls crawls a NEEDS LINK row that now has a url_link")
+    import contextlib
+    import io
+    import tempfile
+    from pathlib import Path
+    from openpyxl import Workbook, load_workbook
+    import client_config                                      # noqa: E402
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from test_credits import _write_client                    # noqa: E402
+
+    tmp = Path(tmp_path) if tmp_path else Path(tempfile.mkdtemp())
+    rows = [("WM-AAA111", "https://x.test/a", "NEEDS LINK - NOT FOUND"),
+            ("WM-BBB222", "", "NEEDS LINK - NOT FOUND"),
+            ("WM-CCC333", "https://x.test/c", "FOUND (x.test)"),
+            ("WM-DDD444", "https://x.test/d", "NEEDS CRAWL (x.test)")]
+    src = tmp / "SCRATCH.xlsx"
+    wb = Workbook()
+    wb.active.append(["SKU"])
+    for sku, _, _ in rows:
+        wb.active.append([sku])
+    wb.save(src)
+    wb = Workbook()
+    wb.active.append(["SKU", "url_link", "status"])
+    for row in rows:
+        wb.active.append(list(row))
+    wb.save(tmp / "SCRATCH_filled.xlsx")
+    _write_client(tmp / "clients", "acme", api_key_env="ACME_SERPER",
+                  monthly_budget=0, default_run_budget=0)
+
+    crawled = []
+
+    def fake_crawl(url, sku="", min_images=0):
+        crawled.append(url)
+        return {"status": "NOT FOUND - stub"}
+
+    real = (client_config.CLIENTS_DIR, E.crawl_url, E.polite_sleep, sys.argv)
+    real_globals = {name: getattr(E, name) for name in
+                    ("CATEGORY_CODES", "SERPER_KEY_ENV", "CACHE_DIR",
+                     "CACHE_ENABLED", "CACHE_REFRESH", "CACHE_TTL_DAYS",
+                     "SPECS_ENABLED", "IMAGE_CHECK", "IMAGE_MIN_PX",
+                     "MERGE_BUDGET", "DISCOVER_MODE", "PW_ENABLED")}
+    client_config.CLIENTS_DIR = tmp / "clients"
+    E.crawl_url = fake_crawl
+    E.polite_sleep = lambda *a, **k: None
+    sys.argv = ["sku_enricher.py", str(src), "--client", "acme",
+                "--crawl-urls", "--no-cache",
+                "--cache-dir", str(tmp / "cache"), "--delay", "0", "0"]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            E.main()
+    finally:
+        (client_config.CLIENTS_DIR, E.crawl_url, E.polite_sleep,
+         sys.argv) = real
+        for name, value in real_globals.items():
+            setattr(E, name, value)
+        E.RUN_STATS["stopped_by"] = "done"
+        E.RUN_STATS["client"] = client_config.DEFAULT_CLIENT
+
+    check("the pasted NEEDS LINK row and the NEEDS CRAWL row are crawled, "
+          "the FOUND one is not", crawled,
+          ["https://x.test/a", "https://x.test/d"])
+    ws = load_workbook(tmp / "SCRATCH_filled.xlsx").active
+    head = [c.value for c in ws[1]]
+    status = {r[0]: r[head.index("status")]
+              for r in ws.iter_rows(min_row=2, values_only=True)}
+    check("a row with no link stays NEEDS LINK",
+          str(status["WM-BBB222"]).startswith("NEEDS LINK"), True)
+    check("the FOUND row is untouched", status["WM-CCC333"], "FOUND (x.test)")
+
+
 def main():
     for test in (test_discovery_status, test_discovery_is_not_importable,
                  test_gui_buckets, test_gui_gate_refuses_discovery,
                  test_discover_hint_names_the_original_list,
-                 test_query_tiers, test_flags_are_exclusive):
+                 test_query_tiers, test_flags_are_exclusive,
+                 test_crawl_urls_selects_a_pasted_needs_link_row):
         test()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
