@@ -1433,7 +1433,15 @@ def missing_spec_axes(sub, title, category_family, scraped=(), parent='',
     specs = {}
     for text in reversed(texts):
         specs.update(spec_tags(text))
-    labels = {label.lower() for label, _ in scraped}
+    # Scraped rows arrive canonicalised, a reviewer row ('Star rating: 3')
+    # does not: take the raw AND the canonical label. A row with no value
+    # states nothing.
+    labels = set()
+    for label, value in scraped:
+        if not compact(value):
+            continue
+        labels.add(compact(label).lower())
+        labels.add(canon_spec_label(label).lower())
     hit_axes = {hit.axis for hit in filters}
     removed = set(removed)
     missing = []
@@ -1455,7 +1463,9 @@ def missing_spec_axes(sub, title, category_family, scraped=(), parent='',
         if any(k in specs for k in AXIS_SPEC_KEYS.get(axis, ())):
             continue
         # 3. the retailer's spec table names it
-        if any(l in labels for l in AXIS_SPEC_LABELS.get(axis, ())):
+        #    (or a row is named after the axis itself: 'Star Rating', 'Ton')
+        if (axis.lower() in labels
+                or any(l in labels for l in AXIS_SPEC_LABELS.get(axis, ()))):
             continue
         # 4. 'Type' is satisfied by a configuration we could actually determine
         if axis == 'Type' and configuration_text(title, category_family):

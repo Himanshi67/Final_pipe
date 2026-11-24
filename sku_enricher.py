@@ -595,7 +595,10 @@ COMMERCE_RE = re.compile(r"""
       cash\s?back | \bcoupons?\b | \bvouchers?\b | \bpromo | superdost
     | super\s?coins? | \bbank\s+offers? | \bcard\s+offers? | \bspecial\s+offers?
     | \bexchange\s+offers? | (?<!ion\s)(?<!ion-)(?<!heat\s)\bexchange\b
-    | \bno[\s-]?cost\s+emi\b | \bemi\b(?!\s*(?:filter|protection|shield|suppress))
+    | \bno[\s-]?cost\s+emis?\b | \bemis?\b(?!\s*(?:filter|protection|shield|suppress))
+    | \binstal{1,2}ments?\b
+    | \bnotify\s+me\b | \bavailability\s+notifications?\b
+    | \benter\s+your\s+e-?mail\b
     | instant\s+discount | %\s*off\b | flat\s*off | free\s+gift
     | \bt\s?&\s?c\b | terms\s+(?:and\s+conditions\s+)?apply
     | \bpin\s?codes?\b | \bdelivery\s+by\b | \bfree\s+delivery\b
@@ -615,7 +618,8 @@ COMMERCE_RE = re.compile(r"""
 # warranty DURATION ("2 Years Comprehensive, 10 Years on Compressor") passes.
 SERVICE_RE = re.compile(r"""
       \bcustomer\s*(?:care|support|service)s?\b | \bservice\s*cent(?:er|re)s?\b
-    | \btoll[\s-]?free\b | \bhelpline\b | \bcall\s+us\b | \bcontact\s+us\b
+    | \btoll[\s-]?free\b | \bhelpline\b | \bcalls?\s+us\b | \bcontact\s+us\b
+    | \bgot\s+a\s+question\b
     | \btechnician\s+visit | \bbrand\s+authori[sz]ed\s+service
     | \b(?:warranty|service)\s+(?:is\s+)?(?:provided|serviced|handled|fulfilled)\s+by\b
     | \bfree\s+installation\b | \binstallation\s+(?:and|&)\s+demo\b
@@ -652,6 +656,9 @@ SPEC_LABEL_DENY_RE = re.compile(
     r"sales\s+package|in\s+the\s+box|seller|sold\s+by|fulfilled\s+by|"
     r"delivery|returns?|replacement|warranty\s+summary|warranty\s+service|"
     r"service\s+type|installation(?!\s*type)|emi|offers?|price|mrp|discount|"
+    # a warranty UPSELL banner, not the product's own warranty ('Warranty',
+    # 'Manufacturer Warranty' still pass); stock-alert widgets
+    r"extended\s+warranty|notify\s+me|"
     r"availability|stock|share|compare|quantity|add\s+to|buy|description|"
     r"about\s+this\s+item|highlights?|features?|specifications?|overview|"
     r"reviews?|ratings?|q\s?&\s?a|faq|sku|ean|upc|hsn|gst|tax|"
@@ -674,6 +681,15 @@ SPEC_VALUE_IS_LABEL_RE = re.compile(
     r"notify\s+me|check\s+(?:availability|pincode|delivery)|"
     r"view\s+(?:details|offers?|plans?)|know\s+more|learn\s+more|"
     r"compare|share|in\s+stock|out\s+of\s+stock)$", re.I)
+
+# Retailer trust badges and stock widgets dressed as spec rows ('Trusted Tech:
+# Delivered Fast', 'Notify Me: Enter your email ...'). Checked on the label
+# AND the value of a SPEC ROW only (spec_row_ok), not in content_ok: the words
+# are too common in running description text. 'Air Delivery' / 'Water
+# Delivery' (air cooler and purifier specs) are guarded.
+SPEC_ROW_JUNK_RE = re.compile(
+    r"(?<!air\s)(?<!water\s)\bdeliver(?:y|ed|ies)\b|\bships\b|\be-?mail\b",
+    re.I)
 
 # Labels whose value IS the product's brand (so it is never a "retailer").
 _BRAND_LABELS = ("brand", "brand name")
@@ -734,6 +750,8 @@ def spec_row_ok(label, value, *, brand=""):
         return False
     if SPEC_VALUE_IS_LABEL_RE.match(value):
         return False                      # the "value" is a commerce UI label
+    if SPEC_ROW_JUNK_RE.search(label) or SPEC_ROW_JUNK_RE.search(value):
+        return False                      # a trust badge / stock widget
     if label.lower() in _BRAND_LABELS:
         brand = brand or value
     return content_ok(label, brand=brand) and content_ok(value, brand=brand)

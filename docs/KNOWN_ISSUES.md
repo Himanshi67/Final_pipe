@@ -666,3 +666,17 @@ SKU (WH) still ignores "L/min". Sweep: no change on rows with a model code.
 `size_values`; flow rates count only on a gas SKU. Tests: `tests\test_loose_model_ki35.py`.
 Sweep: 33 old sheets, 894 rows, 0 rows changed. Not in scope: "6 Lt" is still not a size
 (pre-existing, also for electric SKUs; see KI-38).
+
+## KI-40 · MED · fixed (2026-11-25) — store banner text in spec rows; false "Star Rating" gap
+**Symptom:** GUI step 2 for HAIER-LE32A900G (vijaysales.com) showed the attributes "Notify Me",
+"Extended Warranty" ("... calls us"), "Trusted Tech" ("Delivered Fast"), "Easy Installment"
+("... easy EMIs"). A reviewer row "Star rating: 3" still gave "Required attribute(s) still
+missing: Star Rating".
+**Cause:** the firewall patterns missed "EMIs", "calls us", "notify me", "delivered", "email",
+"got a question" and the label "extended warranty". `missing_spec_axes` compared raw labels,
+but only scraped rows were canonicalised ("star rating" -> "energy rating").
+**Fix (2026-11-25):** `COMMERCE_RE`, `SERVICE_RE`, `SPEC_LABEL_DENY_RE` extended; new
+`SPEC_ROW_JUNK_RE` (delivery/ships/email; not "Air Delivery") in `spec_row_ok` only.
+`missing_spec_axes` adds the `canon_spec_label` form and the axis name; a blank value fills
+no axis. Sweep: 2,968 spec rows in 33 old sheets, only the 4 banner rows newly dropped.
+Tests: `tests\test_spec_junk.py`.
