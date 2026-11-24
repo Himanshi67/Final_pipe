@@ -578,3 +578,33 @@ internal and client packs probably have 0 images.
 reads the correct per-client folder.
 **Accept:** an archived run of a built CSV holds every image that the CSV references.
 A test pins the folder.
+
+## KI-35 · HIGH · open (found 2026-11-24) — SKU with no model code gets the WRONG product
+**Symptom:** `KENSTAR-WH AQUALIA 25L` -> "Kenstar Aqualia **Vogue 10L**" (amazon) and
+`KENSTAR-GWH JETT 6L` -> "KENSTAR **Star 6L**" (amazon), both `NEEDS CRAWL - CHECK LINK`.
+The exact Flipkart listings ("Kenstar Aqualia 25L …", "Kenstar JETT MAX 6L …") were in
+the same candidate set (`runs\kenstar-diag\`).
+**Cause:** `sku_parts` finds no model code: "25L" and "6L" are under 4 characters, and
+"WH" is a category code. So `assess()` checks the brand only and gives every candidate
+`weak`. `assess` checks capacity in kg, never in litres. The weak-hit choice (about :4046)
+ranks by site and completeness, not by title fit. "GWH" is not in `CATEGORY_CODES`.
+**Fix sketch:** when the model is empty, use the series word plus the size as a loose
+model ("AQUALIA 25L") and require them in the title. Add a litre check next to `KG_RE`.
+Rank weak hits by the number of SKU words in the title first. Add GWH to `CATEGORY_CODES`.
+**Accept:** both SKUs pick the Flipkart listing (or another page whose title has the
+series and the size). "Vogue 10L" and "Star 6L" are rejected.
+
+## KI-36 · MED · open (found 2026-11-24) — a failed DuckDuckGo search reads as "no results"
+**Symptom:** on Streamlit Cloud (no Serper key, cloud IP) both Kenstar SKUs gave
+`NEEDS LINK - NOT FOUND - …`. On the laptop, DuckDuckGo raised Timeout/DDGSException and
+recovered on its second try. Two later searches failed with "No results found".
+**Cause:** `ddg_search` tries twice, then returns `[]` silently. The status then says
+"no usable search results", not that the search engine failed.
+**Accept:** when every search for a row fails with an engine error, the status says
+`NOT FOUND - search engine failed`, and the run summary counts it. A hosted setup without
+`SERPER_API_KEY` warns at start.
+
+## KI-37 · LOW · open (found 2026-11-24) — the client's own store pages are search candidates
+**Symptom:** shreejeeelectronics.in product pages were fetched as candidates for both
+Kenstar SKUs.
+**Accept:** the candidate filter skips the client's own `[store] url` host.
