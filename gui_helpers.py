@@ -383,6 +383,11 @@ def _cell_filled(value) -> bool:
     return bool(str(value).strip())
 
 
+# Mirror of sku_enricher.SEARCH_FAILED_STATUS (KI-36). Copied, not imported,
+# so this module stays light; tests\test_search_chain_ki36.py pins equality.
+SEARCH_FAILED_STATUS = "NOT FOUND - search engine failed"
+
+
 def eligible_rows(df, flags) -> int:
     """How many rows this invocation will actually process - the ETA total.
 
@@ -399,7 +404,8 @@ def eligible_rows(df, flags) -> int:
       --retry-missing    rows with no link that were tried and failed
       plain              untouched rows only
 
-    A row whose status mentions 'blocked' is transient and stays eligible;
+    A row whose status mentions 'blocked' or SEARCH_FAILED_STATUS (KI-36;
+    the latter also under --discover) is transient and stays eligible;
     --force takes every row (bar a crawl-urls row with no link); --limit
     caps the count exactly as the enricher's `if args.limit and done >=
     args.limit: break` does. `df` is the filled sheet as strings."""
@@ -427,7 +433,8 @@ def eligible_rows(df, flags) -> int:
         elif discover:
             if not force and url:
                 continue
-            if not force and status and not retry_missing:
+            if (not force and status and not retry_missing
+                    and SEARCH_FAILED_STATUS not in status):
                 continue
         elif not force:
             if url:
@@ -437,7 +444,8 @@ def eligible_rows(df, flags) -> int:
                 if not (retry_incomplete and incomplete):
                     continue
             elif status and not retry_missing:
-                if "blocked" not in status.lower():
+                if ("blocked" not in status.lower()
+                        and SEARCH_FAILED_STATUS not in status):
                     continue
         n += 1
     limit = limit_from_flags(flags)

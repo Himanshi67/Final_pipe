@@ -1082,10 +1082,36 @@ def step_enrich(P):
         st.rerun()
 
     key_env = cfg.serper.api_key_env
-    if not (os.environ.get(key_env) or client_env(cfg).get(key_env)):
+    _cenv = client_env(cfg)
+
+    def _has_key(name):
+        return bool(name and (os.environ.get(name) or _cenv.get(name)))
+
+    # KI-36: the paid engines of the chain, in [serper] engines order
+    _paid_envs = {"serper": key_env,
+                  "tavily": getattr(cfg.serper, "tavily_api_key_env",
+                                    "TAVILY_API_KEY"),
+                  "serpapi": getattr(cfg.serper, "serpapi_api_key_env",
+                                     "SERPAPI_API_KEY")}
+    _engines = getattr(cfg.serper, "engines", tuple(_paid_envs) + ("ddg",))
+    _paid = [_paid_envs[e] for e in _engines if e in _paid_envs]
+    _labels = {"serper": "Serper", "tavily": "Tavily", "serpapi": "SerpApi",
+               "ddg": "DuckDuckGo"}
+    if not _paid:
+        # the client's engines list names no paid engine: no key to ask for
+        st.warning("Only DuckDuckGo is in this client's [serper] engines "
+                   "list; it often fails on a cloud server.")
+    elif not any(_has_key(n) for n in _paid):
+        add = (", ".join(_paid[:-1]) + " or " + _paid[-1]
+               if len(_paid) > 1 else _paid[0])
+        st.warning("Only DuckDuckGo is available; it often fails on a cloud "
+                   f"server. Add {add} (environment or "
+                   f"clients\\{cfg.slug}\\.env).")
+    elif "serper" in _engines and not _has_key(key_env):
+        _fallback = [_labels.get(e, e) for e in _engines if e != "serper"]
         st.warning(f"{key_env} is set neither in the environment nor in "
-                   f"clients\\{cfg.slug}\\.env — search falls back to "
-                   "DuckDuckGo (worse results).")
+                   f"clients\\{cfg.slug}\\.env — search uses the fallback "
+                   f"engines ({' / '.join(_fallback) or 'none'}).")
 
 
 # ------------------------------------------------------------------- step 2 --

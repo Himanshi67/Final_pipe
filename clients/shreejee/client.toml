@@ -86,6 +86,12 @@ query_mode = "incremental"
 # "free_first": DuckDuckGo first, serper only when DuckDuckGo gives nothing.
 # The --search-order flag overrides this for one run.
 search_order = "paid_first"
+# KI-36: the search engine chain, in paid_first order (free_first moves "ddg"
+# to the front). An engine with no key is skipped; one that fails passes the
+# query on. Allowed: serper, tavily, serpapi, ddg. --budget caps serper only.
+engines = ["serper", "tavily", "serpapi", "ddg"]
+tavily_api_key_env = "TAVILY_API_KEY"     # BYOK, free tier (no credit card)
+serpapi_api_key_env = "SERPAPI_API_KEY"   # BYOK, free tier (no credit card)
 
 # Tier 0 of the URL search (url_index.py): the local sitemap index and the
 # retailers' own search, tried BEFORE any paid serper.dev search. Shared

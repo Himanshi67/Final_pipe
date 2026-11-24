@@ -36,7 +36,8 @@ Public API:
         .prefixes        -> tuple  parent codes in TOML order + fallback
         .enricher_codes  -> tuple  input_codes + prefixes + strip_codes
     SerperConfig(api_key_env, monthly_budget, default_run_budget,
-                 query_mode, search_order)          [serper] - item 4
+                 query_mode, search_order, engines,
+                 tavily_api_key_env, serpapi_api_key_env)  [serper] - item 4, KI-36
     UrlIndexConfig(enabled, max_age_days, extra_sources, disable)
                                                     [url_index] - tier 0
     PricingConfig(single_price, basis, markup)      [pricing] - one price only
@@ -129,10 +130,18 @@ class SerperConfig:
     # "paid_first": serper, DuckDuckGo only as a fallback; "free_first":
     # DuckDuckGo first, serper only when DuckDuckGo gives nothing
     search_order: str = "paid_first"
+    # KI-36: the search engine chain, in paid_first order. An engine without
+    # a key is skipped; an engine that fails passes the query to the next one.
+    # free_first moves "ddg" to the front at run time.
+    engines: tuple = ("serper", "tavily", "serpapi", "ddg")
+    # BYOK env var NAMES of the two fallback engines (values in clients\<slug>\.env)
+    tavily_api_key_env: str = "TAVILY_API_KEY"
+    serpapi_api_key_env: str = "SERPAPI_API_KEY"
 
 
 SERPER_QUERY_MODES = ("incremental", "batch")
 SERPER_SEARCH_ORDERS = ("paid_first", "free_first")
+SEARCH_ENGINES = ("serper", "tavily", "serpapi", "ddg")
 
 
 @dataclass(frozen=True)
@@ -454,7 +463,34 @@ def _load_serper(data, where) -> SerperConfig:
                 f"{', '.join(allowed)}, got {table.get(key)!r}")
         return raw
 
+    def _engines():
+        raw = table.get("engines", list(defaults.engines))
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)) or not raw:
+            raise ClientConfigError(
+                f"{where}: [serper] engines must be a non-empty list of "
+                f"{', '.join(SEARCH_ENGINES)}, got {table.get('engines')!r}")
+        out = []
+        for name in raw:
+            name = str(name or "").strip().lower()
+            if name not in SEARCH_ENGINES:
+                raise ClientConfigError(
+                    f"{where}: [serper] engines: unknown engine {name!r} "
+                    f"(allowed: {', '.join(SEARCH_ENGINES)})")
+            if name not in out:
+                out.append(name)
+        return tuple(out)
+
+    def _env_name(key, default):
+        return str(table.get(key) or "").strip() or default
+
     return SerperConfig(
+        engines=_engines(),
+        tavily_api_key_env=_env_name("tavily_api_key_env",
+                                     defaults.tavily_api_key_env),
+        serpapi_api_key_env=_env_name("serpapi_api_key_env",
+                                      defaults.serpapi_api_key_env),
         api_key_env=(str(table.get("api_key_env") or "").strip()
                      or defaults.api_key_env),
         monthly_budget=_int("monthly_budget", defaults.monthly_budget),

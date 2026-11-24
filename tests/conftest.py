@@ -44,6 +44,26 @@ os.environ.setdefault("PIPELINE_REVIEW_IMAGE_PREVIEW", "off")
 collect_ignore = ["qa_pipeline.py", "qa_deep.py", "qa_cli.py"]
 
 
+@pytest.fixture(autouse=True)
+def _no_fallback_engine_network(monkeypatch):
+    """KI-36: the suites stub serper_search / ddg_search only. A TAVILY or
+    SERPAPI key in the shell or in a client's .env must never make one of
+    them spend a real credit, so both fallback engines answer "no key" (None)
+    under pytest. tests\\test_search_chain_ki36.py keeps references to the
+    real functions and tests them with a mocked HTTP client."""
+    E = sys.modules.get("sku_enricher")
+    if E is not None:
+        for name in ("tavily_search", "serpapi_search"):
+            if hasattr(E, name):
+                monkeypatch.setattr(E, name, lambda q: None)
+    # a subprocess (the enricher run as a script) does not see the patch
+    # above, so the shell keys are removed too. A client's .env can still
+    # set them in a child process; the suites run on test clients.
+    for var in ("TAVILY_API_KEY", "SERPAPI_API_KEY"):
+        monkeypatch.delenv(var, raising=False)
+    yield
+
+
 @pytest.fixture
 def tmp(tmp_path):
     """Alias for pytest's tmp_path, under the name test_gui_ui.py asks for."""

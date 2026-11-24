@@ -71,6 +71,7 @@ are stripped. Any other line is an error naming its line number.
 | Variable | Where to get it | Needed for |
 |---|---|---|
 | `SERPER_API_KEY` | free at serper.dev | search (falls back to DuckDuckGo without it) |
+| `TAVILY_API_KEY`, `SERPAPI_API_KEY` | free at tavily.com / serpapi.com, no card | fallback search engines after serper (KI-36) |
 | `WC_URL` | your store URL | `wc_publish.py`, `wc_seo.py` |
 | `WC_KEY` / `WC_SECRET` | WooCommerce > Settings > Advanced > REST API (Read/Write) | products, categories, tags |
 | `WP_APP_USER` / `WP_APP_PASSWORD` | WP Users > Profile > Application Passwords | uploading images via the API |

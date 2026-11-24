@@ -605,7 +605,7 @@ FLOW RATE (6 L/min), not a tank size. "Jett" is sold as "Jett Max", so the Flipk
 sibling titled "Jett 10 L/min" is not rejected (it only ranks lower). A fix would read
 L/min values as the size when the SKU has a GWH code. Recorded as KI-39.
 
-## KI-36 · MED · open (found 2026-11-24) — a failed DuckDuckGo search reads as "no results"
+## KI-36 · MED · fixed (2026-11-24) — a failed DuckDuckGo search reads as "no results"
 **Symptom:** on Streamlit Cloud (no Serper key, cloud IP) both Kenstar SKUs gave
 `NEEDS LINK - NOT FOUND - …`. On the laptop, DuckDuckGo raised Timeout/DDGSException and
 recovered on its second try. Two later searches failed with "No results found".
@@ -614,6 +614,14 @@ recovered on its second try. Two later searches failed with "No results found".
 **Accept:** when every search for a row fails with an engine error, the status says
 `NOT FOUND - search engine failed`, and the run summary counts it. A hosted setup without
 `SERPER_API_KEY` warns at start.
+**Fix (2026-11-24):** `ddg_search` returns `None` after 2 failed tries (a real empty answer
+stays `[]`). `web_search` walks an engine chain, `[serper] engines` (default serper ->
+tavily -> serpapi -> ddg; `free_first` puts ddg first). `None` (error, no key, budget refused)
+tries the next engine; an empty answer from a paid engine stops the chain. New engines
+`tavily_search` / `serpapi_search` (no-credit-card free tiers, owner choice), keys from
+`TAVILY_API_KEY` / `SERPAPI_API_KEY`. A row whose every sent query failed on all engines gets
+`NOT FOUND - search engine failed`; the report counts it. The enricher and GUI warn when no
+paid key exists. `--budget` still caps Serper credits only. Tests: `tests\test_search_chain_ki36.py`.
 
 ## KI-37 · LOW · open (found 2026-11-24) — the client's own store pages are search candidates
 **Symptom:** shreejeeelectronics.in product pages were fetched as candidates for both

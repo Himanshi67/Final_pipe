@@ -404,6 +404,42 @@ def test_shreejee_serper_table_is_the_documented_one():
     serper = C.load_client("shreejee").serper
     assert (serper.api_key_env, serper.monthly_budget,
             serper.default_run_budget) == ("SERPER_API_KEY", 2500, 0)
+    # KI-36: the engine chain and the two fallback key env names
+    assert serper.engines == ("serper", "tavily", "serpapi", "ddg")
+    assert (serper.tavily_api_key_env, serper.serpapi_api_key_env) == (
+        "TAVILY_API_KEY", "SERPAPI_API_KEY")
+
+
+def test_serper_engine_defaults_when_absent(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch)
+    serper = C.load_client("synth").serper
+    assert serper.engines == ("serper", "tavily", "serpapi", "ddg")
+    assert serper.tavily_api_key_env == "TAVILY_API_KEY"
+    assert serper.serpapi_api_key_env == "SERPAPI_API_KEY"
+
+
+def test_serper_engines_come_from_the_toml(tmp_path, monkeypatch):
+    make_client(tmp_path, monkeypatch, SKU_TABLE + """
+[serper]
+engines = ["Tavily", "ddg"]
+tavily_api_key_env = "ACME_TAVILY"
+serpapi_api_key_env = "ACME_SERPAPI"
+""")
+    serper = C.load_client("synth").serper
+    assert serper.engines == ("tavily", "ddg")
+    assert serper.tavily_api_key_env == "ACME_TAVILY"
+    assert serper.serpapi_api_key_env == "ACME_SERPAPI"
+
+
+@pytest.mark.parametrize("value", ['["serper", "bing"]', "[]", "5"])
+def test_unknown_or_empty_engine_list_is_refused(tmp_path, monkeypatch, value):
+    make_client(tmp_path, monkeypatch, SKU_TABLE + f"""
+[serper]
+engines = {value}
+""")
+    with pytest.raises(C.ClientConfigError) as excinfo:
+        C.load_client("synth")
+    assert "engines" in str(excinfo.value)
 
 
 def test_credits_and_env_are_paths_only(tmp_path, monkeypatch):

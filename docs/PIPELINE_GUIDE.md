@@ -276,6 +276,14 @@ without lowering the find rate:
   `free_first`: DuckDuckGo first, serper.dev only when DuckDuckGo gives no result.
   The cache key is the bare query in both orders, so old cache entries stay valid,
   and the `--budget` gate and the ledger work the same way in both.
+- *Engine chain* (`[serper] engines`, KI-36). Default `["serper", "tavily", "serpapi",
+  "ddg"]`; `free_first` moves ddg to the front. An engine with no key is skipped; an
+  error or a refused budget tries the next engine; an empty answer from a paid engine
+  stops the chain. Keys: `TAVILY_API_KEY` (tavily.com, 1,000/month) and `SERPAPI_API_KEY`
+  (serpapi.com, 250/month), both free with no card, read like the serper key.
+  `--budget` caps serper credits only; the report and the ledger count Tavily and
+  SerpApi calls. A row whose every search failed on all engines gets
+  `NOT FOUND - search engine failed`, not "no usable search results".
 
 The report's `Credits:` line adds `queries not sent: N (free source said not there)
 + M (stopped early)`, and the console prints the same two counts at the end of a run.
@@ -634,6 +642,9 @@ on that server until the next restart or redeploy. Download the file and
 commit it to GitHub to keep it. Save and backup behaviour is unchanged.
 
 **Streamlit Community Cloud Secrets** (app settings > Secrets, TOML):
+- Search keys (recommended in both modes, each on its own line, no leading `#`):
+  `SERPER_API_KEY`, `TAVILY_API_KEY`, `SERPAPI_API_KEY`. Without them only
+  DuckDuckGo runs, and it often fails from a cloud server.
 - Password-only mode: `GUI_PASSWORD`; optional `SERPER_API_KEY`; for the real
   publish also `WC_URL`, `WC_KEY`, `WC_SECRET`, `WP_APP_USER`,
   `WP_APP_PASSWORD`.

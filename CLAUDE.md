@@ -81,7 +81,10 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   query costs 1 credit; `"batch"` is the old send-all behaviour. An uncached `site:`
   query that a free tier-0 source already answered "not there" (Croma site search, a
   fresh brand sitemap) is not sent. `[serper] search_order` / `--search-order
-  free_first` asks DuckDuckGo before serper. Free tier
+  free_first` asks DuckDuckGo before serper. `[serper] engines` is the fallback chain
+  (default serper -> tavily -> serpapi -> ddg, KI-36): an engine with no key is skipped, an
+  error tries the next one, an empty paid answer stops; keys `TAVILY_API_KEY` /
+  `SERPAPI_API_KEY` (no-card free tiers: 1,000 and 250/month). Free tier
   2,500/month ≈ 300 SKUs. BYOK per client: the variable NAME comes from `[serper]
   api_key_env`, its value from `clients\<slug>\.env` (which OVERRIDES the shell env).
   `--budget N` caps a run at N credits (0 = unlimited; default `[serper]
@@ -94,7 +97,8 @@ Turns a bare SKU list into a verified WooCommerce import for shreejeeelectronics
   (merged from another source) · `FOUND … - VERIFY: <why>` (pass 2 crawled the
   link a human supplied and the page does not match the SKU) · `CLOSE MATCH -
   CHECK (site)` · `CHECK MANUALLY (site)` · `SKIPPED - same unit as row N` ·
-  `NOT FOUND` + a reason suffix (`- no usable search results` / `- N page(s) checked,
+  `NOT FOUND` + a reason suffix (`- no usable search results` / `- search engine failed`
+  (every engine errored; KI-36) / `- N page(s) checked,
   none matched` / `- all sources blocked (…)` / `- N source(s) blocked`) · `ERROR: …`
   (incl. `ERROR: no product data in the page`). More FOUND suffixes that still import by
   default and are asking to be looked at: `- unlisted store, verify` · `- MRP <why>, check`
