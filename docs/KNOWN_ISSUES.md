@@ -599,6 +599,11 @@ when the SKU states a litre size (elsewhere it stays `weak`). Weak hits rank by
 `(loose_overlap, rec_score)`. GWH is a category code. Tests: `tests\test_loose_model_ki35.py`.
 Sweep: 265 old rows, only the 2 Kenstar rows change. Replay: `runs\ki35-replay\`, 0 credits.
 Follow-up: KI-38 (a glued size such as `25LTR` becomes the model code).
+**Owner note (2026-11-24):** GWH = Gas Water Heater. On a GWH SKU the size ("6L") is the
+FLOW RATE (6 L/min), not a tank size. "Jett" is sold as "Jett Max", so the Flipkart
+"Jett Max 6L" page is the right product. Open gap: `LITRE_RE` skips "L/min", so a GWH
+sibling titled "Jett 10 L/min" is not rejected (it only ranks lower). A fix would read
+L/min values as the size when the SKU has a GWH code.
 
 ## KI-36 · MED · open (found 2026-11-24) — a failed DuckDuckGo search reads as "no results"
 **Symptom:** on Streamlit Cloud (no Serper key, cloud IP) both Kenstar SKUs gave
