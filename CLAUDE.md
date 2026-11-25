@@ -243,9 +243,10 @@ Main loop does: designing fixes, editing code, judgment calls. Prefer one well-b
 subagent over 20 tool calls in the main context.
 
 ## Docs (load on demand only)
-- `docs/handover-2026-11-24-ki35.md` — the current handover: KI-35 fix (SKUs with no
-  model code), GWH = gas water heater, test baseline 1011/7 and the next task (KI-39).
-  Read it first in a new session.
+- `docs/handover-2026-11-25-ki36.md` — the current handover: KI-39 (GWH flow rate),
+  KI-36 (search engine chain serper -> tavily -> serpapi -> ddg), KI-40 (banner text in
+  spec rows), test baseline 1090/7 and the next task (KI-38). Read it first in a new session.
+  `docs/handover-2026-11-24-ki35.md` is the one before it: KI-35 fix, GWH = gas water heater.
   `docs/handover-2026-11-24.md` is the one before it: KI-17/18/26/27/28 fixes, the
   hosted Streamlit Cloud app (password-only mode), the two git remotes (§4 gotchas).
   `docs/handover-2026-11-19.md` is the older one (image canvas, content firewall, filter
