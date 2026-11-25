@@ -176,17 +176,33 @@ COMPAT_PHRASES = ("made for", "compatible with", "for use with",
 # candidates when the exact model code could not be verified
 KG_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*kg\b", re.I)
 # the lookahead keeps a geyser's flow rate ('12 L/min') out of the size
-LITRE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|ltrs?|litres?|liters?)\b"
+LITRE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|lts?|ltrs?|litres?|liters?)\b"
                       r"(?!\s*/\s*min)", re.I)
 # KI-39: on a gas geyser (GWH) the flow rate IS the size
-FLOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|ltrs?|litres?|liters?)"
+FLOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(?:l|lts?|ltrs?|litres?|liters?)"
                      r"(?:\s*/\s*min(?:ute)?s?\b|\s+per\s+min(?:ute)?s?\b)"
                      r"|(\d+(?:\.\d+)?)\s*-?\s*lpm\b", re.I)
+# KI-38: a SKU token that is only a size ('25LTR', '1.5L', '15-L', '7KG',
+# '2000W', '6LPM', '1.5TON', '5STAR') is never the model code
+SIZE_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?-?(?:l|lts?|ltrs?|litres?|liters?|"
+                           r"kgs?|w|watts?|lpm|tons?|stars?)", re.I)
+# KI-38: wattage, kept apart from litres - a geyser title lists '2000 W'
+# next to '25 L'. '2 kW' reads as 2000 W.
+WATT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*-?\s*(k)?(?:w|watts?)\b", re.I)
+# KI-38: brands written as two words ('AO SMITH' would give brand 'AO').
+# (canonical name, pattern for every spelling seen in SKUs and titles)
+MULTI_WORD_BRANDS = (("AO SMITH", r"A\.?\s*O\.?[\s\-]*SMITH"),)
 
 
 def sku_is_gas(sku):
     return any(t.upper() == "GWH"
                for t in re.split(r"[\s\-,/()_]+", str(sku)))
+
+
+def watt_values(text):
+    """Wattages in text: '2000W', '1000 Watts', '2 kW' -> [2000.0, ...]."""
+    return [float(n) * (1000 if k else 1)
+            for n, k in WATT_RE.findall(str(text or ""))]
 
 
 def size_values(text, gas):
@@ -1324,6 +1340,26 @@ def is_product_url(url):
 
 # ------------------------------ SKU parsing ------------------------------
 
+def brand_pattern(brand):
+    """Regex for brand as written in raw SKU text; covers the spellings of a
+    MULTI_WORD_BRANDS name ('A.O. SMITH', 'AO-SMITH')."""
+    for name, pat in MULTI_WORD_BRANDS:
+        if brand.upper() == name:
+            return pat
+    return re.escape(brand)
+
+
+def size_only_digits(token):
+    """True for 'AQUAGENIE-25L' / '1200W-KISTO': every digit in the token is
+    in a size piece, so it names a series and a size, not a model code (KI-38).
+    'HTW120-178BK' and '7.5KG-HWM75' keep a digit outside the size: False."""
+    if not re.search(r"[-_]", token):
+        return False
+    rest = [p for p in re.split(r"[-_]+", token)
+            if p and not SIZE_TOKEN_RE.fullmatch(p)]
+    return not re.search(r"\d", "".join(rest))
+
+
 def sku_parts(sku):
     """('SAMSUNG', 'WA70BG4441YYTL') from 'SAMSUNG-WA70BG4441YYTL'
 
@@ -1337,7 +1373,16 @@ def sku_parts(sku):
     # '63HNCCC21V9SN(WATER DISPENSER)' - a bracketed note is never the brand
     sku = re.sub(r"\([^)]*\)", " ", sku).strip(" -,")
     brand = ""
-    for token in re.split(r"[-\s]", sku):
+    codes = "|".join(re.escape(c) for c in CATEGORY_CODES)
+    head = re.sub(r"^(?:(?:" + codes + r")[-\s]+)*", "", sku, flags=re.I)
+    for name, pat in MULTI_WORD_BRANDS:
+        m = re.match(r"(?:" + pat + r")(?![A-Za-z0-9])", head, re.I)
+        if m:
+            brand = name
+            # drop the brand words, so 'A.O.SMITH-SDS15' still frees the model
+            sku = sku[:len(sku) - len(head)] + " " + head[m.end():]
+            break
+    for token in ([] if brand else re.split(r"[-\s]", sku)):
         if not token or token.upper() in CATEGORY_CODES:
             continue                       # a category code, not a maker
         # A brand name carries no digits. Without this the token AFTER the
@@ -1364,6 +1409,8 @@ def sku_parts(sku):
         t = re.sub(r"^(?:" + "|".join(CATEGORY_CODES) + r")[-_]+", "", t,
                    flags=re.I)
         if (len(t) >= 4 and re.search(r"\d", t) and re.search(r"[A-Za-z]", t)
+                and not SIZE_TOKEN_RE.fullmatch(t)
+                and not size_only_digits(t)
                 and (not brand or norm(t) != norm(brand))):
             models.append(t)
     models.sort(key=len, reverse=True)     # longest token = model code, usually
@@ -1373,8 +1420,10 @@ def sku_parts(sku):
 # words a SKU carries that never identify a series: filler and colours
 LOOSE_STOP_WORDS = {"with", "new", "and", "for", "the", "plus",
                     "white", "black", "blue", "grey", "gray", "silver", "red",
-                    "ivory", "gold", "per"}
-LITRE_UNIT_WORDS = {"l", "lt", "ltr", "ltrs", "litre", "litres", "liter", "liters",
+                    "ivory", "gold", "per",
+                    # unit words of a spaced size ('1.5 TON', '2000 WATTS')
+                    "ton", "tons", "watt", "watts", "kgs"}
+LITRE_UNIT_WORDS = {"l", "lt", "lts", "ltr", "ltrs", "litre", "litres", "liter", "liters",
                     "lpm", "min", "minute"}
 
 
@@ -1389,12 +1438,16 @@ def loose_model_terms(sku, brand):
     # the whole string, not from tokens
     litres = set(size_values(raw, sku_is_gas(raw)))
     sku = re.sub(r"\([^)]*\)", " ", raw).strip(" -,")
+    # '5 STAR' is a rating; a bare 'STAR' stays a series word (Kenstar Star)
+    sku = re.sub(r"\d+\s*-?\s*stars?\b", " ", sku, flags=re.I)
     codes = {c.upper() for c in CATEGORY_CODES}
+    # 'AO SMITH': neither 'ao' nor 'smith' is a series word
+    brand_ns = {norm(brand)} | {norm(w) for w in str(brand).split()} if brand else set()
     words = []
     for token in re.split(r"[\s\-,/]+", sku):
         if not token or token.upper() in codes:
             continue
-        if brand and norm(token) == norm(brand):
+        if norm(token) in brand_ns:
             continue
         low = token.lower()
         if (re.fullmatch(r"[a-z]{3,}", low) and low not in LITRE_UNIT_WORDS
@@ -1413,6 +1466,9 @@ def loose_overlap(title, sku, brand, model):
     hits = sum(1 for w in words if re.search(r"\b" + re.escape(w) + r"\b", t_low))
     t_litres = size_values(title, sku_is_gas(sku))
     hits += sum(1 for v in litres if any(abs(v - t) <= 0.05 for t in t_litres))
+    t_watts = watt_values(title)
+    hits += sum(1 for v in set(watt_values(sku))
+                if any(abs(v - t) <= 0.5 for t in t_watts))
     return hits
 
 
@@ -1420,8 +1476,12 @@ def build_queries(sku):
     brand, model = sku_parts(sku)
     rest = str(sku)
     if brand:
-        rest = re.sub(r"^\s*" + re.escape(brand) + r"[-\s]*", "", rest, flags=re.I)
+        rest = re.sub(r"^\s*" + brand_pattern(brand) + r"[-\s]*", "", rest, flags=re.I)
     rest = re.sub(r"^(" + "|".join(CATEGORY_CODES) + r")\b[\s-]*", "", rest, flags=re.I).strip()
+    if brand and " " in brand:
+        # 'WH AO SMITH SDS 15L': a multi-word brand may follow the code.
+        # Single-word brands keep the old behaviour (tier-2 queries unchanged).
+        rest = re.sub(r"^" + brand_pattern(brand) + r"[-\s]*", "", rest, flags=re.I).strip()
 
     brand_site = BRAND_SITES.get(brand.lower(), "") if brand else ""
 
@@ -3491,6 +3551,13 @@ def assess(rec, sku, model, brand, min_price, max_price):
         return "", (f"size mismatch: listing says "
                     f"{', '.join(f'{v:g}' for v in t_litres)} L, SKU says "
                     f"{', '.join(f'{v:g}' for v in sorted(litres))} L")
+    # KI-38: '2000W' is no longer the model code, so compare it here
+    watts, t_watts = set(watt_values(sku)), watt_values(title)
+    if watts and t_watts and not any(abs(v - s) <= 0.5
+                                     for v in t_watts for s in watts):
+        return "", (f"wattage mismatch: listing says "
+                    f"{', '.join(f'{v:g}' for v in t_watts)} W, SKU says "
+                    f"{', '.join(f'{v:g}' for v in sorted(watts))} W")
     # whole words: 'star' must not match inside 'KENSTAR'. One word is enough,
     # so a colour word in the SKU cannot reject the right page.
     # Only for size-coded lines (geysers): there the series word is the only

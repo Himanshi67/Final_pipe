@@ -630,7 +630,7 @@ Kenstar SKUs.
 **Note (2026-11-24, KI-35 replay):** the own-store page "Kenstar WH Aqualia 25L" tied the
 Flipkart page on title fit. Only the source rank (`rec_score`) kept it from winning.
 
-## KI-38 · MED · open (found 2026-11-24) — a glued size becomes the model code
+## KI-38 · MED · fixed (2026-11-25) — a glued size becomes the model code
 **Symptom:** `KENSTAR WH AQUALIA 25LTR`, `... 1.5L` and `CROMPTON ARNO NEO 15-L` give the
 model `25LTR` / `1.5L` / `15-L` from `sku_parts`. The SKU then takes the model-code path in
 `assess()`, so the KI-35 checks do not run. Any "Kenstar <other series> 25 Ltr" title gives
@@ -640,6 +640,22 @@ model `25LTR` / `1.5L` / `15-L` from `sku_parts`. The SKU then takes the model-c
 **Also seen:** "AO SMITH SDS 15L" gives the brand "AO", so "smith" is a series word.
 **Accept:** a token that is only a size (litres, kg, W) is never the model; such a SKU takes
 the KI-35 loose path. The false-positive sweep shows no change on rows with a real model code.
+**Fix (2026-11-25):** `SIZE_TOKEN_RE` (litres incl. Lt/Ltr, LPM, kg, W/watts, ton, star):
+a token that matches it is never the model. `size_only_digits`: a hyphen-joined token with
+no digit left after removing its size pieces is not a model either (`WH-AQUAGENIE-25L`,
+`ICT-1200W-KISTO`); `HTW120-178BK` is kept. `LITRE_RE`/`FLOW_RE` read "6 Lt" / "6 Lts".
+`MULTI_WORD_BRANDS` + `brand_pattern`: AO SMITH / AO-SMITH / A.O. SMITH give brand
+"AO SMITH"; brand words are never series words; `build_queries` strips the brand correctly.
+New wattage check (review finding): `WATT_RE` / `watt_values`; the no-model branch of
+`assess()` rejects an explicit wattage mismatch (2000 W SKU vs 1000 W title); no wattage in
+the title stays weak; `loose_overlap` counts a wattage hit. "5 STAR" is dropped from loose
+terms, a bare "STAR" (a Kenstar series) is kept. Tests: `tests\test_sku_parts_ki38.py` (66).
+Sweep: 33 sheets, 894 rows, 6 rows changed, all hyphen-joined sizes, none a real model code
+(WH-MAXIMUS-3L and DI-ARDO-1000W go strong -> weak: the only source was the client's own
+store page). Independent review run.
+**Not fixed (follow-up):** a size glued to a word with no hyphen (`AQUAGENIE25L`) is still
+the model (same shape as a real code); "6 Lt per min" counts as litres on an electric SKU;
+a one-word brand after a category code is doubled in the queries (`WH AO` -> "AO AO").
 
 ## KI-39 · MED · fixed (2026-11-24) — gas geyser (GWH) flow rate is not compared
 **Symptom:** for `KENSTAR-GWH JETT 6L` the "6L" is 6 L/min (owner). `LITRE_RE` skips
@@ -664,8 +680,7 @@ SKU (WH) still ignores "L/min". Sweep: no change on rows with a model code.
 `sku_is_gas` (a `GWH` token, also `GWH(6L)` / `_GWH`) and `size_values(text, gas)`.
 `loose_model_terms`, `loose_overlap` and the no-model branch of `assess()` use
 `size_values`; flow rates count only on a gas SKU. Tests: `tests\test_loose_model_ki35.py`.
-Sweep: 33 old sheets, 894 rows, 0 rows changed. Not in scope: "6 Lt" is still not a size
-(pre-existing, also for electric SKUs; see KI-38).
+Sweep: 33 old sheets, 894 rows, 0 rows changed. "6 Lt" is a size since KI-38.
 
 ## KI-40 · MED · fixed (2026-11-25) — store banner text in spec rows; false "Star Rating" gap
 **Symptom:** GUI step 2 for HAIER-LE32A900G (vijaysales.com) showed the attributes "Notify Me",

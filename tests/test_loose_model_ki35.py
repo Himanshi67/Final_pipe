@@ -63,8 +63,8 @@ def test_no_model_code_but_series_and_size(sku, words, litres):
 
 
 def test_litre_spellings():
-    # regex unit test only: a glued '25LTR' in a SKU is taken as the model
-    # code by sku_parts and never reaches loose_model_terms (KI-38)
+    # regex unit test only; since KI-38 a size token in a SKU ('25LTR',
+    # 'AQUAGENIE-25L') is never the model code (tests/test_sku_parts_ki38.py)
     for s in ("25L", "25 L", "25-litre", "25 Ltr", "25 ltrs", "25 Liters"):
         assert [float(x) for x in E.LITRE_RE.findall(s)] == [25.0], s
     assert E.LITRE_RE.findall("5 Star rating, 2000 W") == []
